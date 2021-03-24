@@ -303,7 +303,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 
 		# Undershoot appears on the left
 		if (output == "B") or (output == "D"):
-			img[:,:,:-1] = img[:,:,:-1] + undershoot * img[:,:,:-1]
+			img[:,:,:-1] = img[:,:,:-1] + undershoot * img[:,:,1:]
 			img[:,:,-1] = img[:,:,-1]*(1+undershoot)
 
 		return img
