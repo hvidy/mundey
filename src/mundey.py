@@ -162,7 +162,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 
 		flux = self.flatfield(flux,verbose=verbose)
 
-		flux = self.to_electrons_per_second(flux,verbose=verbose)
+		# flux = self.to_electrons_per_second(flux,verbose=verbose)
 
 		self.hdu[1].data['FLUX'] = flux
 
@@ -236,7 +236,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 			black1d = p(x)
 
 			img[frame,:,:] = img[frame,:,:] - np.expand_dims(black1d[y1:y1+dy],axis=1)
-			smrow[frame:,:] = smrow[frame,:,:] - np.expand_dims(black1d[2058:2068],axis=1)
+			smrow[frame,:,:] = smrow[frame,:,:] - np.expand_dims(black1d[2058:2068],axis=1)
 
 		return img,smrow
 
