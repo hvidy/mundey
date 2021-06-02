@@ -162,7 +162,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 
 		flux = self.flatfield(flux,verbose=verbose)
 
-		# flux = self.to_electrons_per_second(flux,verbose=verbose)
+		flux = self.to_electrons_per_second(flux,verbose=verbose)
 
 		self.hdu[1].data['FLUX'] = flux
 
@@ -191,7 +191,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 		if verbose:
 			print("Performing 2-D black correction")
 
-			img = img - twodblackimg
+		img = img - twodblackimg
 
 		return img
 
@@ -259,8 +259,6 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 
 		img = img/(factor*self.hdu[1].header['NUM_FRM'])
 
-		return img
-
 		# Load linearity model
 		lintree = ET.parse('tess2018143203310-41006_100-linearity.xml')
 		linroot = lintree.getroot()
@@ -280,6 +278,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 
 		img = img*p((img-originx)*scalex)*self.hdu[1].header['GAIN'+output]
 
+		return img
 
 # =========================================================================
 # Correct for LDE undershoot
