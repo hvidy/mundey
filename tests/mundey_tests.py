@@ -15,4 +15,4 @@ def test_sirius():
 
 	tpf.calibrate() # do the entire thing
 
-	assert np.nansum(tpf.flux.value) == 4128732700.0
+	assert np.nansum(tpf.flux.value) == 4128732700.0 # very simple checksum! improve this long term
