@@ -11,7 +11,11 @@ Tim White, Benjamin Pope
 
 ## Installation
 
-Clone this git repo, enter the directory, and run
+The easiest option is just from PyPI:
+
+`pip install mundey`
+
+To install from source: clone this git repo, enter the directory, and run
 
 `python setup.py install`
 
