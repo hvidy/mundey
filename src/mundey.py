@@ -17,7 +17,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 # Main routine to perform a new calibration of a TESS target pixel file
 # =========================================================================
 
-	def calibrate(self,verbose=True,smear='alternate'):
+	def calibrate(self,verbose=True,smear='alternate',ddir='.'):
 		"""Performs a new calibration for a target pixel file
 			Parameters
 			----------
@@ -37,6 +37,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 		result_table = customSimbad.query_region(coord.SkyCoord(self.ra,self.dec, unit=(u.deg, u.deg), frame='icrs'))
 		result_table.sort(['FLUX_V'])
 		target = result_table[0]["MAIN_ID"]
+		self.ddir = ddir
 
 
 		if verbose:
@@ -80,14 +81,14 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 
 		for idx,output in enumerate(set(outputs)):
 
-			smrowfile = path.split('/')[-1].split('-')[0]+'-'+path.split('/')[-1].split('-')[1]+'-smrow-'+str(self.camera)+'-'+str(self.ccd)+'-'+output.lower()+'-'+path.split('/')[-1].split('-')[3]+'-s_col.fits'
+			smrowfile = self.ddir+path.split('/')[-1].split('-')[0]+'-'+path.split('/')[-1].split('-')[1]+'-smrow-'+str(self.camera)+'-'+str(self.ccd)+'-'+output.lower()+'-'+path.split('/')[-1].split('-')[3]+'-s_col.fits'
 			if verbose:
 				print("... loading smear row file "+smrowfile)
 
 			smrow = fits.open(smrowfile)
 			sm_cal[idx] = smrow[1].data['SMROW_RAW']
 
-			tvcolfile = path.split('/')[-1].split('-')[0]+'-'+path.split('/')[-1].split('-')[1]+'-tvcol-'+str(self.camera)+'-'+str(self.ccd)+'-'+output.lower()+'-'+path.split('/')[-1].split('-')[3]+'-s_col.fits'
+			tvcolfile = self.ddir+path.split('/')[-1].split('-')[0]+'-'+path.split('/')[-1].split('-')[1]+'-tvcol-'+str(self.camera)+'-'+str(self.ccd)+'-'+output.lower()+'-'+path.split('/')[-1].split('-')[3]+'-s_col.fits'
 			if verbose:
 				print("... loading trailing virtual column file "+tvcolfile)
 
@@ -103,7 +104,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 			tv_cal[idx] = self.fixedoffset_meanblack(tv_cal[idx],output,verbose=False)
 	
 
-		black2dfile = 'tess2018323-'+str(self.camera)+'-'+str(self.ccd)+'-2dblack.fits'
+		black2dfile = self.ddir+'tess2018323-'+str(self.camera)+'-'+str(self.ccd)+'-2dblack.fits'
 
 		if verbose:
 			print("")
@@ -260,7 +261,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 		img = img/(factor*self.hdu[1].header['NUM_FRM'])
 
 		# Load linearity model
-		lintree = ET.parse('tess2018143203310-41006_100-linearity.xml')
+		lintree = ET.parse(self.ddir+'tess2018143203310-41006_100-linearity.xml')
 		linroot = lintree.getroot()
 
 		poly = linroot.find(".//*[@cameraNumber='"+str(self.camera)+"'][@ccdNumber='"+str(self.ccd)+"'][@ccdOutput='"+output+"']/linearityPoly")
@@ -290,7 +291,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 			print("Correcting for LDE undershoot")
 
 		# Load undershoot model
-		undertree = ET.parse('tess-undershoot.xml')
+		undertree = ET.parse(self.ddir+'tess-undershoot.xml')
 		underroot = undertree.getroot()
 
 		undershoot = float(underroot.find(".//*[@cameraNumber='"+str(self.camera)+"'][@ccdNumber='"+str(self.ccd)+"'][@ccdOutput='"+output+"']").get('undershoot'))
@@ -381,7 +382,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 # =========================================================================
 
 	def flatfield(self,img,verbose=True):
-		flatfile = 'tess2018323-'+str(self.camera)+'-'+str(self.ccd)+'-flat.fits'
+		flatfile =  self.ddir+'tess2018323-'+str(self.camera)+'-'+str(self.ccd)+'-flat.fits'
 
 		if verbose:
 			print("")
