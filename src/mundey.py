@@ -19,7 +19,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 # Main routine to perform a new calibration of a TESS target pixel file
 # =========================================================================
 
-	def calibrate(self,verbose=True,smear='alternate',ddir='.'):
+	def calibrate(self,verbose=True,smear='alternate',ddir='./'):
 		"""Performs a new calibration for a target pixel file
 			Parameters
 			----------
