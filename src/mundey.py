@@ -8,6 +8,8 @@ import astropy.coordinates as coord
 import astropy.units as u
 from IPython.core.display import display, HTML
 
+import pkg_resources
+
 import warnings
 
 class mundey_tpf(lightkurve.TessTargetPixelFile):
@@ -291,7 +293,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 			print("Correcting for LDE undershoot")
 
 		# Load undershoot model
-		undertree = ET.parse(self.ddir+'tess-undershoot.xml')
+		undertree = ET.parse(pkg_resources.resource_stream(__name__, 'data/tess-undershoot.xml'))
 		underroot = undertree.getroot()
 
 		undershoot = float(underroot.find(".//*[@cameraNumber='"+str(self.camera)+"'][@ccdNumber='"+str(self.ccd)+"'][@ccdOutput='"+output+"']").get('undershoot'))
