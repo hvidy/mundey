@@ -76,7 +76,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 			print("CCD: " +str(self.ccd))
 			print("Outputs: " +str(set(outputs)))
 			print("")
-			print("Loading collatoral target pixel files")
+			print("Loading collateral target pixel files")
 
 		sm_cal = np.zeros((len(set(outputs)),flux.shape[0],10,512))
 		tv_cal = np.zeros((len(set(outputs)),flux.shape[0],2078,11))
