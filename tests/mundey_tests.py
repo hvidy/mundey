@@ -16,5 +16,6 @@ def test_sirius():
 	tpf = mundey.mundey.mundey_tpf(tpffile)
 
 	tpf.calibrate(ddir=ddir) # do the entire thing
+	print(np.nansum(tpf.flux.value))
 
-	assert (np.nansum(tpf.flux.value) - 41293316000.0) < 1. # very simple checksum! improve this long term
+	assert np.abs(np.nansum(tpf.flux.value) - float32(41293316000.0)) < 1. # very simple checksum! improve this long term
