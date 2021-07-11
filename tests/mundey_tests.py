@@ -17,4 +17,4 @@ def test_sirius():
 
 	tpf.calibrate(ddir=ddir) # do the entire thing
 
-	assert (np.nansum(tpf.flux.value) - 4128732700.0) < 0.01 # very simple checksum! improve this long term
+	assert (np.nansum(tpf.flux.value) - 41293316000.0) < 0.01 # very simple checksum! improve this long term
