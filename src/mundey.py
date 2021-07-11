@@ -8,6 +8,8 @@ import astropy.coordinates as coord
 import astropy.units as u
 from IPython.core.display import display, HTML
 
+from tqdm import tqdm
+
 import pkg_resources
 
 import warnings
@@ -222,9 +224,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 		x = np.arange(nrows)/nrows-0.5
 		ks = np.arange(20,50)
 
-		for frame in np.arange(tvcol.shape[0]):
-			if frame % 1000 == 0:
-				print('Frame '+str(frame)+' of '+str(tvcol.shape[0]))
+		for frame in tqdm(np.arange(tvcol.shape[0]),desc='Frame'):
 			aics = []
 			y = np.nanmean(tvcol[frame,:,:-1],axis=1) #Average over all but the last column, which seems to be off
 
