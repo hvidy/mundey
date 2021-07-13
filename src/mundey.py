@@ -21,7 +21,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 # Main routine to perform a new calibration of a TESS target pixel file
 # =========================================================================
 
-	def calibrate(self,verbose=True,smear='alternate',ddir='./'):
+	def calibrate(self,verbose=True,smear='alternate',ddir='./',target=None,use_simbad=True):
 		"""Performs a new calibration for a target pixel file
 			Parameters
 			----------
@@ -35,12 +35,17 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 		"""
 
 		#Identify star we're looking at
-		customSimbad = Simbad()
-		customSimbad.add_votable_fields('flux(V)')
+		if target is not None:
+			target = target 
+		elif use_simbad:
+			customSimbad = Simbad()
+			customSimbad.add_votable_fields('flux(V)')
 
-		result_table = customSimbad.query_region(coord.SkyCoord(self.ra,self.dec, unit=(u.deg, u.deg), frame='icrs'))
-		result_table.sort(['FLUX_V'])
-		target = result_table[0]["MAIN_ID"]
+			result_table = customSimbad.query_region(coord.SkyCoord(self.ra,self.dec, unit=(u.deg, u.deg), frame='icrs'))
+			result_table.sort(['FLUX_V'])
+			target = result_table[0]["MAIN_ID"]
+		else:
+			target = 'TIC ' + str(self.targetid)
 		self.ddir = ddir
 
 
