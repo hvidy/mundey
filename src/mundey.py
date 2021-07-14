@@ -341,7 +341,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 		if smrow.shape[0] == 2: #TPF goes over two outputs
 			newsmrow = np.zeros((smrow.shape[1],10,1024))
 			newsmrow[:,:,:512] = smrow[0]
-			newsmrow[:,:,512] = smrow[1]
+			newsmrow[:,:,512:] = smrow[1]
 			smrow = newsmrow
 		else:
 			smrow = smrow[0]
