@@ -85,6 +85,8 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 			print("")
 			print("Loading collateral target pixel files")
 
+		#Search for colleteral data
+
 		sm_cal = np.zeros((len(set(outputs)),flux.shape[0],10,512))
 		tv_cal = np.zeros((len(set(outputs)),flux.shape[0],2078,11))
 
@@ -105,6 +107,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 			tv_cal[idx] = tvcol[1].data['TVCOL_RAW']
 
 
+		# Subtract fixed offset, add mean black
 		for idx,output in enumerate(set(outputs)):
 			indices = [i for i, x in enumerate(outputs) if x == output]
 
@@ -113,6 +116,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 			tv_cal[idx] = self.fixedoffset_meanblack(tv_cal[idx],output,verbose=False)
 	
 
+		# Remove 2D black
 		black2dfile = self.ddir+'tess2018323-'+str(self.camera)+'-'+str(self.ccd)+'-2dblack.fits'
 
 		if verbose:
@@ -149,29 +153,34 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 				tx2 = 2136
 			sm_cal[idx] = self.twodblack(sm_cal[idx],black2dimg[2058:2068,sx1:sx2],verbose=False)
 			tv_cal[idx] = self.twodblack(tv_cal[idx],black2dimg[:,tx1:tx2],verbose=False)
-		
+
+		# Remove 1D black		
 		for idx,output in enumerate(set(outputs)):
 			indices = [i for i, x in enumerate(outputs) if x == output]
 
 			flux,sm_cal[idx] = self.onedblack(flux,sm_cal[idx],tv_cal[idx],verbose=verbose)
 
+		# Correct for non-linearity and gain
 		for idx,output in enumerate(set(outputs)):
 			indices = [i for i, x in enumerate(outputs) if x == output]
 		
 			flux[:,:,indices] = self.linearity_gain(flux[:,:,indices],output,verbose=verbose)
 			sm_cal[idx] = self.linearity_gain(sm_cal[idx],output,verbose=False)
 
+		# Correct for LDE undershoot
 		for idx,output in enumerate(set(outputs)):
 			indices = [i for i, x in enumerate(outputs) if x == output]
 
 			flux[:,:,indices] = self.undershoot(flux[:,:,indices],output,verbose=verbose)
 			sm_cal[idx] = self.undershoot(sm_cal[idx],output,verbose=False)
 
-
+		# Smear correction
 		flux = self.smear(flux,sm_cal,outputs[0],smear=smear,verbose=verbose)
 
+		# Flatfield correction
 		flux = self.flatfield(flux,verbose=verbose)
 
+		# Convert to electrons per second
 		flux = self.to_electrons_per_second(flux,verbose=verbose)
 
 		self.hdu[1].data['FLUX'] = flux
@@ -212,7 +221,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 	def onedblack(self,img,smrow,tvcol,verbose=True):
 		if verbose:
 			print("")
-			print("Performing 1-D black correction")
+			print("Calculating 1-D black correction")
 			print("... this step may take a while;")
 			print("... if you haven't already done so")
 			print("... you might like to take this opportunity")
