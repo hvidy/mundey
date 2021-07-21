@@ -12,7 +12,6 @@ from tqdm import tqdm
 
 import pkg_resources
 
-import warnings
 
 class mundey_tpf(lightkurve.TessTargetPixelFile):
 
@@ -83,28 +82,61 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 			print("CCD: " +str(self.ccd))
 			print("Outputs: " +str(set(outputs)))
 			print("")
-			print("Loading collateral target pixel files")
+			print("Searching for collateral target pixel files")
 
 		#Search for colleteral data
 
 		sm_cal = np.zeros((len(set(outputs)),flux.shape[0],10,512))
 		tv_cal = np.zeros((len(set(outputs)),flux.shape[0],2078,11))
+		calcsmear = np.zeros(len(set(outputs)),dtype=bool)
+		calcblack = np.zeros(len(set(outputs)),dtype=bool)
+
 
 		for idx,output in enumerate(set(outputs)):
 
-			smrowfile = self.ddir+path.split('/')[-1].split('-')[0]+'-'+path.split('/')[-1].split('-')[1]+'-smrow-'+str(self.camera)+'-'+str(self.ccd)+'-'+output.lower()+'-'+path.split('/')[-1].split('-')[3]+'-s_col.fits'
-			if verbose:
-				print("... loading smear row file "+smrowfile)
+			smearfile = self.ddir+path.split('/')[-1].split('-')[0]+'-'+path.split('/')[-1].split('-')[1]+'-smrow-'+str(self.camera)+'-'+str(self.ccd)+'-'+output.lower()+'-'+path.split('/')[-1].split('-')[3]+'-s_col-blf.fits'
 
-			smrow = fits.open(smrowfile)
-			sm_cal[idx] = smrow[1].data['SMROW_RAW']
+			try:
+				if verbose:
+					print("... loading smear file "+smearfile)
+				smrow = fits.open(smearfile)
+				sm_cal[idx,:,0,:] = smrow[1].data['SMEAR']
+				calcsmear[idx]=False
+			
+			except FileNotFoundError:
+				smrowfile = self.ddir+path.split('/')[-1].split('-')[0]+'-'+path.split('/')[-1].split('-')[1]+'-smrow-'+str(self.camera)+'-'+str(self.ccd)+'-'+output.lower()+'-'+path.split('/')[-1].split('-')[3]+'-s_col.fits'
+			
+				if verbose:
+					print("... file not found: "+smearfile)
+					print("... smear correction will be calculated from raw counts")
+					print("... loading smear row file "+smrowfile)
+					print("")
 
-			tvcolfile = self.ddir+path.split('/')[-1].split('-')[0]+'-'+path.split('/')[-1].split('-')[1]+'-tvcol-'+str(self.camera)+'-'+str(self.ccd)+'-'+output.lower()+'-'+path.split('/')[-1].split('-')[3]+'-s_col.fits'
-			if verbose:
-				print("... loading trailing virtual column file "+tvcolfile)
+				smrow = fits.open(smrowfile)
+				sm_cal[idx] = smrow[1].data['SMROW_RAW']
+				calcsmear[idx]=True
 
-			tvcol = fits.open(tvcolfile)
-			tv_cal[idx] = tvcol[1].data['TVCOL_RAW']
+	
+			onedblackfile = self.ddir+path.split('/')[-1].split('-')[0]+'-'+path.split('/')[-1].split('-')[1]+'-tvcol-'+str(self.camera)+'-'+str(self.ccd)+'-'+output.lower()+'-'+path.split('/')[-1].split('-')[3]+'-s_col-blf.fits'
+			
+			try:
+				if verbose:
+					print("... loading 1D black file "+onedblackfile)
+				tvcol = fits.open(onedblackfile)
+				tv_cal[idx,:,:,0] = tvcol[1].data['1DBLACK']
+				calcblack[idx]=False
+
+			except FileNotFoundError:
+				tvcolfile = self.ddir+path.split('/')[-1].split('-')[0]+'-'+path.split('/')[-1].split('-')[1]+'-tvcol-'+str(self.camera)+'-'+str(self.ccd)+'-'+output.lower()+'-'+path.split('/')[-1].split('-')[3]+'-s_col.fits'
+				if verbose:
+					print("... file not found: "+onedblackfile)
+					print("... 1D black correction will be calculated from raw counts")
+					print("... loading trailing virtual column file "+tvcolfile)
+					print("")
+
+				tvcol = fits.open(tvcolfile)
+				tv_cal[idx] = tvcol[1].data['TVCOL_RAW']
+				calcblack[idx]=True
 
 
 		# Subtract fixed offset, add mean black
@@ -112,8 +144,10 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 			indices = [i for i, x in enumerate(outputs) if x == output]
 
 			flux[:,:,indices] = self.fixedoffset_meanblack(flux[:,:,indices],output,verbose=verbose)
-			sm_cal[idx] = self.fixedoffset_meanblack(sm_cal[idx],output,verbose=False)
-			tv_cal[idx] = self.fixedoffset_meanblack(tv_cal[idx],output,verbose=False)
+			if calcsmear[idx]:
+				sm_cal[idx] = self.fixedoffset_meanblack(sm_cal[idx],output,verbose=False)
+			if calcblack[idx]:
+				tv_cal[idx] = self.fixedoffset_meanblack(tv_cal[idx],output,verbose=False)
 	
 
 		# Remove 2D black
@@ -151,31 +185,55 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 				sx2 = 2092
 				tx1 = 2125
 				tx2 = 2136
-			sm_cal[idx] = self.twodblack(sm_cal[idx],black2dimg[2058:2068,sx1:sx2],verbose=False)
-			tv_cal[idx] = self.twodblack(tv_cal[idx],black2dimg[:,tx1:tx2],verbose=False)
+			if calcsmear[idx]:
+				sm_cal[idx] = self.twodblack(sm_cal[idx],black2dimg[2058:2068,sx1:sx2],verbose=False)
+			if calcblack[idx]:
+				tv_cal[idx] = self.twodblack(tv_cal[idx],black2dimg[:,tx1:tx2],verbose=False)
+
+
+		# Calculate 1D black
+		for idx,output in enumerate(set(outputs)):
+			if calcblack[idx]:
+				tv_cal[idx] = self.calconedblack(tv_cal[idx],output,verbose=verbose)
+
 
 		# Remove 1D black		
+		tv_cal = tv_cal[:,:,:,0] #By now only this slice has the calibrated value
+
 		for idx,output in enumerate(set(outputs)):
 			indices = [i for i, x in enumerate(outputs) if x == output]
 
-			flux,sm_cal[idx] = self.onedblack(flux,sm_cal[idx],tv_cal[idx],verbose=verbose)
+			flux = self.onedblack(flux[:,:,indices],tv_cal[idx,:,y1:y1+dy],verbose=verbose)
+			if calcsmear:
+				sm_cal[idx] = self.onedblack(sm_cal[idx],tv_cal[idx,:,2058:2068],verbose=verbose)
+
 
 		# Correct for non-linearity and gain
 		for idx,output in enumerate(set(outputs)):
 			indices = [i for i, x in enumerate(outputs) if x == output]
 		
 			flux[:,:,indices] = self.linearity_gain(flux[:,:,indices],output,verbose=verbose)
-			sm_cal[idx] = self.linearity_gain(sm_cal[idx],output,verbose=False)
+			if calcsmear[idx]:
+				sm_cal[idx] = self.linearity_gain(sm_cal[idx],output,verbose=False)
+
 
 		# Correct for LDE undershoot
 		for idx,output in enumerate(set(outputs)):
 			indices = [i for i, x in enumerate(outputs) if x == output]
 
 			flux[:,:,indices] = self.undershoot(flux[:,:,indices],output,verbose=verbose)
-			sm_cal[idx] = self.undershoot(sm_cal[idx],output,verbose=False)
+			if calcsmear[idx]:
+				sm_cal[idx] = self.undershoot(sm_cal[idx],output,verbose=False)
 
-		# Smear correction
-		flux = self.smear(flux,sm_cal,outputs[0],smear=smear,verbose=verbose)
+
+		# Calculate smear correction
+		for idx,output in enumerate(set(outputs)):
+			if calcsmear[idx]:
+				sm_cal[idx] = self.calcsmear(flux,sm_cal[idx],output,smear=smear,verbose=verbose)
+
+		# Remove smear correction
+		sm_cal = sm_cal[:,:,0,:] #By now only this slice has the calibrated value
+		flux = self.smear(flux,sm_cal,output[0],verbose=verbose)
 
 		# Flatfield correction
 		flux = self.flatfield(flux,verbose=verbose)
@@ -215,10 +273,10 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 		return img
 
 # =========================================================================
-# Calculate 1D black and remove it
+# Calculate 1D black
 # =========================================================================
 
-	def onedblack(self,img,smrow,tvcol,verbose=True):
+	def calconedblack(self,tvcol,output,verbose=True):
 		if verbose:
 			print("")
 			print("Calculating 1-D black correction")
@@ -238,6 +296,8 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 		x = np.arange(nrows)/nrows-0.5
 		ks = np.arange(20,50)
 
+		black1d = np.zeros((tvcol.shape[0],tvcol.shape[1]))
+
 		for frame in tqdm(np.arange(tvcol.shape[0]),desc='Frame'):
 			aics = []
 			y = np.nanmean(tvcol[frame,:,:-1],axis=1) #Average over all but the last column, which seems to be off
@@ -250,12 +310,35 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 			order = ks[np.argmin(np.asarray(aics))]
 			p = np.polynomial.Polynomial.fit(x,y,order)
 
-			black1d = p(x)
+			black1d[frame,:] = p(x)
 
-			img[frame,:,:] = img[frame,:,:] - np.expand_dims(black1d[y1:y1+dy],axis=1)
-			smrow[frame,:,:] = smrow[frame,:,:] - np.expand_dims(black1d[2058:2068],axis=1)
+		#Save calibration data for later use
+		col1 = fits.Column(name=self.hdu[1].header['TTYPE1'], format=self.hdu[1].header['TFORM1'], unit=self.hdu[1].header['TUNIT1'], disp=self.hdu[1].header['TDISP1'], array=self.hdu[1].data['TIME'])
+		col2 = fits.Column(name=self.hdu[1].header['TTYPE2'], format=self.hdu[1].header['TFORM2'], disp=self.hdu[1].header['TDISP2'], array=self.hdu[1].data['CADENCENO'])
+		col3 = fits.Column(name='1DBLACK', format=str(black1d.shape[1])+'D', unit='count', disp='F14.7', dim='('+str(black1d.shape[1])+')', array=black1d)
 
-		return img,smrow
+		cols = fits.ColDefs([col1,col2,col3])
+		blackhdu = fits.BinTableHDU.from_columns(cols)
+
+		path=self.path
+		onedblackfile = self.ddir+path.split('/')[-1].split('-')[0]+'-'+path.split('/')[-1].split('-')[1]+'-tvcol-'+str(self.camera)+'-'+str(self.ccd)+'-'+output.lower()+'-'+path.split('/')[-1].split('-')[3]+'-s_col-blf.fits'
+		blackhdu.writeto(onedblackfile)
+
+		tvcol[:,:,0] = black1d
+
+		return tvcol
+
+# =========================================================================
+# Remove 1D black
+# =========================================================================	
+
+	def onedblack(self,img,onedblackimg,verbose=True):
+		if verbose:
+			print("Performing 1-D black correction")
+
+		img = img - np.expand_dims(onedblackimg,axis=2)
+
+		return img		
 
 # =========================================================================
 # Correct for non-linearity and gain
@@ -325,13 +408,13 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 		return img
 
 # =========================================================================
-# Calculate and correct smear
+# Calculate smear
 # =========================================================================
 
-	def smear(self,img,smrow,output,smear='alternate',verbose=True):
+	def calcsmear(self,img,smrow,output,smear='alternate',verbose=True):
 		if verbose:
 			print("")
-			print("Correcting for photometric smear")
+			print("Calculating photometric smear")
 
 		#Origin and dimensions of the target pixel file relative to the smear data
 		if output == 'A':
@@ -346,14 +429,6 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 		x1 = self.hdu[2].header['CRVAL1P']-1-sx1
 		dx = self.hdu[2].header['NAXIS1']
 		dy = self.hdu[2].header['NAXIS2']
-
-		if smrow.shape[0] == 2: #TPF goes over two outputs
-			newsmrow = np.zeros((smrow.shape[1],10,1024))
-			newsmrow[:,:,:512] = smrow[0]
-			newsmrow[:,:,512:] = smrow[1]
-			smrow = newsmrow
-		else:
-			smrow = smrow[0]
 
 		#Calculate the 'regular' smear correction
 		smcor = np.nanmedian(smrow,axis=1)
@@ -381,15 +456,57 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 			#Estimate the background and remove it from the smear correction. Here we can use the median level for the regular smear correction
 			msk = (np.arange(smrow.shape[2]) < x1) | (np.arange(smrow.shape[2]) > x1 + dx)
 			bkgd = np.nanmin(smbkgd,axis=1) - np.nanmedian(smcor[:,msk],axis=1)
-			sm = smbkgd - np.tile(bkgd[:,np.newaxis],dx)
+
+			smcor[:,np.max([x1,0]):x1+dx] = smbkgd[:,-dx-np.min([x1,0]):] - np.tile(bkgd[:,np.newaxis],dx+np.min([x1,0]))
 
 
-		if smear == 'standard':
-			sm = smcor[:,x1:x1+dx]
+		#Save calibration data for later use
+		col1 = fits.Column(name=self.hdu[1].header['TTYPE1'], format=self.hdu[1].header['TFORM1'], unit=self.hdu[1].header['TUNIT1'], disp=self.hdu[1].header['TDISP1'], array=self.hdu[1].data['TIME'])
+		col2 = fits.Column(name=self.hdu[1].header['TTYPE2'], format=self.hdu[1].header['TFORM2'], disp=self.hdu[1].header['TDISP2'], array=self.hdu[1].data['CADENCENO'])
+		col3 = fits.Column(name='SMEAR', format=str(smcor.shape[1])+'D', unit='count', disp='F14.7', dim='('+str(smcor.shape[1])+')', array=smcor)
 
-		#Apply the new correction
-		img = img - np.expand_dims(sm,axis=1)
+		cols = fits.ColDefs([col1,col2,col3])
+		smearhdu = fits.BinTableHDU.from_columns(cols)
 
+		path=self.path
+		smearfile = self.ddir+path.split('/')[-1].split('-')[0]+'-'+path.split('/')[-1].split('-')[1]+'-smrow-'+str(self.camera)+'-'+str(self.ccd)+'-'+output.lower()+'-'+path.split('/')[-1].split('-')[3]+'-s_col-blf.fits'
+		smearhdu.writeto(smearfile)		
+
+		smrow[:,0,:] = smcor
+
+		return smrow
+
+# =========================================================================
+# Remove smear
+# =========================================================================
+	
+	def smear(self,img,sm,output,verbose=True):
+		if verbose:
+			print("")
+			print("Removing photometric smear")
+
+		#Origin and dimensions of the target pixel file relative to the smear data
+		if output == 'A':
+			sx1 = 44
+		if output == 'B':
+			sx1 = 556
+		if output == 'C':
+			sx1 = 1068
+		if output == 'D':
+			sx1 = 1580
+
+		x1 = self.hdu[2].header['CRVAL1P']-1-sx1
+		dx = self.hdu[2].header['NAXIS1']
+
+		if sm.shape[0] == 2: #TPF goes over two outputs
+			newsm = np.zeros((sm.shape[1],10,1024))
+			newsm[:,:,:512] = sm[0]
+			newsm[:,:,512:] = sm[1]
+			sm = newsm
+		else:
+			sm = sm[0]		
+
+		img = img - np.expand_dims(sm[:,x1:x1+dx],axis=1)
 
 		return img
 
