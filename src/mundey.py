@@ -20,11 +20,12 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 # Main routine to perform a new calibration of a TESS target pixel file
 # =========================================================================
 
-	def calibrate(self,verbose=True,smear='alternate',ddir='./',target=None,use_simbad=True):
+	def calibrate(self,verbose=True,smear='automatic',ddir='./',target=None,use_simbad=True):
 		"""Performs a new calibration for a target pixel file
 			Parameters
 			----------
-			smear : 'standard', or 'alternate'
+			smear : 'automatric', standard', or 'alternate'
+				If the string 'automatic' is passed, will automatically work out which smear correction to use
 				If the string 'standard' is passed, will calculate the smear correction directly from the collateral files.
 				If the string 'alternate' is passed, smear correction will be estimated from the target pixel file.
 
@@ -76,6 +77,13 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 		y1 = self.hdu[2].header['CRVAL2P']-1
 		dy = self.hdu[2].header['NAXIS2']
 
+		#Determine which smear correction to use if set to auto
+		if smear == 'automatic':
+			if y1+dy >= 2048:
+				smear = 'alternate'
+			else:
+				smear = 'standard'
+
 		if verbose:
 			print("Sector: "+str(self.sector))
 			print("Camera: " +str(self.camera))
@@ -84,7 +92,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 			print("")
 			print("Searching for collateral target pixel files")
 
-		#Search for colleteral data
+		#Search for collateral data
 
 		sm_cal = np.zeros((len(set(outputs)),flux.shape[0],10,512))
 		tv_cal = np.zeros((len(set(outputs)),flux.shape[0],2078,11))
@@ -414,7 +422,10 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 	def calcsmear(self,img,smrow,output,smear='alternate',verbose=True):
 		if verbose:
 			print("")
-			print("Calculating photometric smear")
+			if smear == 'alternate':
+				print("Calculating photometric smear from TPF background")
+			if smear == 'standard':
+				print("Calculating photometric smear from collateral data")
 
 		#Origin and dimensions of the target pixel file relative to the smear data
 		if output == 'A':
