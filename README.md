@@ -1,7 +1,7 @@
 # mundey
 [![Licence](http://img.shields.io/badge/license-GPLv3-blue.svg?style=flat)](http://www.gnu.org/licenses/gpl-3.0.html)
 [![integration](https://github.com/hvidy/mundey/actions/workflows/tests.yml/badge.svg)](https://github.com/hvidy/mundey/actions/workflows/tests.yml)
-[![PyPI version](https://img.shields.io/py/mundey.svg)](https://pypi.python.org/pypi/mundey)
+[![PyPI version](https://badge.fury.io/py/mundey.svg)](https://badge.fury.io/py/mundey)
 
 Saving Sirius - Recalibration of TESS target pixel files for the brightest stars
 
