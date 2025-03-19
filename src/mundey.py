@@ -1,3 +1,4 @@
+import sys
 import numpy as np 
 from astropy.io import fits
 import xml.etree.ElementTree as ET
@@ -20,7 +21,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 # Main routine to perform a new calibration of a TESS target pixel file
 # =========================================================================
 
-	def calibrate(self,verbose=True,smear='automatic',ddir='./',target=None,use_simbad=True):
+	def calibrate(self,verbose=True,smear='automatic',smear_range=None,wings=None,ddir='./',target=None,use_simbad=True):
 		"""Performs a new calibration for a target pixel file
 			Parameters
 			----------
@@ -28,6 +29,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 				If the string 'automatic' is passed, will automatically work out which smear correction to use
 				If the string 'standard' is passed, will calculate the smear correction directly from the collateral files.
 				If the string 'alternate' is passed, smear correction will be estimated from the target pixel file.
+				If the string 'both' is passed, smear correction will be estimated from both the and the target pixel file.
 
 			Returns
 			-------
@@ -237,7 +239,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 		# Calculate smear correction
 		for idx,output in enumerate(set(outputs)):
 			if calcsmear[idx]:
-				sm_cal[idx] = self.calcsmear(flux,sm_cal[idx],output,smear=smear,verbose=verbose)
+				sm_cal[idx] = self.calcsmear(flux,sm_cal[idx],output,smear=smear,smear_range=smear_range,wings=wings, verbose=verbose)
 
 		# Remove smear correction
 		sm_cal = sm_cal[:,:,0,:] #By now only this slice has the calibrated value
@@ -419,13 +421,15 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 # Calculate smear
 # =========================================================================
 
-	def calcsmear(self,img,smrow,output,smear='alternate',verbose=True):
+	def calcsmear(self,img,smrow,output,smear='alternate',smear_range=None,wings=None,verbose=True):
 		if verbose:
 			print("")
 			if smear == 'alternate':
 				print("Calculating photometric smear from TPF background")
 			if smear == 'standard':
 				print("Calculating photometric smear from collateral data")
+			if smear == 'both':
+				print("Calculating photometric smear using both TPF background and collateral data")
 
 		#Origin and dimensions of the target pixel file relative to the smear data
 		if output == 'A':
@@ -441,10 +445,14 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 		dx = self.hdu[2].header['NAXIS1']
 		dy = self.hdu[2].header['NAXIS2']
 
+		if smear_range == None or wings == None:
+			print('Warning: Specify both smear_range and wings. Revert to calculating photometric smear from TPF background')
+			smear = 'alternate'
+
 		#Calculate the 'regular' smear correction
 		smcor = np.nanmedian(smrow,axis=1)
 
-		if smear == 'alternate':
+		if smear == 'alternate' or smear == 'both':
 			#Find which rows are below the bleed column
 			medimg = np.nanmedian(img,axis=0)
 
@@ -461,17 +469,31 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
 				idx = medimg[:maxrow,col] < np.percentile(medimg[:maxrow,col],20)
 				smmask[:maxrow,col][idx] = True
 
-			#From the background pixels calculate a smear correction + background for each column as a function of time
-			smbkgd = np.nanmean(img.T[smmask.T].reshape(dx,int(np.sum(smmask)/dx),img.shape[0]),axis=1).T
+			if smear == 'alternate':
+				#From the background pixels calculate a smear correction + background for each column as a function of time
+				smbkgd = np.nanmean(img.T[smmask.T].reshape(dx,int(np.sum(smmask)/dx),img.shape[0]),axis=1).T
 
-			#Estimate the background and remove it from the smear correction. Here we can use the median level for the regular smear correction
-			msk = (np.arange(smrow.shape[2]) < x1) | (np.arange(smrow.shape[2]) > x1 + dx)
-			bkgd = np.nanmin(smbkgd,axis=1) - np.nanmedian(smcor[:,msk],axis=1)
+				#Estimate the background and remove it from the smear correction. Here we can use the median level for the regular smear correction
+				msk = (np.arange(smrow.shape[2]) < x1) | (np.arange(smrow.shape[2]) > x1 + dx)
+				bkgd = np.nanmin(smbkgd,axis=1) - np.nanmedian(smcor[:,msk],axis=1)
 
-			smcor[:,np.max([x1,0]):x1+dx] = smbkgd[:,-dx-np.min([x1,0]):] - np.tile(bkgd[:,np.newaxis],dx+np.min([x1,0]))
+				smcor[:,np.max([x1,0]):x1+dx] = smbkgd[:,-dx-np.min([x1,0]):] - np.tile(bkgd[:,np.newaxis],dx+np.min([x1,0]))
+            
+			if smear == 'both':
+				left_smear, right_smear = smear_range[0] - (sx1 + x1) - 1, smear_range[1] - (sx1 + x1)
+				left_wings, right_wings = wings[0] - (sx1 + x1) - 1, wings[1] - (sx1 + x1)
 
+				#From the background pixels calculate a smear correction + background for each column as a function of time
+				smbkgd = np.nanmean(img.T[smmask.T].reshape(dx,int(np.sum(smmask)/dx),img.shape[0]),axis=1).T
 
-		#Save calibration data for later use
+				#Estimate the background and remove it from the smear correction. Here we can use the median level for the regular smear correction
+				msk = (np.arange(smrow.shape[2]) < x1) | (np.arange(smrow.shape[2]) > x1 + dx)
+				bkgd = np.nanmin(smbkgd[:, left_wings: right_wings],axis=1) - np.nanmedian(smcor[:,msk],axis=1)
+
+				smcor_copy = smbkgd[:,-dx-np.min([x1,0]):] - np.tile(bkgd[:,np.newaxis],dx+np.min([x1,0]))
+				smcor[:,np.max([x1 + left_smear,0]):x1+right_smear] = smcor_copy[:,left_smear:right_smear]
+		
+        #Save calibration data for later use
 		col1 = fits.Column(name=self.hdu[1].header['TTYPE1'], format=self.hdu[1].header['TFORM1'], unit=self.hdu[1].header['TUNIT1'], disp=self.hdu[1].header['TDISP1'], array=self.hdu[1].data['TIME'])
 		col2 = fits.Column(name=self.hdu[1].header['TTYPE2'], format=self.hdu[1].header['TFORM2'], disp=self.hdu[1].header['TDISP2'], array=self.hdu[1].data['CADENCENO'])
 		col3 = fits.Column(name='SMEAR', format=str(smcor.shape[1])+'D', unit='count', disp='F14.7', dim='('+str(smcor.shape[1])+')', array=smcor)
