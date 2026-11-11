@@ -22,6 +22,8 @@ class SyntheticTPFBundle:
     true_signal: np.ndarray
     true_star_cube: np.ndarray
     true_sky_cube: np.ndarray
+    cr_cube: np.ndarray
+    injected_flux_cube: np.ndarray
     bleed_mask: np.ndarray
     columns_1based: np.ndarray
     outputs: tuple[str, ...]
@@ -64,6 +66,60 @@ def _write_linearity_xml(path: Path, camera: int, ccd: int) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _invert_linearity_poly(
+    dn_linear: np.ndarray,
+    *,
+    originx: float = 850.0,
+    scalex: float = 2.5e-5,
+    coeffs: tuple[float, float, float] = (1.0, -0.02, 0.03),
+) -> np.ndarray:
+    """Invert ``d * p((d - originx) * scalex) = dn_linear`` via Newton-Raphson."""
+    d = np.array(dn_linear, dtype=np.float64, copy=True)
+    c0, c1, c2 = coeffs
+    for _ in range(10):
+        s = (d - originx) * scalex
+        ps = c0 + c1 * s + c2 * (s * s)
+        dps_dd = (c1 + 2.0 * c2 * s) * scalex
+        f_val = d * ps - dn_linear
+        df_val = ps + d * dps_dd
+        d = d - f_val / df_val
+    return d
+
+
+def _apply_forward_undershoot(
+    e_per_frame: np.ndarray,
+    output: str,
+    u_coeff: float,
+) -> np.ndarray:
+    """Apply exact forward serial LDE undershoot inverse to ``mundey_tpf.undershoot``."""
+    w = np.asarray(e_per_frame, dtype=np.float64)
+    z = np.empty_like(w)
+    m = w.shape[-1]
+    if output in ("A", "C"):
+        z[..., 0] = w[..., 0] / (1.0 + u_coeff)
+        for j in range(1, m):
+            z[..., j] = w[..., j] - u_coeff * z[..., j - 1]
+    else:
+        z[..., -1] = w[..., -1] / (1.0 + u_coeff)
+        for j in range(m - 2, -1, -1):
+            z[..., j] = w[..., j] - u_coeff * z[..., j + 1]
+    return z
+
+
+def _true_1dblack_profile(output: str, rows_0based: np.ndarray) -> np.ndarray:
+    """Evaluate output-specific quadratic 1D black profile (ADU summed over cadence)."""
+    offsets = {"A": 4.0, "B": 5.5, "C": 3.5, "D": 4.5}
+    x_norm = np.asarray(rows_0based, dtype=np.float64) / 2078.0 - 0.5
+    return offsets[output] + 3.0 * x_norm + 0.8 * (x_norm * x_norm)
+
+
+def _flat_field_subarray(rows_0based: np.ndarray, cols_0based: np.ndarray) -> np.ndarray:
+    """Evaluate deterministic smooth flat-field subarray matching ``flat.fits``."""
+    row_grid = np.linspace(0.0, 3.0, 2048, dtype=np.float64)[rows_0based][:, None]
+    col_grid = np.linspace(0.0, 4.0, 2136, dtype=np.float64)[cols_0based][None, :]
+    return (1.0 + 0.015 * np.sin(row_grid) * np.cos(col_grid)).astype(np.float32)
+
+
 def build_synthetic_tess_tpf(
     out_dir: Path,
     *,
@@ -79,15 +135,15 @@ def build_synthetic_tess_tpf(
     include_object_header: bool = True,
     flag_bad_cadence: bool = True,
     write_collateral: bool = True,
+    noise_sigma: float = 2.0,
+    bleed_in_smrow: bool = False,
     seed: int = 42,
 ) -> SyntheticTPFBundle:
     """Build a deterministic SPOC-schema TESS TPF (1-output or 2-output A/B).
 
-    Includes coherent pulsation + box transit modulation, ``> maxDomain`` saturated
-    bleed column, causal LDE serial undershoot (rightward on Output A, leftward on
-    Output B), sweeping dark (``< 10 e-/s``) to bright Earthshine (``> 600 e-/s``)
-    2D sky gradients, sparse cosmic-ray hits, a mid-sector downlink gap, and non-zero
-    stale SPOC ``FLUX_BKG`` values.
+    Synthesizes ``RAW_CNTS`` using the exact forward CCD readout physics matching
+    the generated static ``2dblack``, ``flat``, ``linearity.xml``, bundled
+    ``tess-undershoot.xml``, and collateral ``SMROW_RAW`` / ``TVCOL_RAW`` tables.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
@@ -116,13 +172,13 @@ def build_synthetic_tess_tpf(
         np.arange(nx, dtype=np.float64),
         indexing="ij",
     )
-    cy = 0.55 * (ny - 1)
+    cy = 0.72 * (ny - 1)
     cx = 0.5 * (nx - 1)
     r2 = (yy - cy) ** 2 + (xx - cx) ** 2
     psf_halo = 2_400.0 / (1.0 + r2 / 3.5) ** 2.0
     bleed_col = nx // 2
     bleed_mask = np.zeros((ny, nx), dtype=bool)
-    bleed_mask[max(0, ny // 4) :, bleed_col] = True
+    bleed_mask[max(1, int(0.55 * ny)) :, bleed_col] = True
 
     true_star_cube = true_signal[:, None, None] * psf_halo[None, :, :]
     # Inject saturated core/bleed exceeding maxDomain in electrons/s
@@ -151,15 +207,33 @@ def build_synthetic_tess_tpf(
     crblksz = 10
     n_eff = num_frm * (crblksz - 2) / crblksz  # 48 effective frames
     fxdoff = 209_700
+    black2d_val = 1.5
+    smear_base_e = 24.0
     gains = {"A": 5.28, "B": 5.26, "C": 5.25, "D": 5.21}
     meanblc = {"A": 6812, "B": 6724, "C": 6753, "D": 6433}
+    sx1_map = {"A": 44, "B": 556, "C": 1068, "D": 1580}
 
-    # Causal LDE undershoot forward injection (opposite directions on A vs B)
-    underroot = load_undershoot_xml()
-    total_e_per_s = true_star_cube + true_sky_cube + cr_cube + rng.normal(
-        0.0, 2.0, size=(n_cadences, ny, nx)
+    noise_cube = (
+        rng.normal(0.0, noise_sigma, size=(n_cadences, ny, nx))
+        if noise_sigma > 0.0
+        else np.zeros((n_cadences, ny, nx), dtype=np.float64)
     )
-    observed_e_per_s = total_e_per_s.copy()
+    injected_flux_cube = true_star_cube + true_sky_cube + cr_cube + noise_cube
+
+    rows_0based = np.arange(row0_1based - 1, row0_1based - 1 + ny, dtype=int)
+    cols_0based = cols_1based - 1
+    flat_cutout = _flat_field_subarray(rows_0based, cols_0based).astype(np.float64)
+
+    true_smear_cutout = np.full((n_cadences, nx), smear_base_e, dtype=np.float64)
+    if bleed_in_smrow:
+        true_smear_cutout[:, bleed_col] += 180.0 * true_signal
+
+    # Forward readout chain per output (flat -> smear -> undershoot -> nonlinearity -> blacks)
+    underroot = load_undershoot_xml()
+    u_coeffs: dict[str, float] = {}
+    raw_cnts = np.zeros((n_cadences, ny, nx), dtype=np.int32)
+    observed_e_per_s = np.zeros((n_cadences, ny, nx), dtype=np.float64)
+
     for out in unique_outputs:
         idx = [i for i, o in enumerate(col_outputs) if o == out]
         u_node = underroot.find(
@@ -167,19 +241,23 @@ def build_synthetic_tess_tpf(
         )
         assert u_node is not None
         u_coeff = float(u_node.attrib["undershoot"])
-        sub = observed_e_per_s[:, :, idx].copy()
-        if out in ("A", "C") and len(idx) > 1:
-            sub[:, :, 1:] -= u_coeff * sub[:, :, :-1]
-        elif out in ("B", "D") and len(idx) > 1:
-            sub[:, :, :-1] -= u_coeff * sub[:, :, 1:]
-        observed_e_per_s[:, :, idx] = sub
+        u_coeffs[out] = u_coeff
 
-    # Synthesize RAW_CNTS per output
-    raw_cnts = np.zeros((n_cadences, ny, nx), dtype=np.int32)
-    for i, out in enumerate(col_outputs):
-        dn_per_frame = observed_e_per_s[:, :, i] * int_time / gains[out]
-        counts = np.round(dn_per_frame * n_eff + fxdoff - meanblc[out]).astype(np.int32)
-        raw_cnts[:, :, i] = np.clip(counts, 0, 2_000_000_000)
+        sci_e_per_frame = injected_flux_cube[:, :, idx] * int_time * flat_cutout[None, :, idx]
+        w_e_per_frame = sci_e_per_frame + true_smear_cutout[:, None, idx]
+        z_e_per_frame = _apply_forward_undershoot(w_e_per_frame, out, u_coeff)
+        observed_e_per_s[:, :, idx] = z_e_per_frame / int_time
+
+        dn_per_frame = _invert_linearity_poly(z_e_per_frame / gains[out])
+        b1d_cutout = _true_1dblack_profile(out, rows_0based)
+        counts = np.round(
+            dn_per_frame * n_eff
+            + b1d_cutout[None, :, None]
+            + black2d_val
+            + fxdoff
+            - meanblc[out]
+        ).astype(np.int32)
+        raw_cnts[:, :, idx] = np.clip(counts, 0, 2_000_000_000)
 
     # Stale SPOC background (non-zero, to verify mundey zeroes FLUX_BKG & FLUX_BKG_ERR)
     spoc_flux_bkg = (true_sky_cube + 12.5).astype(np.float32)
@@ -388,40 +466,61 @@ def build_synthetic_tess_tpf(
 
     if write_collateral:
         # Static 2D black (2078 x 2136) and flat field (2048 x 2136)
-        black2d = np.full((2078, 2136), 1.5, dtype=np.float32)
-        fits.HDUList([fits.PrimaryHDU(), fits.ImageHDU(data=black2d)]).writeto(
-            out_dir / f"tess2018323-{camera}-{ccd}-2dblack.fits", overwrite=True
-        )
-        flat = np.ones((2048, 2136), dtype=np.float32)
-        fits.HDUList([fits.PrimaryHDU(), fits.ImageHDU(data=flat)]).writeto(
-            out_dir / f"tess2018323-{camera}-{ccd}-flat.fits", overwrite=True
-        )
-        _write_linearity_xml(
-            out_dir / "tess2018143203310-41006_100-linearity.xml", camera=camera, ccd=ccd
-        )
+        black2d_path = out_dir / f"tess2018323-{camera}-{ccd}-2dblack.fits"
+        if not black2d_path.exists():
+            black2d = np.full((2078, 2136), black2d_val, dtype=np.float32)
+            fits.HDUList([fits.PrimaryHDU(), fits.ImageHDU(data=black2d)]).writeto(
+                black2d_path, overwrite=True
+            )
+        flat_path = out_dir / f"tess2018323-{camera}-{ccd}-flat.fits"
+        if not flat_path.exists():
+            flat = _flat_field_subarray(np.arange(2048), np.arange(2136))
+            fits.HDUList([fits.PrimaryHDU(), fits.ImageHDU(data=flat)]).writeto(
+                flat_path, overwrite=True
+            )
+        lin_path = out_dir / "tess2018143203310-41006_100-linearity.xml"
+        if not lin_path.exists():
+            _write_linearity_xml(lin_path, camera=camera, ccd=ccd)
+
+        all_rows = np.arange(2078, dtype=int)
+        sm_rows = np.arange(2058, 2068, dtype=int)
+        bleed_out = col_outputs[bleed_col]
+        bleed_sm_col = int(cols_1based[bleed_col] - 1 - sx1_map[bleed_out])
 
         # Collateral smrow (N, 10, 512) and tvcol (N, 2078, 11) per output
         for out in unique_outputs:
             base_black = fxdoff - meanblc[out]
-            smrow_raw = np.full(
-                (n_cadences, 10, 512), base_black + 24.0, dtype=np.int32
-            )
+            sm_w = np.full((n_cadences, 10, 512), smear_base_e, dtype=np.float64)
+            if bleed_in_smrow and out == bleed_out and 0 <= bleed_sm_col < 512:
+                sm_w[:, :, bleed_sm_col] += 250_000.0
+            sm_z = _apply_forward_undershoot(sm_w, out, u_coeffs[out])
+            sm_dn = _invert_linearity_poly(sm_z / gains[out])
+            b1d_sm = _true_1dblack_profile(out, sm_rows)
+            smrow_raw = np.round(
+                sm_dn * n_eff + b1d_sm[None, :, None] + black2d_val + base_black
+            ).astype(np.int32)
             smrow_col = fits.Column(
                 name="SMROW_RAW",
                 format=f"{10 * 512}J",
                 dim="(512,10)",
                 array=smrow_raw,
             )
+            smrow_path = (
+                out_dir / f"{prefix}-smrow-{camera}-{ccd}-{out.lower()}-{run_id}-s_col.fits"
+            )
             fits.HDUList(
                 [fits.PrimaryHDU(), fits.BinTableHDU.from_columns([smrow_col])]
-            ).writeto(
-                out_dir / f"{prefix}-smrow-{camera}-{ccd}-{out.lower()}-{run_id}-s_col.fits",
-                overwrite=True,
-            )
+            ).writeto(smrow_path, overwrite=True)
 
-            row_ramp = np.linspace(-3.0, 3.0, 2078, dtype=np.float64)[None, :, None]
+            b1d_all = _true_1dblack_profile(out, all_rows)
+            tv_sigma = 0.25 if noise_sigma > 0.0 else 0.0
+            tv_noise = (
+                rng.normal(0.0, tv_sigma, size=(n_cadences, 2078, 11))
+                if tv_sigma > 0.0
+                else np.zeros((n_cadences, 2078, 11), dtype=np.float64)
+            )
             tvcol_raw = np.round(
-                base_black + 4.0 + row_ramp + rng.normal(0.0, 0.25, size=(n_cadences, 2078, 11))
+                base_black + black2d_val + b1d_all[None, :, None] + tv_noise
             ).astype(np.int32)
             tvcol_col = fits.Column(
                 name="TVCOL_RAW",
@@ -429,12 +528,12 @@ def build_synthetic_tess_tpf(
                 dim="(11,2078)",
                 array=tvcol_raw,
             )
+            tvcol_path = (
+                out_dir / f"{prefix}-tvcol-{camera}-{ccd}-{out.lower()}-{run_id}-s_col.fits"
+            )
             fits.HDUList(
                 [fits.PrimaryHDU(), fits.BinTableHDU.from_columns([tvcol_col])]
-            ).writeto(
-                out_dir / f"{prefix}-tvcol-{camera}-{ccd}-{out.lower()}-{run_id}-s_col.fits",
-                overwrite=True,
-            )
+            ).writeto(tvcol_path, overwrite=True)
 
     return SyntheticTPFBundle(
         tpf_path=tpf_path,
@@ -442,6 +541,8 @@ def build_synthetic_tess_tpf(
         true_signal=true_signal,
         true_star_cube=true_star_cube,
         true_sky_cube=true_sky_cube,
+        cr_cube=cr_cube,
+        injected_flux_cube=injected_flux_cube,
         bleed_mask=bleed_mask,
         columns_1based=cols_1based,
         outputs=unique_outputs,

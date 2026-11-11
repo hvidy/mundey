@@ -15,7 +15,7 @@ import lightkurve
 import numpy as np
 from astropy.io import fits
 
-from ._contract import write_mundey_provenance
+from ._contract import atomic_temp_path, write_mundey_provenance
 
 try:
     from tqdm import tqdm
@@ -172,6 +172,47 @@ def _build_blf_time_cadence_columns(
     return col_time, col_cad
 
 
+def _smear_blf_path(
+    ddir_path: Path,
+    parts: list[str],
+    camera: int,
+    ccd: int,
+    output: str,
+    smear: str,
+) -> Path:
+    """Resolve the mode- and target-scoped ``-blf.fits`` cache path for smear."""
+    out_lower = output.lower()
+    if smear == "alternate":
+        return ddir_path / (
+            f"{parts[0]}-{parts[1]}-smrow-{camera}-{ccd}-"
+            f"{out_lower}-{parts[2]}-{parts[3]}-alt-s_col-blf.fits"
+        )
+    return ddir_path / (
+        f"{parts[0]}-{parts[1]}-smrow-{camera}-{ccd}-{out_lower}-{parts[3]}-s_col-blf.fits"
+    )
+
+
+def _smear_cache_matches_cutout(
+    hdr: fits.Header,
+    smear: str,
+    hdu2_hdr: fits.Header,
+) -> bool:
+    """Verify a cached smear ``-blf.fits`` header matches ``smear`` and cutout bounds."""
+    if "SMEARMOD" in hdr and str(hdr["SMEARMOD"]).strip() != smear:
+        return False
+    if smear == "alternate":
+        checks = (
+            ("CRVAL1P", "CRVAL1P"),
+            ("CUTNX", "NAXIS1"),
+            ("CRVAL2P", "CRVAL2P"),
+            ("CUTNY", "NAXIS2"),
+        )
+        for cache_key, src_key in checks:
+            if cache_key in hdr and int(hdr[cache_key]) != int(hdu2_hdr[src_key]):
+                return False
+    return True
+
+
 class mundey_tpf(lightkurve.TessTargetPixelFile):
     """TargetPixelFile subclass for TESS bright-star recalibration."""
 
@@ -204,6 +245,11 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
         offline : bool, default False
             Disable all network queries (e.g. on HPC compute nodes).
         """
+        if smear not in ("automatic", "standard", "alternate"):
+            raise ValueError(
+                f"Invalid smear mode {smear!r}; expected 'automatic', 'standard', or 'alternate'."
+            )
+
         resolved_target = _resolve_target_name(
             self.hdu[0].header,
             self.ra,
@@ -232,6 +278,10 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
                 outputs.append("C")
             elif 1581 <= col <= 2092:
                 outputs.append("D")
+            else:
+                raise ValueError(
+                    f"TPF column {int(col)} falls outside TESS science outputs 45..2092."
+                )
 
         unique_outputs = [out for out in ("A", "B", "C", "D") if out in outputs]
         path_name = Path(self.path).name
@@ -264,14 +314,25 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
                 f"{parts[0]}-{parts[1]}-smrow-{self.camera}-{self.ccd}-"
                 f"{output.lower()}-{parts[3]}"
             )
-            smearfile = ddir_path / f"{stem_smrow}-s_col-blf.fits"
+            smearfile = _smear_blf_path(
+                ddir_path, parts, self.camera, self.ccd, output, smear
+            )
+            loaded_smear = False
             try:
                 if verbose:
                     print(f"... loading smear file {smearfile}")
                 with fits.open(smearfile) as smrow:
-                    sm_cal[idx, :, 0, :] = smrow[1].data["SMEAR"]
-                calcsmear[idx] = False
+                    if _smear_cache_matches_cutout(
+                        smrow[1].header, smear, self.hdu[2].header
+                    ):
+                        sm_cal[idx, :, 0, :] = smrow[1].data["SMEAR"]
+                        loaded_smear = True
             except FileNotFoundError:
+                loaded_smear = False
+
+            if loaded_smear:
+                calcsmear[idx] = False
+            else:
                 smrowfile = ddir_path / f"{stem_smrow}-s_col.fits"
                 if verbose:
                     print(f"... file not found: {smearfile}")
@@ -492,7 +553,8 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
             f"{parts[0]}-{parts[1]}-tvcol-{self.camera}-{self.ccd}-"
             f"{output.lower()}-{parts[3]}-s_col-blf.fits"
         )
-        blackhdu.writeto(onedblackfile, overwrite=True)
+        with atomic_temp_path(onedblackfile) as tmp_path:
+            blackhdu.writeto(tmp_path, overwrite=True)
 
         tvcol[:, :, 0] = black1d
         return tvcol
@@ -606,28 +668,47 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
         smcor = np.nanmedian(smrow, axis=1)
 
         if smear == "alternate":
-            medimg = np.nanmedian(img, axis=0)
-            maxrows = [
-                int(np.argmax(medimg[:, col][medimg[:, col] < 1e5])) for col in np.arange(dx)
-            ]
-            maxrow = int(np.nanmin(maxrows)) - 10
+            n_sm_cols = smcor.shape[1]
+            sm_start = max(int(x1), 0)
+            sm_end = min(int(x1 + dx), n_sm_cols)
+            tpf_start = sm_start - int(x1)
+            tpf_end = sm_end - int(x1)
 
-            smmask = np.zeros((dy, dx), dtype=bool)
-            for col in np.arange(dx):
-                idx = medimg[:maxrow, col] < np.percentile(medimg[:maxrow, col], 20)
-                smmask[:maxrow, col][idx] = True
+            if sm_end > sm_start:
+                medimg = np.nanmedian(img, axis=0)
+                maxrows = []
+                for col in np.arange(dx):
+                    unsat = medimg[:, col][medimg[:, col] < 1e5]
+                    if unsat.size > 0:
+                        maxrows.append(int(np.argmax(unsat)))
+                if maxrows:
+                    min_maxrow = int(np.nanmin(maxrows))
+                    maxrow = min_maxrow - 10 if min_maxrow > 10 else max(min_maxrow, 1)
+                else:
+                    maxrow = dy
 
-            smbkgd = np.nanmean(
-                img.T[smmask.T].reshape(dx, int(np.sum(smmask) / dx), img.shape[0]),
-                axis=1,
-            ).T
+                smmask = np.zeros((dy, dx), dtype=bool)
+                for col in np.arange(dx):
+                    sub = medimg[:maxrow, col]
+                    thresh = np.percentile(sub, 20)
+                    idx = sub < thresh
+                    if not np.any(idx):
+                        idx = sub <= thresh
+                    smmask[:maxrow, col][idx] = True
 
-            msk = (np.arange(smrow.shape[2]) < x1) | (np.arange(smrow.shape[2]) > x1 + dx)
-            bkgd = np.nanmin(smbkgd, axis=1) - np.nanmedian(smcor[:, msk], axis=1)
+                smbkgd = np.column_stack(
+                    [np.nanmean(img[:, smmask[:, col], col], axis=1) for col in range(dx)]
+                )
 
-            smcor[:, np.max([x1, 0]) : x1 + dx] = smbkgd[
-                :, -dx - np.min([x1, 0]) :
-            ] - np.tile(bkgd[:, np.newaxis], dx + np.min([x1, 0]))
+                cols_sm = np.arange(n_sm_cols)
+                msk = (cols_sm < sm_start) | (cols_sm >= sm_end)
+                bkgd = np.nanmin(smbkgd[:, tpf_start:tpf_end], axis=1) - np.nanmedian(
+                    smcor[:, msk], axis=1
+                )
+
+                smcor[:, sm_start:sm_end] = (
+                    smbkgd[:, tpf_start:tpf_end] - bkgd[:, np.newaxis]
+                )
 
         col1, col2 = _build_blf_time_cadence_columns(self.hdu[1])
         col3 = fits.Column(
@@ -640,12 +721,29 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
         )
 
         smearhdu = fits.BinTableHDU.from_columns(fits.ColDefs([col1, col2, col3]))
-        parts = Path(self.path).name.split("-")
-        smearfile = Path(self.ddir) / (
-            f"{parts[0]}-{parts[1]}-smrow-{self.camera}-{self.ccd}-"
-            f"{output.lower()}-{parts[3]}-s_col-blf.fits"
+        smearhdu.header["SMEARMOD"] = (smear, "Mundey smear estimation mode")
+        smearhdu.header["CRVAL1P"] = (
+            int(self.hdu[2].header["CRVAL1P"]),
+            "Cutout start CCD column",
         )
-        smearhdu.writeto(smearfile, overwrite=True)
+        smearhdu.header["CUTNX"] = (
+            int(self.hdu[2].header["NAXIS1"]),
+            "Cutout column width",
+        )
+        smearhdu.header["CRVAL2P"] = (
+            int(self.hdu[2].header["CRVAL2P"]),
+            "Cutout start CCD row",
+        )
+        smearhdu.header["CUTNY"] = (
+            int(self.hdu[2].header["NAXIS2"]),
+            "Cutout row height",
+        )
+        parts = Path(self.path).name.split("-")
+        smearfile = _smear_blf_path(
+            Path(self.ddir), parts, self.camera, self.ccd, output, smear
+        )
+        with atomic_temp_path(smearfile) as tmp_path:
+            smearhdu.writeto(tmp_path, overwrite=True)
 
         smrow[:, 0, :] = smcor
         return smrow
@@ -668,13 +766,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
         x1 = self.hdu[2].header["CRVAL1P"] - 1 - sx1
         dx = self.hdu[2].header["NAXIS1"]
 
-        if sm.shape[0] == 2:
-            newsm = np.zeros((sm.shape[1], 1024), dtype=sm.dtype)
-            newsm[:, :512] = sm[0]
-            newsm[:, 512:] = sm[1]
-            sm_combined = newsm
-        else:
-            sm_combined = sm[0]
+        sm_combined = np.concatenate(list(sm), axis=1)
 
         return img - np.expand_dims(sm_combined[:, x1 : x1 + dx], axis=1)
 

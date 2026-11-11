@@ -67,11 +67,13 @@ def test_halocver_roundtrip_and_slicing_lockstep(
     _, ny, nx = tpf.flux.shape
     assert n_raw > len(tpf.flux)  # fixture includes 1 quality-flagged cadence
 
+    assert tpf.hdu[1].header["BACKAPP"] is True
     write_mundey_provenance(tpf, bkgsub=False)
     assert tpf.hdu[0].header["HALOCVER"] == 1
     assert tpf.hdu[1].header["HALOCVER"] == 1
     assert tpf.hdu[0].header["BKGSUB"] is False
     assert tpf.hdu[1].header["BKGSUB"] is False
+    assert tpf.hdu[1].header["BACKAPP"] is False
     assert tpf.meta["HALOCVER"] == 1
     assert tpf.meta["BKGSUB"] is False
     assert read_mundey_provenance(tpf) == {"halocver": 1, "bkgsub": False}
@@ -130,18 +132,43 @@ def test_halocver_roundtrip_and_slicing_lockstep(
 
 
 def test_contract_validation_errors(synthetic_1output_tpf: lk.TessTargetPixelFile) -> None:
-    """Invalid PIXEL_QUALITY or SMEAR_ERR shapes/dtypes must raise clear errors."""
+    """Invalid PIXEL_QUALITY, SMEAR_ERR, or provenance headers must raise clear errors."""
     tpf = synthetic_1output_tpf
     _, ny, nx = tpf.flux.shape
 
     with pytest.raises(TypeError, match="integer or boolean dtype"):
         write_pixel_quality(tpf, np.zeros((ny, nx), dtype=np.float32))
 
+    with pytest.raises(TypeError, match="integer or boolean dtype"):
+        write_pixel_quality(tpf, np.full((ny, nx), "0", dtype="<U2"))
+
+    with pytest.raises(ValueError, match="negative"):
+        write_pixel_quality(tpf, np.full((ny, nx), -1, dtype=np.int32))
+
+    overflow = np.zeros((ny, nx), dtype=np.uint32)
+    overflow[0, 0] = 1 << 16
+    with pytest.raises(ValueError, match="exceeding uint16 max"):
+        write_pixel_quality(tpf, overflow)
+
     with pytest.raises(ValueError, match="does not match TPF spatial shape"):
         write_pixel_quality(tpf, np.zeros((ny + 1, nx), dtype=np.uint16))
 
     with pytest.raises(ValueError, match="does not match HDU\\[1\\]"):
         append_smear_err_column(tpf, np.ones((len(tpf.flux) - 3, nx), dtype=np.float32))
+
+    write_mundey_provenance(tpf, bkgsub=False)
+    tpf.hdu[1].header["BKGSUB"] = True
+    with pytest.raises(ValueError, match="Conflicting BKGSUB"):
+        read_mundey_provenance(tpf)
+
+    tpf.hdu[1].header["BKGSUB"] = "F"
+    with pytest.raises(ValueError, match="Invalid BKGSUB"):
+        read_mundey_provenance(tpf)
+
+    tpf.hdu[1].header["BKGSUB"] = False
+    tpf.hdu[1].header["HALOCVER"] = 2
+    with pytest.raises(ValueError, match="Conflicting HALOCVER"):
+        read_mundey_provenance(tpf)
 
 
 def test_resolve_cache_dir_scratch_default_and_fred_hpc_guard(

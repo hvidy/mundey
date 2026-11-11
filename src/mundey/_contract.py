@@ -72,39 +72,74 @@ def write_mundey_provenance(
 
     Writing to ``hdu[0].header`` exposes ``tpf.meta['HALOCVER']`` and
     ``tpf.meta['BKGSUB']`` automatically on ``lightkurve`` v2 ``TargetPixelFile``
-    instances without mutating the read-only ``MappingProxyType``.
+    instances without mutating the read-only ``MappingProxyType``. When SPOC's
+    standard ``BACKAPP`` card is present, it is synchronized to ``bool(bkgsub)``
+    so FITS consumers never observe contradictory background-subtraction flags.
     """
     hdul = _unwrap_hdulist(target)
     if len(hdul) < 2:
         raise ValueError("Expected HDUList with at least primary HDU[0] and PIXELS HDU[1].")
+    bkgsub_bool = bool(bkgsub)
+    halocver_int = int(halocver)
     for idx in (0, 1):
-        hdul[idx].header["HALOCVER"] = (
-            int(halocver),
+        hdr = hdul[idx].header
+        hdr["HALOCVER"] = (
+            halocver_int,
             "Halo photometry FITS contract version",
         )
-        hdul[idx].header["BKGSUB"] = (
-            bool(bkgsub),
+        hdr["BKGSUB"] = (
+            bkgsub_bool,
             "Whether sky background has been subtracted",
         )
+        if "BACKAPP" in hdr:
+            hdr["BACKAPP"] = bkgsub_bool
     meta = getattr(target, "meta", None)
     meta_dict = getattr(meta, "_dict", None)
     if isinstance(meta_dict, dict):
-        meta_dict["HALOCVER"] = int(halocver)
-        meta_dict["BKGSUB"] = bool(bkgsub)
+        meta_dict["HALOCVER"] = halocver_int
+        meta_dict["BKGSUB"] = bkgsub_bool
+        if "BACKAPP" in meta_dict:
+            meta_dict["BACKAPP"] = bkgsub_bool
     return hdul
 
 
 def read_mundey_provenance(target: fits.HDUList | Any) -> dict[str, int | bool | None]:
-    """Read ``HALOCVER`` and ``BKGSUB`` provenance metadata from ``hdu[0]``/``hdu[1]``."""
+    """Read and validate ``HALOCVER`` and ``BKGSUB`` across ``hdu[0]`` and ``hdu[1]``."""
     hdul = _unwrap_hdulist(target)
     halocver: int | None = None
     bkgsub: bool | None = None
     for idx in range(min(2, len(hdul))):
         hdr = hdul[idx].header
-        if halocver is None and "HALOCVER" in hdr:
-            halocver = int(hdr["HALOCVER"])
-        if bkgsub is None and "BKGSUB" in hdr:
-            bkgsub = bool(hdr["BKGSUB"])
+        if "HALOCVER" in hdr:
+            raw_ver = hdr["HALOCVER"]
+            if not isinstance(raw_ver, (int, np.integer)) or isinstance(
+                raw_ver, (bool, np.bool_)
+            ):
+                raise ValueError(
+                    f"Invalid HALOCVER header value in HDU[{idx}] (expected int): {raw_ver!r}."
+                )
+            ver_int = int(raw_ver)
+            if halocver is None:
+                halocver = ver_int
+            elif halocver != ver_int:
+                raise ValueError(
+                    f"Conflicting HALOCVER values between HDU[0] ({halocver}) "
+                    f"and HDU[{idx}] ({ver_int})."
+                )
+        if "BKGSUB" in hdr:
+            raw_bkg = hdr["BKGSUB"]
+            if not isinstance(raw_bkg, (bool, np.bool_)):
+                raise ValueError(
+                    f"Invalid BKGSUB header value in HDU[{idx}] (expected bool): {raw_bkg!r}."
+                )
+            bkg_bool = bool(raw_bkg)
+            if bkgsub is None:
+                bkgsub = bkg_bool
+            elif bkgsub != bkg_bool:
+                raise ValueError(
+                    f"Conflicting BKGSUB values between HDU[0] ({bkgsub}) "
+                    f"and HDU[{idx}] ({bkg_bool})."
+                )
     return {"halocver": halocver, "bkgsub": bkgsub}
 
 
@@ -117,10 +152,16 @@ def write_pixel_quality(
     raw = np.asarray(mask)
     if raw.ndim != 2:
         raise ValueError(f"PIXEL_QUALITY mask must be 2D (ny, nx), got shape {raw.shape}.")
-    if np.issubdtype(raw.dtype, np.floating) or np.issubdtype(raw.dtype, np.complexfloating):
+    if not (np.issubdtype(raw.dtype, np.integer) or np.issubdtype(raw.dtype, np.bool_)):
         raise TypeError(f"PIXEL_QUALITY mask must have integer or boolean dtype, got {raw.dtype}.")
-    if np.issubdtype(raw.dtype, np.signedinteger) and np.any(raw < 0):
-        raise ValueError("PIXEL_QUALITY mask cannot contain negative bitmask values.")
+    if np.issubdtype(raw.dtype, np.integer):
+        if np.any(raw < 0):
+            raise ValueError("PIXEL_QUALITY mask cannot contain negative bitmask values.")
+        uint16_max = int(np.iinfo(np.uint16).max)
+        if np.any(raw > uint16_max):
+            raise ValueError(
+                f"PIXEL_QUALITY mask contains values exceeding uint16 max ({uint16_max})."
+            )
 
     inferred = _infer_cutout_shape(hdul)
     if inferred is not None:
