@@ -17,7 +17,7 @@ The easiest option is just from PyPI:
 
 To install from source: clone this git repo, enter the directory, and run
 
-`python setup.py install`
+`pip install .`
 
 ## Smear calibration problems for bright stars observed by TESS
 
