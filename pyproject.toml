@@ -44,6 +44,9 @@ dev = [
     "ruff>=0.6",
 ]
 
+[project.scripts]
+mundey = "mundey.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/hvidy/mundey"
 Repository = "https://github.com/hvidy/mundey"
@@ -61,6 +64,7 @@ packages = ["src/mundey"]
 include = [
     "/src/mundey",
     "/src/mundey/data/*.xml",
+    "/hpc",
     "/tests",
     "/README.md",
     "/LICENSE",
