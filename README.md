@@ -17,7 +17,7 @@ The easiest option is just from PyPI:
 
 To install from source: clone this git repo, enter the directory, and run
 
-`python setup.py install`
+`pip install .`
 
 ## Smear calibration problems for bright stars observed by TESS
 
@@ -30,23 +30,23 @@ Bright stars saturate the TESS cameras, resulting in excess charge bleeding alon
 This code, `mundey`, recalibrates TESS target pixel files, including a new smear correction, calculated from the target pixel file itself, that circumvents this problem. It is simple to run mundey:
 
 ```python
-from mundey.mundey import mundey_tpf
+from mundey import mundey_tpf
 
 tpf_filename = 'tess2018349182459-s0006-0000000322899250-0126-s_tp.fits'
 
 tpf = mundey_tpf(tpf_filename)
 
-tpf.calibrate()
+tpf.calibrate(offline=True)
 ```
 
-The `mundey_tpf` class inherits the methods and attributes of the `lightkurve.TessTargetPixelFile` class.
+The `mundey_tpf` class inherits the methods and attributes of the `lightkurve.TessTargetPixelFile` class. Passing `offline=True` disables network queries (such as SIMBAD target-name lookups on compute nodes); SIMBAD is also skipped automatically whenever `OBJECT` is already present in the primary FITS header.
 
 Besides the target pixel file, `mundey` also requires several files for calibration, most of which are available from MAST (https://archive.stsci.edu/tess/all_products.html). In particular, `mundey` will require the Trailing Virtual Column and Smear Row collateral data, the Two-Dimensional Black Model, the Linearity Model, and the Flat Field Model. These are available at MAST. Additionally, a table of undershoot correction factors, `tess-undershoot.xml` is also required, and is included in this repo.
 
-After running `mundey`, the target pixel file will have flux values updated with the new calibration. To save this updated tpf, use the `tpf.tofits([output_fn, overwrite])` method of the `TessTargetPixelFile` class.
+After running `mundey`, the target pixel file will have `FLUX` updated with un-background-subtracted calibrated electrons per second, stale SPOC `FLUX_BKG` and `FLUX_BKG_ERR` columns zeroed, and `HALOCVER = 1` / `BKGSUB = False` (`BACKAPP = False`) provenance headers recorded. To save this updated TPF, use the `tpf.to_fits(output_fn, overwrite=...)` method of the `TessTargetPixelFile` class.
 
 ```python
-tpf.to_fits(filename)
+tpf.to_fits(filename, overwrite=True)
 ```
 
 The image below shows the Sirius target pixel file after correction with `mundey`.

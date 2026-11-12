@@ -1,0 +1,86 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mundey"
+version = "2.0.0a0"
+description = "Recalibration of TESS target pixel files for saturated bright stars."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Tim White", email = "tim.white@sydney.edu.au" },
+    { name = "Benjamin Pope" },
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "astropy>=6.0",
+    "lightkurve>=2.4",
+    "jax>=0.4.30",
+    "astroquery>=0.4.7",
+]
+
+[project.optional-dependencies]
+hpc = [
+    "fsspec>=2024.2",
+    "s3fs>=2024.2",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/hvidy/mundey"
+Repository = "https://github.com/hvidy/mundey"
+Issues = "https://github.com/hvidy/mundey/issues"
+
+[tool.hatch.build]
+artifacts = [
+    "src/mundey/data/*.xml",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mundey"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src/mundey",
+    "/src/mundey/data/*.xml",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
+exclude = [
+    "/notebooks/*.fits",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -m 'not slow'"
+markers = [
+    "slow: full-sector integration tests excluded from fast unit suite",
+]

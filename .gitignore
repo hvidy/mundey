@@ -1,0 +1,22 @@
+# Virtual environments and agent worktrees
+.venv/
+.claude/
+
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Packaging and build artefacts
+*.egg-info/
+dist/
+build/
+
+# Testing and linting caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS metadata
+.DS_Store
