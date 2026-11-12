@@ -1,12 +1,14 @@
-"""Legacy ``mundey_tpf`` calibration class modernized for Python 3.11+ and NumPy 2.x."""
+"""Compatibility ``mundey_tpf`` shim wired onto the ``mundey`` v2.0 JAX calibration engine."""
 
 from __future__ import annotations
 
+import functools
 import importlib.resources
 import warnings
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from xml.etree.ElementTree import Element
 
 import astropy.coordinates as coord
@@ -15,19 +17,35 @@ import lightkurve
 import numpy as np
 from astropy.io import fits
 
-from ._contract import atomic_temp_path, write_mundey_provenance
+from .calibration import (
+    CadenceMatchMode,
+    MissingCadenceMode,
+    SmearMode,
+    _recalibrate_hdulist_inplace,
+)
 
-try:
-    from tqdm import tqdm
-except ImportError:  # pragma: no cover
-
-    def tqdm(iterable: Any, **_kwargs: Any) -> Any:
-        return iterable
-
+F = TypeVar("F", bound=Callable[..., Any])
 
 _RANK_WARNING: type[Warning] = getattr(
     getattr(np, "exceptions", np), "RankWarning", UserWarning
 )
+
+
+def _deprecated(message: str) -> Callable[[F], F]:
+    """PEP 702 ``@deprecated`` decorator compatible with Python 3.11+."""
+    stdlib_dep = getattr(warnings, "deprecated", None)
+    if stdlib_dep is not None:
+        return stdlib_dep(message, category=DeprecationWarning, stacklevel=2)  # type: ignore[no-any-return]
+
+    def decorator(fn: F) -> F:
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            warnings.warn(message, DeprecationWarning, stacklevel=2)
+            return fn(*args, **kwargs)
+
+        return wrapper  # type: ignore[return-value]
+
+    return decorator
 
 
 def load_undershoot_xml() -> Element:
@@ -140,116 +158,27 @@ def _resolve_target_name(
     return fallback
 
 
-def _build_blf_time_cadence_columns(
-    hdu1: fits.BinTableHDU,
-) -> tuple[fits.Column, fits.Column]:
-    """Construct ``TIME`` and ``CADENCENO`` (``'J'``) columns for ``-blf.fits`` caches.
-
-    SPOC TPFs store ``TIMECORR`` (``'E'``, 32-bit float) in ``TTYPE2``/``TFORM2``
-    and ``CADENCENO`` (``'J'``, 32-bit integer) in ``TTYPE3``/``TFORM3``.
-    """
-    hdr = hdu1.header
-    col_time = fits.Column(
-        name=hdr.get("TTYPE1", "TIME"),
-        format=hdr.get("TFORM1", "D"),
-        unit=hdr.get("TUNIT1", "BJD - 2457000, days"),
-        disp=hdr.get("TDISP1", "D14.7"),
-        array=hdu1.data["TIME"],
-    )
-    cad_name = hdr.get("TTYPE3", "CADENCENO")
-    cad_form = hdr.get("TFORM3", "J")
-    cad_disp = hdr.get("TDISP3", "I10")
-    if cad_name != "CADENCENO" or not str(cad_form).strip().endswith(("J", "K", "I")):
-        cad_name = "CADENCENO"
-        cad_form = "J"
-        cad_disp = "I10"
-    col_cad = fits.Column(
-        name=cad_name,
-        format=cad_form,
-        disp=cad_disp,
-        array=np.asarray(hdu1.data["CADENCENO"], dtype=np.int32),
-    )
-    return col_time, col_cad
-
-
-def _smear_blf_path(
-    ddir_path: Path,
-    parts: list[str],
-    camera: int,
-    ccd: int,
-    output: str,
-    smear: str,
-) -> Path:
-    """Resolve the mode- and target-scoped ``-blf.fits`` cache path for smear."""
-    out_lower = output.lower()
-    if smear == "alternate":
-        return ddir_path / (
-            f"{parts[0]}-{parts[1]}-smrow-{camera}-{ccd}-"
-            f"{out_lower}-{parts[2]}-{parts[3]}-alt-s_col-blf.fits"
-        )
-    return ddir_path / (
-        f"{parts[0]}-{parts[1]}-smrow-{camera}-{ccd}-{out_lower}-{parts[3]}-s_col-blf.fits"
-    )
-
-
-def _smear_cache_matches_cutout(
-    hdr: fits.Header,
-    smear: str,
-    hdu2_hdr: fits.Header,
-) -> bool:
-    """Verify a cached smear ``-blf.fits`` header matches ``smear`` and cutout bounds."""
-    if "SMEARMOD" in hdr and str(hdr["SMEARMOD"]).strip() != smear:
-        return False
-    if smear == "alternate":
-        checks = (
-            ("CRVAL1P", "CRVAL1P"),
-            ("CUTNX", "NAXIS1"),
-            ("CRVAL2P", "CRVAL2P"),
-            ("CUTNY", "NAXIS2"),
-        )
-        for cache_key, src_key in checks:
-            if cache_key in hdr and int(hdr[cache_key]) != int(hdu2_hdr[src_key]):
-                return False
-    return True
-
-
 class mundey_tpf(lightkurve.TessTargetPixelFile):
-    """TargetPixelFile subclass for TESS bright-star recalibration."""
+    """Compatibility ``TessTargetPixelFile`` subclass delegating to ``mundey`` v2.0."""
 
+    @_deprecated(
+        "mundey_tpf.calibrate is deprecated in mundey v2.0; "
+        "prefer functional mundey.recalibrate_tpf(tpf, ...)."
+    )
     def calibrate(
         self,
         verbose: bool = True,
-        smear: str = "automatic",
-        ddir: str | Path = "./",
+        smear: SmearMode = "automatic",
+        ddir: str | Path | None = "./",
+        cache_dir: str | Path | None = None,
         target: str | None = None,
         use_simbad: bool | None = None,
+        cadence_match: CadenceMatchMode = "cadenceno",
+        missing_cadence: MissingCadenceMode = "nan",
         offline: bool = False,
+        strict_hpc: bool = False,
     ) -> None:
-        """Perform a recalibration of a TESS target pixel file from ``RAW_CNTS``.
-
-        Parameters
-        ----------
-        verbose : bool, default True
-            Print progress messages during calibration.
-        smear : {'automatic', 'standard', 'alternate'}, default 'automatic'
-            Smear estimation mode. ``'automatic'`` selects ``'alternate'`` when
-            the cutout reaches row 2048 and ``'standard'`` otherwise.
-        ddir : str or Path, default './'
-            Directory containing collateral and static CCD reference files.
-        target : str, optional
-            Explicit target label override.
-        use_simbad : bool, optional
-            Whether to query SIMBAD for target identification. Defaults to
-            ``False`` whenever ``OBJECT`` is present in ``hdu[0].header`` or
-            ``offline=True``.
-        offline : bool, default False
-            Disable all network queries (e.g. on HPC compute nodes).
-        """
-        if smear not in ("automatic", "standard", "alternate"):
-            raise ValueError(
-                f"Invalid smear mode {smear!r}; expected 'automatic', 'standard', or 'alternate'."
-            )
-
+        """Recalibrate ``self.hdu`` in place via the ``mundey`` v2.0 JAX engine."""
         resolved_target = _resolve_target_name(
             self.hdu[0].header,
             self.ra,
@@ -259,540 +188,26 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
             use_simbad=use_simbad,
             offline=offline,
         )
-        ddir_path = Path(ddir)
-        self.ddir = f"{ddir_path}/"
+        if ddir is not None:
+            self.ddir = f"{Path(ddir)}/"
 
         if verbose:
             print(f"Beginning calibration of {resolved_target}")
-
-        flux = np.copy(self.hdu[1].data["RAW_CNTS"])
-        cols = np.arange(self.column, self.column + self.shape[2])
-
-        outputs: list[str] = []
-        for col in cols:
-            if 45 <= col <= 556:
-                outputs.append("A")
-            elif 557 <= col <= 1068:
-                outputs.append("B")
-            elif 1069 <= col <= 1580:
-                outputs.append("C")
-            elif 1581 <= col <= 2092:
-                outputs.append("D")
-            else:
-                raise ValueError(
-                    f"TPF column {int(col)} falls outside TESS science outputs 45..2092."
-                )
-
-        unique_outputs = [out for out in ("A", "B", "C", "D") if out in outputs]
-        path_name = Path(self.path).name
-        parts = path_name.split("-")
-
-        x1 = self.hdu[2].header["CRVAL1P"] - 1
-        dx = self.hdu[2].header["NAXIS1"]
-        y1 = self.hdu[2].header["CRVAL2P"] - 1
-        dy = self.hdu[2].header["NAXIS2"]
-
-        if smear == "automatic":
-            smear = "alternate" if (y1 + dy >= 2048) else "standard"
-
-        if verbose:
-            print(f"Sector: {self.sector}")
-            print(f"Camera: {self.camera}")
-            print(f"CCD: {self.ccd}")
-            print(f"Outputs: {unique_outputs}")
-            print("")
-            print("Searching for collateral target pixel files")
-
-        n_out = len(unique_outputs)
-        sm_cal = np.zeros((n_out, flux.shape[0], 10, 512))
-        tv_cal = np.zeros((n_out, flux.shape[0], 2078, 11))
-        calcsmear = np.zeros(n_out, dtype=bool)
-        calcblack = np.zeros(n_out, dtype=bool)
-
-        for idx, output in enumerate(unique_outputs):
-            stem_smrow = (
-                f"{parts[0]}-{parts[1]}-smrow-{self.camera}-{self.ccd}-"
-                f"{output.lower()}-{parts[3]}"
-            )
-            smearfile = _smear_blf_path(
-                ddir_path, parts, self.camera, self.ccd, output, smear
-            )
-            loaded_smear = False
-            try:
-                if verbose:
-                    print(f"... loading smear file {smearfile}")
-                with fits.open(smearfile) as smrow:
-                    if _smear_cache_matches_cutout(
-                        smrow[1].header, smear, self.hdu[2].header
-                    ):
-                        sm_cal[idx, :, 0, :] = smrow[1].data["SMEAR"]
-                        loaded_smear = True
-            except FileNotFoundError:
-                loaded_smear = False
-
-            if loaded_smear:
-                calcsmear[idx] = False
-            else:
-                smrowfile = ddir_path / f"{stem_smrow}-s_col.fits"
-                if verbose:
-                    print(f"... file not found: {smearfile}")
-                    print("... smear correction will be calculated from raw counts")
-                    print(f"... loading smear row file {smrowfile}")
-                    print("")
-                with fits.open(smrowfile) as smrow:
-                    sm_cal[idx] = smrow[1].data["SMROW_RAW"]
-                calcsmear[idx] = True
-
-            stem_tvcol = (
-                f"{parts[0]}-{parts[1]}-tvcol-{self.camera}-{self.ccd}-"
-                f"{output.lower()}-{parts[3]}"
-            )
-            onedblackfile = ddir_path / f"{stem_tvcol}-s_col-blf.fits"
-            try:
-                if verbose:
-                    print(f"... loading 1D black file {onedblackfile}")
-                with fits.open(onedblackfile) as tvcol:
-                    tv_cal[idx, :, :, 0] = tvcol[1].data["1DBLACK"]
-                calcblack[idx] = False
-            except FileNotFoundError:
-                tvcolfile = ddir_path / f"{stem_tvcol}-s_col.fits"
-                if verbose:
-                    print(f"... file not found: {onedblackfile}")
-                    print("... 1D black correction will be calculated from raw counts")
-                    print(f"... loading trailing virtual column file {tvcolfile}")
-                    print("")
-                with fits.open(tvcolfile) as tvcol:
-                    tv_cal[idx] = tvcol[1].data["TVCOL_RAW"]
-                calcblack[idx] = True
-
-        # Subtract fixed offset, add mean black
-        for idx, output in enumerate(unique_outputs):
-            indices = [i for i, x in enumerate(outputs) if x == output]
-            flux[:, :, indices] = self.fixedoffset_meanblack(
-                flux[:, :, indices], output, verbose=verbose
-            )
-            if calcsmear[idx]:
-                sm_cal[idx] = self.fixedoffset_meanblack(sm_cal[idx], output, verbose=False)
-            if calcblack[idx]:
-                tv_cal[idx] = self.fixedoffset_meanblack(tv_cal[idx], output, verbose=False)
-
-        # Remove 2D black
-        black2dfile = ddir_path / f"tess2018323-{self.camera}-{self.ccd}-2dblack.fits"
-        if verbose:
-            print("")
-            print("Loading 2D black model")
-            print(f"... {black2dfile}")
-
-        with fits.open(black2dfile) as black2dfits:
-            black2dimg = np.array(black2dfits[1].data, copy=True)
-
-        flux = self.twodblack(flux, black2dimg[y1 : y1 + dy, x1 : x1 + dx], verbose=verbose)
-
-        output_bounds = {
-            "A": (44, 556, 2092, 2103),
-            "B": (556, 1068, 2103, 2114),
-            "C": (1068, 1580, 2114, 2125),
-            "D": (1580, 2092, 2125, 2136),
-        }
-        for idx, output in enumerate(unique_outputs):
-            sx1, sx2, tx1, tx2 = output_bounds[output]
-            if calcsmear[idx]:
-                sm_cal[idx] = self.twodblack(
-                    sm_cal[idx], black2dimg[2058:2068, sx1:sx2], verbose=False
-                )
-            if calcblack[idx]:
-                tv_cal[idx] = self.twodblack(tv_cal[idx], black2dimg[:, tx1:tx2], verbose=False)
-
-        # Calculate 1D black
-        for idx, output in enumerate(unique_outputs):
-            if calcblack[idx]:
-                tv_cal[idx] = self.calconedblack(tv_cal[idx], output, verbose=verbose)
-
-        # Remove 1D black
-        tv_cal_1d = tv_cal[:, :, :, 0]
-        if n_out == 1:
-            flux = self.onedblack(flux, tv_cal_1d[0, :, y1 : y1 + dy], verbose=verbose)
-            if calcsmear[0]:
-                sm_cal[0] = self.onedblack(
-                    sm_cal[0], tv_cal_1d[0, :, 2058:2068], verbose=verbose
-                )
-        else:
-            flux = flux.astype(float, copy=False)
-            for idx, output in enumerate(unique_outputs):
-                indices = [i for i, x in enumerate(outputs) if x == output]
-                flux[:, :, indices] = self.onedblack(
-                    flux[:, :, indices], tv_cal_1d[idx, :, y1 : y1 + dy], verbose=verbose
-                )
-                if calcsmear[idx]:
-                    sm_cal[idx] = self.onedblack(
-                        sm_cal[idx], tv_cal_1d[idx, :, 2058:2068], verbose=verbose
-                    )
-
-        # Correct for non-linearity and gain
-        for idx, output in enumerate(unique_outputs):
-            indices = [i for i, x in enumerate(outputs) if x == output]
-            flux[:, :, indices] = self.linearity_gain(
-                flux[:, :, indices], output, verbose=verbose
-            )
-            if calcsmear[idx]:
-                sm_cal[idx] = self.linearity_gain(sm_cal[idx], output, verbose=False)
-
-        # Correct for LDE undershoot
-        for idx, output in enumerate(unique_outputs):
-            indices = [i for i, x in enumerate(outputs) if x == output]
-            flux[:, :, indices] = self.undershoot(
-                flux[:, :, indices], output, verbose=verbose
-            )
-            if calcsmear[idx]:
-                sm_cal[idx] = self.undershoot(sm_cal[idx], output, verbose=False)
-
-        # Calculate smear correction
-        for idx, output in enumerate(unique_outputs):
-            if calcsmear[idx]:
-                sm_cal[idx] = self.calcsmear(
-                    flux, sm_cal[idx], output, smear=smear, verbose=verbose
-                )
-
-        # Remove smear correction
-        sm_cal_2d = sm_cal[:, :, 0, :]
-        flux = self.smear(flux, sm_cal_2d, unique_outputs[0], verbose=verbose)
-
-        # Flatfield correction
-        flux = self.flatfield(flux, verbose=verbose)
-
-        # Convert to electrons per second
-        flux = self.to_electrons_per_second(flux, verbose=verbose)
-
-        self.hdu[1].data["FLUX"] = flux
-        col_names = self.hdu[1].data.names or ()
-        if "FLUX_BKG" in col_names:
-            self.hdu[1].data["FLUX_BKG"] = np.float32(0.0)
-        if "FLUX_BKG_ERR" in col_names:
-            self.hdu[1].data["FLUX_BKG_ERR"] = np.float32(0.0)
-        write_mundey_provenance(self, bkgsub=False)
-
-        if verbose:
-            print("")
-            print("Calibration Complete")
-
-    def fixedoffset_meanblack(
-        self,
-        img: np.ndarray,
-        output: str,
-        verbose: bool = True,
-    ) -> np.ndarray:
-        """Subtract fixed electronic offset and add output mean black."""
-        if verbose:
-            print("")
-            print(f"Adjusting for fixed offset and mean black - Output {output}")
-
-        img = img - self.hdu[1].header["FXDOFF"]
-        img = img + self.hdu[1].header[f"MEANBLC{output}"]
-        return img
-
-    def twodblack(
-        self,
-        img: np.ndarray,
-        twodblackimg: np.ndarray,
-        verbose: bool = True,
-    ) -> np.ndarray:
-        """Subtract static 2D black image."""
-        if verbose:
-            print("Performing 2-D black correction")
-        return img - twodblackimg
-
-    def calconedblack(
-        self,
-        tvcol: np.ndarray,
-        output: str,
-        verbose: bool = True,
-    ) -> np.ndarray:
-        """Fit per-cadence 1D black polynomial to virtual columns and cache ``-blf.fits``."""
-        if verbose:
-            print("")
-            print("Calculating 1-D black correction")
-            print("... this step may take a while;")
-            print("... if you haven't already done so")
-            print("... you might like to take this opportunity")
-            print("... to join your union.")
             _maybe_display_union_link()
 
-        nrows = tvcol.shape[1]
-        x = np.arange(nrows) / nrows - 0.5
-        ks = np.arange(20, 50)
-        black1d = np.zeros((tvcol.shape[0], tvcol.shape[1]))
+        raw_path = getattr(self, "path", None)
+        src_path = Path(raw_path).expanduser() if raw_path else None
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", _RANK_WARNING)
-            for frame in tqdm(np.arange(tvcol.shape[0]), desc="Frame", disable=not verbose):
-                aics = []
-                y = np.nanmean(tvcol[frame, :, :-1], axis=1)
-
-                for k in ks:
-                    p = np.polynomial.Polynomial.fit(x, y, int(k))
-                    aic = 2 * k + nrows * np.log(np.sum((y - p(x)) ** 2))
-                    aics.append(aic)
-
-                order = int(ks[np.argmin(np.asarray(aics))])
-                p = np.polynomial.Polynomial.fit(x, y, order)
-                black1d[frame, :] = p(x)
-
-        col1, col2 = _build_blf_time_cadence_columns(self.hdu[1])
-        col3 = fits.Column(
-            name="1DBLACK",
-            format=f"{black1d.shape[1]}D",
-            unit="count",
-            disp="F14.7",
-            dim=f"({black1d.shape[1]})",
-            array=black1d,
+        _recalibrate_hdulist_inplace(
+            self.hdu,
+            source_path=src_path,
+            cache_dir=cache_dir,
+            ddir=ddir,
+            smear=smear,
+            cadence_match=cadence_match,
+            missing_cadence=missing_cadence,
+            offline=offline,
+            strict_hpc=strict_hpc,
+            verbose=verbose,
+            target_obj=self,
         )
-
-        blackhdu = fits.BinTableHDU.from_columns(fits.ColDefs([col1, col2, col3]))
-        parts = Path(self.path).name.split("-")
-        onedblackfile = Path(self.ddir) / (
-            f"{parts[0]}-{parts[1]}-tvcol-{self.camera}-{self.ccd}-"
-            f"{output.lower()}-{parts[3]}-s_col-blf.fits"
-        )
-        with atomic_temp_path(onedblackfile) as tmp_path:
-            blackhdu.writeto(tmp_path, overwrite=True)
-
-        tvcol[:, :, 0] = black1d
-        return tvcol
-
-    def onedblack(
-        self,
-        img: np.ndarray,
-        onedblackimg: np.ndarray,
-        verbose: bool = True,
-    ) -> np.ndarray:
-        """Subtract 1D black profile across columns."""
-        if verbose:
-            print("Performing 1-D black correction")
-        return img - np.expand_dims(onedblackimg, axis=2)
-
-    def linearity_gain(
-        self,
-        img: np.ndarray,
-        output: str,
-        verbose: bool = True,
-    ) -> np.ndarray:
-        """Apply TESS nonlinearity polynomial and output gain."""
-        if verbose:
-            print("")
-            print("Correcting for non-linearity and gain")
-
-        factor = 1.0
-        if bool(self.hdu[0].header["CRMITEN"]):
-            factor = (self.hdu[0].header["CRBLKSZ"] - 2) / self.hdu[0].header["CRBLKSZ"]
-
-        img = img / (factor * self.hdu[1].header["NUM_FRM"])
-
-        lintree = ET.parse(Path(self.ddir) / "tess2018143203310-41006_100-linearity.xml")
-        linroot = lintree.getroot()
-        xpath = (
-            f".//*[@cameraNumber='{self.camera}']"
-            f"[@ccdNumber='{self.ccd}']"
-            f"[@ccdOutput='{output}']/linearityPoly"
-        )
-        poly = linroot.find(xpath)
-        if poly is None:
-            raise KeyError(
-                f"Linearity polynomial not found for camera={self.camera}, "
-                f"ccd={self.ccd}, output={output}."
-            )
-
-        originx = float(poly.attrib["originx"])
-        scalex = float(poly.attrib["scalex"])
-        coeffs = [float(elem.attrib["value"]) for elem in poly.findall("coeffs/coeff")]
-        p = np.polynomial.Polynomial(np.asarray(coeffs))
-
-        return img * p((img - originx) * scalex) * self.hdu[1].header[f"GAIN{output}"]
-
-    def undershoot(
-        self,
-        img: np.ndarray,
-        output: str,
-        verbose: bool = True,
-    ) -> np.ndarray:
-        """Correct for LDE serial readout undershoot using bundled ``tess-undershoot.xml``."""
-        if verbose:
-            print("")
-            print("Correcting for LDE undershoot")
-
-        underroot = load_undershoot_xml()
-        xpath = (
-            f".//*[@cameraNumber='{self.camera}']"
-            f"[@ccdNumber='{self.ccd}']"
-            f"[@ccdOutput='{output}']"
-        )
-        node = underroot.find(xpath)
-        if node is None:
-            raise KeyError(
-                f"Undershoot factor not found for camera={self.camera}, "
-                f"ccd={self.ccd}, output={output}."
-            )
-        undershoot_coeff = float(node.attrib["undershoot"])
-
-        if output in ("A", "C"):
-            img[:, :, 1:] = img[:, :, 1:] + undershoot_coeff * img[:, :, :-1]
-            img[:, :, 0] = img[:, :, 0] * (1 + undershoot_coeff)
-        elif output in ("B", "D"):
-            img[:, :, :-1] = img[:, :, :-1] + undershoot_coeff * img[:, :, 1:]
-            img[:, :, -1] = img[:, :, -1] * (1 + undershoot_coeff)
-
-        return img
-
-    def calcsmear(
-        self,
-        img: np.ndarray,
-        smrow: np.ndarray,
-        output: str,
-        smear: str = "alternate",
-        verbose: bool = True,
-    ) -> np.ndarray:
-        """Estimate collateral or TPF-anchored smear and cache ``-blf.fits``."""
-        if verbose:
-            print("")
-            if smear == "alternate":
-                print("Calculating photometric smear from TPF background")
-            if smear == "standard":
-                print("Calculating photometric smear from collateral data")
-
-        sx1_map = {"A": 44, "B": 556, "C": 1068, "D": 1580}
-        sx1 = sx1_map[output]
-
-        x1 = self.hdu[2].header["CRVAL1P"] - 1 - sx1
-        dx = self.hdu[2].header["NAXIS1"]
-        dy = self.hdu[2].header["NAXIS2"]
-
-        smcor = np.nanmedian(smrow, axis=1)
-
-        if smear == "alternate":
-            n_sm_cols = smcor.shape[1]
-            sm_start = max(int(x1), 0)
-            sm_end = min(int(x1 + dx), n_sm_cols)
-            tpf_start = sm_start - int(x1)
-            tpf_end = sm_end - int(x1)
-
-            if sm_end > sm_start:
-                medimg = np.nanmedian(img, axis=0)
-                maxrows = []
-                for col in np.arange(dx):
-                    unsat = medimg[:, col][medimg[:, col] < 1e5]
-                    if unsat.size > 0:
-                        maxrows.append(int(np.argmax(unsat)))
-                if maxrows:
-                    min_maxrow = int(np.nanmin(maxrows))
-                    maxrow = min_maxrow - 10 if min_maxrow > 10 else max(min_maxrow, 1)
-                else:
-                    maxrow = dy
-
-                smmask = np.zeros((dy, dx), dtype=bool)
-                for col in np.arange(dx):
-                    sub = medimg[:maxrow, col]
-                    thresh = np.percentile(sub, 20)
-                    idx = sub < thresh
-                    if not np.any(idx):
-                        idx = sub <= thresh
-                    smmask[:maxrow, col][idx] = True
-
-                smbkgd = np.column_stack(
-                    [np.nanmean(img[:, smmask[:, col], col], axis=1) for col in range(dx)]
-                )
-
-                cols_sm = np.arange(n_sm_cols)
-                msk = (cols_sm < sm_start) | (cols_sm >= sm_end)
-                bkgd = np.nanmin(smbkgd[:, tpf_start:tpf_end], axis=1) - np.nanmedian(
-                    smcor[:, msk], axis=1
-                )
-
-                smcor[:, sm_start:sm_end] = (
-                    smbkgd[:, tpf_start:tpf_end] - bkgd[:, np.newaxis]
-                )
-
-        col1, col2 = _build_blf_time_cadence_columns(self.hdu[1])
-        col3 = fits.Column(
-            name="SMEAR",
-            format=f"{smcor.shape[1]}D",
-            unit="count",
-            disp="F14.7",
-            dim=f"({smcor.shape[1]})",
-            array=smcor,
-        )
-
-        smearhdu = fits.BinTableHDU.from_columns(fits.ColDefs([col1, col2, col3]))
-        smearhdu.header["SMEARMOD"] = (smear, "Mundey smear estimation mode")
-        smearhdu.header["CRVAL1P"] = (
-            int(self.hdu[2].header["CRVAL1P"]),
-            "Cutout start CCD column",
-        )
-        smearhdu.header["CUTNX"] = (
-            int(self.hdu[2].header["NAXIS1"]),
-            "Cutout column width",
-        )
-        smearhdu.header["CRVAL2P"] = (
-            int(self.hdu[2].header["CRVAL2P"]),
-            "Cutout start CCD row",
-        )
-        smearhdu.header["CUTNY"] = (
-            int(self.hdu[2].header["NAXIS2"]),
-            "Cutout row height",
-        )
-        parts = Path(self.path).name.split("-")
-        smearfile = _smear_blf_path(
-            Path(self.ddir), parts, self.camera, self.ccd, output, smear
-        )
-        with atomic_temp_path(smearfile) as tmp_path:
-            smearhdu.writeto(tmp_path, overwrite=True)
-
-        smrow[:, 0, :] = smcor
-        return smrow
-
-    def smear(
-        self,
-        img: np.ndarray,
-        sm: np.ndarray,
-        output: str,
-        verbose: bool = True,
-    ) -> np.ndarray:
-        """Subtract 1D column smear profile across science rows."""
-        if verbose:
-            print("")
-            print("Removing photometric smear")
-
-        sx1_map = {"A": 44, "B": 556, "C": 1068, "D": 1580}
-        sx1 = sx1_map[output]
-
-        x1 = self.hdu[2].header["CRVAL1P"] - 1 - sx1
-        dx = self.hdu[2].header["NAXIS1"]
-
-        sm_combined = np.concatenate(list(sm), axis=1)
-
-        return img - np.expand_dims(sm_combined[:, x1 : x1 + dx], axis=1)
-
-    def flatfield(self, img: np.ndarray, verbose: bool = True) -> np.ndarray:
-        """Divide by static TESS flat-field model."""
-        flatfile = Path(self.ddir) / f"tess2018323-{self.camera}-{self.ccd}-flat.fits"
-        if verbose:
-            print("")
-            print("Loading flat field")
-            print(f"... {flatfile}")
-
-        x1 = self.hdu[2].header["CRVAL1P"] - 1
-        dx = self.hdu[2].header["NAXIS1"]
-        y1 = self.hdu[2].header["CRVAL2P"] - 1
-        dy = self.hdu[2].header["NAXIS2"]
-
-        with fits.open(flatfile) as flatfits:
-            if verbose:
-                print("Performing flatfield correction")
-            flat = np.array(flatfits[1].data[y1 : y1 + dy, x1 : x1 + dx], copy=True)
-
-        return img / flat
-
-    def to_electrons_per_second(self, img: np.ndarray, verbose: bool = True) -> np.ndarray:
-        """Convert calibrated electrons per exposure to electrons per second."""
-        if verbose:
-            print("")
-            print("Converting to electrons per second")
-        return img / self.hdu[1].header["INT_TIME"]
