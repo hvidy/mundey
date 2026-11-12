@@ -17,6 +17,7 @@ from mundey import (
     read_smear_err_column,
     recalibrate_tpf,
 )
+from mundey.calibration import _detect_bloom_columns, fit_onedblack_legendre
 
 
 def test_unbleeding_roundtrip_1_2_and_4_outputs_within_1e4(
@@ -416,3 +417,270 @@ def test_cadenceno_subset_thermal_step_and_blf_cache_sharing(
 
     with pytest.raises(ValueError, match="Zero matching CADENCENO"):
         recalibrate_tpf(bad_tpf, ddir=base_dir, cache_dir=shared_cache, offline=True)
+
+
+def test_masked_onedblack_nan_gap_avoids_gibbs_ringing_and_uses_n_finite() -> None:
+    """fit_onedblack_legendre must solve masked normal equations across interior NaN row gaps."""
+    rows = np.arange(2078, dtype=np.float64)
+    x_norm = (rows[:2048] - 1023.5) / 1023.5
+    true_sci = (
+        180.0
+        + 35.0 * x_norm
+        - 18.0 * (x_norm**2)
+        + 9.5 * (x_norm**5)
+        - 4.2 * (x_norm**8)
+    )
+    true_ov = np.full(30, 192.5, dtype=np.float64)
+    true_profile = np.concatenate([true_sci, true_ov])
+
+    # 1. Noiseless 120-row interior NaN dropout (rows 800..919) + 5 overclock NaNs
+    tv_noiseless = np.broadcast_to(true_profile[None, :, None], (2, 2078, 11)).copy()
+    tv_noiseless[1, 800:920, :] = np.nan
+    tv_noiseless[1, 2050:2055, :] = np.nan
+
+    b1d_clean, err_clean = fit_onedblack_legendre(tv_noiseless)
+    # Zero Gibbs ringing across ALL 2,048 rows (including inside the 120-row NaN gap!)
+    np.testing.assert_allclose(b1d_clean[0], true_profile, atol=1e-7)
+    np.testing.assert_allclose(b1d_clean[1], true_profile, atol=1e-7)
+    assert np.all(np.isfinite(err_clean))
+
+    # 2. With Gaussian noise, uncertainty inside the unobserved gap exceeds observed rows
+    rng = np.random.default_rng(2026)
+    tv_noisy = tv_noiseless + rng.normal(0.0, 0.8, size=tv_noiseless.shape)
+    tv_noisy[1, 800:920, :] = np.nan
+    tv_noisy[1, 2050:2055, :] = np.nan
+    _, err_noisy = fit_onedblack_legendre(tv_noisy)
+    gap_err = float(np.median(err_noisy[1, 830:890]))
+    obs_err = float(np.median(err_noisy[1, 200:600]))
+    assert gap_err > 1.2 * obs_err
+
+
+def test_tall_zero_sky_column_not_falsely_flagged_as_bloom(
+    tpf_builder,
+    tmp_path: Path,
+) -> None:
+    """Tall (ny=1287) zero-sky noise columns must not trigger extreme-value bloom false alarms."""
+    rng = np.random.default_rng(2026)
+    sigma_cube = np.full((40, 1287, 6), 5.0, dtype=np.float64)
+    sub_cube = rng.normal(0.0, 5.0, size=sigma_cube.shape)
+    clean_rows = np.ones((1287, 6), dtype=bool)
+
+    flagged = _detect_bloom_columns(sub_cube, sigma_cube, clean_rows)
+    assert not np.any(flagged)
+
+    # End-to-end desmear_calibrated_cutout on a tall zero-sky unbloomed FFI cutout
+    bundle = tpf_builder(
+        tmp_path / "tall_zerosky",
+        col0_1based=300,
+        row0_1based=762,
+        nx=6,
+        ny=1287,
+        n_cadences=16,
+        write_collateral=False,
+        include_bleed=False,
+        flag_bad_cadence=False,
+        noise_sigma=2.0,
+        sky_dark_level=0.0,
+        star_scale=0.0,
+        seed=42,
+    )
+    with fits.open(bundle.tpf_path) as src:
+        h0, h2 = src[0].copy(), src[2].copy()
+        kept = [c for c in src[1].columns if c.name != "RAW_CNTS"]
+        h1 = fits.BinTableHDU.from_columns(
+            fits.ColDefs(kept), header=src[1].header, name="PIXELS"
+        )
+        zero_sky_flux = rng.normal(0.0, 2.0, size=h1.data["FLUX"].shape).astype(np.float32)
+        h1.data["FLUX"] = zero_sky_flux
+        h1.data["FLUX_ERR"] = np.full_like(zero_sky_flux, 2.0)
+        h1.data["FLUX_BKG"] = np.zeros_like(zero_sky_flux)
+        h1.data["FLUX_BKG_ERR"] = np.zeros_like(zero_sky_flux)
+        h1.header["BACKAPP"] = False
+        cut_path = tmp_path / "tall_zerosky_cutout.fits"
+        fits.HDUList([h0, h1, h2]).writeto(cut_path, overwrite=True)
+
+    repaired = desmear_calibrated_cutout(cut_path)
+    np.testing.assert_allclose(repaired.flux.value, zero_sky_flux, atol=1e-5)
+
+
+def test_partial_multioutput_alt_cache_no_nans_and_warm_pixel_quality_parity(
+    tpf_builder,
+    tmp_path: Path,
+) -> None:
+    """Warm -alt- reload must preserve SMEAR_UNRESOLVED & partial multi-output cache has no NaNs."""
+    bundle = tpf_builder(
+        tmp_path / "partial_2out",
+        col0_1based=553,
+        row0_1based=2033,
+        nx=8,  # cols 553..556 (Output A) & 557..560 (Output B)
+        ny=16,
+        n_cadences=4,
+        bleed_in_smrow=True,
+        flag_bad_cadence=False,
+        noise_sigma=0.0,
+        seed=612,
+    )
+    assert bundle.outputs == ("A", "B")
+    # Saturate Output A col 1 rows 6..15 -> < 5 clean rows after 4-row dilation -> SMEAR_UNRESOLVED
+    with fits.open(bundle.tpf_path, mode="update") as hdul:
+        hdul[1].data["RAW_CNTS"][:, 6:, 1] = 12_000_000
+
+    cache_dir = tmp_path / "alt_cache"
+    cal_cold = recalibrate_tpf(
+        bundle.tpf_path,
+        ddir=bundle.ddir,
+        cache_dir=cache_dir,
+        smear="alternate",
+        offline=True,
+    )
+    pq_cold = read_pixel_quality(cal_cold)
+    assert np.all((pq_cold[:, 1] & int(PixelQuality.SMEAR_UNRESOLVED)) != 0)
+
+    # 1. Full warm reload from both A & B -alt- caches preserves PIXEL_QUALITY bit-for-bit!
+    cal_warm = recalibrate_tpf(
+        bundle.tpf_path,
+        ddir=bundle.ddir,
+        cache_dir=cache_dir,
+        smear="alternate",
+        offline=True,
+    )
+    np.testing.assert_array_equal(read_pixel_quality(cal_warm), pq_cold)
+    np.testing.assert_allclose(cal_warm.flux.value, cal_cold.flux.value, rtol=1e-5, atol=1e-4)
+
+    # 2. Delete ONLY Output B's -alt- cache -> partial hit must still load standard smrow for all
+    # outputs and calibrate with zero NaNs and identical flux!
+    out_b_alt = next((cache_dir / "s0020").glob("*-smrow-2-3-b-*-alt-s_col-blf.fits"))
+    out_b_alt.unlink()
+
+    cal_partial = recalibrate_tpf(
+        bundle.tpf_path,
+        ddir=bundle.ddir,
+        cache_dir=cache_dir,
+        smear="alternate",
+        offline=True,
+    )
+    assert np.all(np.isfinite(cal_partial.flux.value))
+    assert np.all(np.isfinite(read_smear_err_column(cal_partial)))
+    np.testing.assert_array_equal(read_pixel_quality(cal_partial), pq_cold)
+    np.testing.assert_allclose(cal_partial.flux.value, cal_cold.flux.value, rtol=1e-5, atol=1e-4)
+
+
+def test_upper_register_bloom_stellar_wing_smear_and_desmear_exposure_scaling(
+    tpf_builder,
+    tmp_path: Path,
+) -> None:
+    """All-column smrow bloom subtracts in-cutout stellar smear; desmear scales with exposure."""
+    # Part A: Narrow 4-column stamp with bright unsaturated stellar wing & all-column smrow bloom
+    bundle = tpf_builder(
+        tmp_path / "upper_bloom",
+        col0_1based=220,
+        row0_1based=1993,
+        nx=4,
+        ny=56,
+        n_cadences=4,
+        include_bleed=False,
+        bleed_in_smrow=False,
+        flag_bad_cadence=False,
+        noise_sigma=0.0,
+        sky_dark_level=120.0,
+        star_scale=2500.0,
+        seed=718,
+    )
+    sm_path = next(bundle.ddir.glob("*-smrow-*-s_col.fits"))
+    sm_c0 = 220 - 1 - 44
+    with fits.open(sm_path, mode="update") as sh:
+        sh[1].data["SMROW_RAW"][:, :, sm_c0 : sm_c0 + 4] = 12_000_000
+
+    cache_dir = tmp_path / "ub_cache"
+    cal_cold = recalibrate_tpf(
+        bundle.tpf_path,
+        ddir=bundle.ddir,
+        cache_dir=cache_dir,
+        smear="alternate",
+        offline=True,
+    )
+    # Delete -alt- cache so second run reloads standard smrow -blf.fits + SMROW_SAT extension!
+    for alt_p in (cache_dir / "s0020").glob("*-alt-s_col-blf.fits"):
+        alt_p.unlink()
+    cal_warm_sat = recalibrate_tpf(
+        bundle.tpf_path,
+        ddir=bundle.ddir,
+        cache_dir=cache_dir,
+        smear="alternate",
+        offline=True,
+    )
+    np.testing.assert_allclose(
+        cal_warm_sat.flux.value, cal_cold.flux.value, rtol=1e-5, atol=1e-4
+    )
+    np.testing.assert_allclose(
+        read_smear_err_column(cal_warm_sat),
+        read_smear_err_column(cal_cold),
+        rtol=1e-5,
+        atol=1e-4,
+    )
+
+    truth = bundle.true_star_cube + bundle.true_sky_cube
+    non_cr = bundle.cr_cube == 0.0
+    np.testing.assert_allclose(cal_cold.flux.value[non_cr], truth[non_cr], rtol=8e-3, atol=2.5)
+
+    # Part B: desmear_calibrated_cutout without FLUX_ERR scales Poisson fallback with exposure time
+    # and scales SMEAR_UNRESOLVED uncertainty covariantly with flux units!
+    bundle_b = tpf_builder(
+        tmp_path / "desmear_exp_src",
+        col0_1based=220,
+        row0_1based=1993,
+        nx=8,
+        ny=56,
+        n_cadences=4,
+        write_collateral=False,
+        include_bleed=False,
+        flag_bad_cadence=False,
+        noise_sigma=0.0,
+        seed=719,
+    )
+
+    def _make_errless_cutout(path_out: Path, num_frm: int, flux_scale: float) -> Path:
+        with fits.open(bundle_b.tpf_path) as src:
+            h0, h2 = src[0].copy(), src[2].copy()
+            kept = [c for c in src[1].columns if c.name not in ("RAW_CNTS", "FLUX_ERR")]
+            h1 = fits.BinTableHDU.from_columns(
+                fits.ColDefs(kept), header=src[1].header, name="PIXELS"
+            )
+            h0.header["NUM_FRM"] = num_frm
+            h0.header["CRMITEN"] = False
+            h1.header["NUM_FRM"] = num_frm
+            h1.header["CRMITEN"] = False
+            base_flux = np.full(h1.data["FLUX"].shape, 200.0 * flux_scale, dtype=np.float32)
+            # Col 1 has symmetric clean flanks (col 0 & cols 2..4) -> pure shot-noise SMEAR_ERR
+            base_flux[:, :, 1] = np.float32(-500.0 * flux_scale)
+            # Col 5 is an unresolved saturated column (all 56 rows > sat limit)
+            base_flux[:, :, 5] = np.float32(2.0e6 * flux_scale)
+            h1.data["FLUX"] = base_flux
+            h1.data["FLUX_BKG"] = np.zeros_like(base_flux)
+            h1.data["FLUX_BKG_ERR"] = np.zeros_like(base_flux)
+            h1.header["BACKAPP"] = False
+            fits.HDUList([h0, h1, h2]).writeto(path_out, overwrite=True)
+        return path_out
+
+    cut_20s = _make_errless_cutout(tmp_path / "cut_20s.fits", num_frm=10, flux_scale=1.0)
+    cut_30m = _make_errless_cutout(tmp_path / "cut_30m.fits", num_frm=900, flux_scale=1.0)
+    cut_20s_10x = _make_errless_cutout(tmp_path / "cut_20s_10x.fits", num_frm=10, flux_scale=10.0)
+
+    rep_20s = desmear_calibrated_cutout(cut_20s)
+    rep_30m = desmear_calibrated_cutout(cut_30m)
+    rep_20s_10x = desmear_calibrated_cutout(cut_20s_10x, saturation_flux_threshold=1.0e6)
+
+    serr_20s = read_smear_err_column(rep_20s, quality_masked=False)
+    serr_30m = read_smear_err_column(rep_30m, quality_masked=False)
+    serr_20s_10x = read_smear_err_column(rep_20s_10x, quality_masked=False)
+
+    # Active-repair bloom column 1: 20-s exposure has ~sqrt(900/10) = 9.5x larger shot-noise error!
+    assert np.all(serr_20s[:, 0] == 0.0)
+    ratio_exp = float(np.median(serr_20s[:, 1]) / np.median(serr_30m[:, 1]))
+    assert 8.0 < ratio_exp < 11.0
+
+    # Unresolved column 5 scales linearly (10x) with flux scale (zero magic additive floor!)
+    pq_20s = read_pixel_quality(rep_20s)
+    assert np.all((pq_20s[:, 5] & int(PixelQuality.SMEAR_UNRESOLVED)) != 0)
+    ratio_scale = float(np.median(serr_20s_10x[:, 5]) / np.median(serr_20s[:, 5]))
+    np.testing.assert_allclose(ratio_scale, 10.0, rtol=0.05)

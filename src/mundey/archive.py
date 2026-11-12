@@ -12,7 +12,7 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -109,25 +109,49 @@ def _candidate_search_dirs(
     return deduped
 
 
-def _find_local_match(search_dirs: list[Path], patterns: list[str]) -> Path | None:
-    """Find the first matching existing non-temporary file across ``search_dirs``."""
+def _find_all_local_matches(
+    search_dirs: list[Path],
+    patterns: list[str],
+    *,
+    predicate: Callable[[Path], bool] | None = None,
+) -> list[Path]:
+    """Return all matching existing non-temporary files across ``search_dirs`` in priority order."""
+    results: list[Path] = []
+    seen: set[str] = set()
     for directory in search_dirs:
         if not directory.is_dir():
             continue
         for pat in patterns:
             if "*" not in pat and "?" not in pat:
                 exact = directory / pat
-                if exact.is_file():
-                    return exact
+                candidates = [exact] if exact.is_file() else []
             else:
-                matches = sorted(
+                candidates = sorted(
                     p
                     for p in directory.glob(pat)
                     if p.is_file() and not p.name.endswith(".tmp")
                 )
-                if matches:
-                    return matches[0]
-    return None
+            for p in candidates:
+                if p.name.endswith(".tmp"):
+                    continue
+                if predicate is not None and not predicate(p):
+                    continue
+                key = os.path.abspath(os.fspath(p))
+                if key not in seen:
+                    seen.add(key)
+                    results.append(p)
+    return results
+
+
+def _find_local_match(
+    search_dirs: list[Path],
+    patterns: list[str],
+    *,
+    predicate: Callable[[Path], bool] | None = None,
+) -> Path | None:
+    """Find the first matching existing non-temporary file across ``search_dirs``."""
+    matches = _find_all_local_matches(search_dirs, patterns, predicate=predicate)
+    return matches[0] if matches else None
 
 
 def _open_anon_s3_filesystem(*, s3_fs: Any = None) -> Any:
@@ -336,7 +360,12 @@ def collateral_blf_cache_path(
     return base_dir / f"tess-s{sector:04d}-{kind}-{camera}-{ccd}-{out_lower}-{col_tag}-blf.fits"
 
 
-def find_cached_blf(
+def _is_alt_blf_name(path: Path) -> bool:
+    name = path.name
+    return "-alt-" in name or name.endswith("-alt-blf.fits")
+
+
+def find_all_cached_blf(
     *,
     sector: int,
     camera: int,
@@ -349,8 +378,8 @@ def find_cached_blf(
     cache_dir: Path | None = None,
     tpf_parts: list[str] | None = None,
     ticid: int | None = None,
-) -> Path | None:
-    """Locate an existing ``-blf.fits`` cache locally across ``ddir`` and ``cache_dir``."""
+) -> list[Path]:
+    """Return all candidate ``-blf.fits`` cache paths across ``ddir`` and ``cache_dir``."""
     out_lower = output.lower()
     col_tag = collateral_suffix(cadence)
     sec_sub = f"s{sector:04d}"
@@ -368,6 +397,14 @@ def find_cached_blf(
                 f"tess*-s{sector:04d}-smrow-{camera}-{ccd}-"
                 f"{out_lower}-{int(ticid):016d}-*-alt-{col_tag}-blf.fits"
             )
+            patterns.append(
+                f"tess-s{sector:04d}-smrow-{camera}-{ccd}-"
+                f"{out_lower}-{int(ticid):016d}-alt-blf.fits"
+            )
+        patterns.append(
+            f"tess*-s{sector:04d}-smrow-{camera}-{ccd}-{out_lower}-*-alt*-blf.fits"
+        )
+        predicate: Callable[[Path], bool] = _is_alt_blf_name
     else:
         if tpf_parts is not None and len(tpf_parts) >= 4:
             patterns.append(
@@ -380,8 +417,40 @@ def find_cached_blf(
         patterns.append(
             f"tess-s{sector:04d}-{kind}-{camera}-{ccd}-{out_lower}-{col_tag}-blf.fits"
         )
+        predicate = lambda p: not _is_alt_blf_name(p)  # noqa: E731
 
-    return _find_local_match(search_dirs, patterns)
+    return _find_all_local_matches(search_dirs, patterns, predicate=predicate)
+
+
+def find_cached_blf(
+    *,
+    sector: int,
+    camera: int,
+    ccd: int,
+    output: str,
+    kind: Literal["smrow", "tvcol"],
+    cadence: CadenceKind = "2min",
+    smear_mode: str = "standard",
+    ddir: str | os.PathLike[str] | None = None,
+    cache_dir: Path | None = None,
+    tpf_parts: list[str] | None = None,
+    ticid: int | None = None,
+) -> Path | None:
+    """Locate an existing ``-blf.fits`` cache locally across ``ddir`` and ``cache_dir``."""
+    matches = find_all_cached_blf(
+        sector=sector,
+        camera=camera,
+        ccd=ccd,
+        output=output,
+        kind=kind,
+        cadence=cadence,
+        smear_mode=smear_mode,
+        ddir=ddir,
+        cache_dir=cache_dir,
+        tpf_parts=tpf_parts,
+        ticid=ticid,
+    )
+    return matches[0] if matches else None
 
 
 def resolve_collateral_file(
@@ -615,6 +684,8 @@ def write_smear_blf(
     cadenceno: np.ndarray,
     smear: np.ndarray,
     smear_err: np.ndarray | None = None,
+    smear_sat: np.ndarray | None = None,
+    unresolved_cols: np.ndarray | None = None,
     smear_mode: str = "standard",
     cutout_bounds: tuple[int, int, int, int] | None = None,
     int_time: float | None = None,
@@ -645,7 +716,7 @@ def write_smear_blf(
         fits.Column(
             name="SMEAR",
             format=f"{ncols}D",
-            unit="count",
+            unit="e-/frame",
             disp="F14.7",
             dim=f"({ncols})",
             array=sm_arr,
@@ -656,7 +727,7 @@ def write_smear_blf(
             fits.Column(
                 name="SMEAR_ERR",
                 format=f"{ncols}E",
-                unit="count",
+                unit="e-/frame",
                 disp="E14.7",
                 dim=f"({ncols})",
                 array=np.asarray(smear_err, dtype=np.float32),
@@ -675,7 +746,19 @@ def write_smear_blf(
         hdu1.header["CRVAL2P"] = (int(crval2p), "Cutout start CCD row")
         hdu1.header["CUTNY"] = (int(cutny), "Cutout row height")
 
-    hdul = fits.HDUList([fits.PrimaryHDU(), hdu1])
+    hdu_list: list[fits.PrimaryHDU | fits.BinTableHDU | fits.ImageHDU] = [
+        fits.PrimaryHDU(),
+        hdu1,
+    ]
+    if smear_sat is not None:
+        hdu_list.append(
+            fits.ImageHDU(data=np.asarray(smear_sat, dtype=np.uint8), name="SMROW_SAT")
+        )
+    if unresolved_cols is not None:
+        hdu_list.append(
+            fits.ImageHDU(data=np.asarray(unresolved_cols, dtype=np.uint8), name="ALT_UNRES")
+        )
+    hdul = fits.HDUList(hdu_list)
 
     if stage_dir is not None:
         stage_dir.mkdir(parents=True, exist_ok=True)

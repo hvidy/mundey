@@ -67,6 +67,7 @@ include = [
     "/hpc",
     "/tests",
     "/README.md",
+    "/CHANGELOG.md",
     "/LICENSE",
     "/pyproject.toml",
 ]

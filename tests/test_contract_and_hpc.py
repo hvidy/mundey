@@ -251,3 +251,15 @@ def test_atomic_publish_same_dir_cross_dir_and_fsync(
             raise RuntimeError("abort write")
     assert dst.read_bytes() == b"updated-from-jobfs"
     assert list(dst.parent.glob("*.tmp")) == []
+
+
+def test_hpc_sbatch_redirects_apptainer_cache_and_tmp_off_home() -> None:
+    """Slurm template must redirect APPTAINER_CACHEDIR and APPTAINER_TMPDIR off /home."""
+    repo_root = Path(__file__).resolve().parent.parent
+    text = (repo_root / "hpc" / "mundey_prefetch.sbatch").read_text(encoding="utf-8")
+    assert 'export APPTAINER_CACHEDIR="${APPTAINER_CACHEDIR:-$SCRATCH/.apptainer/cache}"' in text
+    assert 'export APPTAINER_TMPDIR="${JOBFS:-$STAGE_DIR}"' in text
+    assert '"$APPTAINER_CACHEDIR"' in text
+
+    pyproject_text = (repo_root / "pyproject.toml").read_text(encoding="utf-8")
+    assert "zarr" not in pyproject_text

@@ -30,12 +30,13 @@ export SCRATCH="${SCRATCH:-/aphid/scratch-3month/$USER}"
 export MYFRED="${MYFRED:-/fred/oz440/$USER}"
 export SIF="${SIF:-$MYFRED/containers/virgil.sif}"
 
-# Zero-/fred cache hierarchy on /aphid scratch
+# Zero-/fred cache hierarchy on /aphid scratch (including Apptainer cache & session tmpdir)
 export MUNDEY_CACHE_DIR="${MUNDEY_CACHE_DIR:-$SCRATCH/.cache/tess_bright}"
 export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-$SCRATCH/jax_cache}"
 export LIGHTKURVE_CACHE_DIR="${SCRATCH}/.cache/lightkurve"
 export ASTROPY_CACHE_DIR="${SCRATCH}/.cache/astropy"
-mkdir -p "$MUNDEY_CACHE_DIR" "$JAX_COMPILATION_CACHE_DIR" "$LIGHTKURVE_CACHE_DIR" "$ASTROPY_CACHE_DIR"
+export APPTAINER_CACHEDIR="${APPTAINER_CACHEDIR:-$SCRATCH/.apptainer/cache}"
+mkdir -p "$MUNDEY_CACHE_DIR" "$JAX_COMPILATION_CACHE_DIR" "$LIGHTKURVE_CACHE_DIR" "$ASTROPY_CACHE_DIR" "$APPTAINER_CACHEDIR"
 
 # EPYC Milan CPU-only JAX configuration & strict thread pinning (omit --nv)
 CPUS="${SLURM_CPUS_PER_TASK:-4}"
@@ -46,9 +47,10 @@ export OPENBLAS_NUM_THREADS="$CPUS"
 export MKL_NUM_THREADS="$CPUS"
 export XLA_FLAGS="--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=${CPUS}"
 
+STAGE_DIR="${JOBFS:-$SCRATCH/tmp/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}}"
+export APPTAINER_TMPDIR="${JOBFS:-$STAGE_DIR}"
 export APPTAINER_BINDPATH="/fred,/aphid${JOBFS:+,$JOBFS}"
 
-STAGE_DIR="${JOBFS:-$SCRATCH/tmp/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}}"
 OUT="${STAGE_DIR}/task_manifest"
 ARCHIVE_DIR="${MYFRED}/outputs/${SLURM_JOB_NAME}-${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}"
 TASK_TAG="${SLURM_ARRAY_TASK_ID:-0}"

@@ -5,12 +5,15 @@ from __future__ import annotations
 import io
 from pathlib import Path
 
+import lightkurve as lk
 import numpy as np
 import pytest
 from astropy.io import fits
 
+from mundey import recalibrate_tpf
 from mundey.archive import (
     S3_TESS_PUBLIC_ROOT,
+    find_cached_blf,
     iter_collateral_chunks,
     prefetch_collateral,
     resolve_collateral_file,
@@ -273,3 +276,102 @@ def test_cli_prefetch_task_id_and_tpf_inference(tpf_builder, tmp_path: Path) -> 
                 "--offline",
             ]
         )
+
+
+def test_blf_cache_wildcard_excludes_alt_files_and_stamps_e_per_frame_units(
+    tpf_builder,
+    tmp_path: Path,
+) -> None:
+    """Standard -blf lookup & prefetch must ignore -alt- caches and stamp e-/frame units."""
+    # ticid=322899250 -> '0000000322899250' sorts ASCII-before 4-digit run ID '0165'
+    bundle = tpf_builder(
+        tmp_path / "alt_vs_std",
+        col0_1based=210,
+        row0_1based=1993,
+        nx=8,
+        ny=56,
+        n_cadences=6,
+        sector=6,
+        camera=2,
+        ccd=3,
+        ticid=322899250,
+        bleed_in_smrow=True,
+        flag_bad_cadence=False,
+        noise_sigma=0.0,
+        seed=515,
+    )
+    cache_dir = tmp_path / "cache"
+
+    # Remove standard smrow -blf if any, and populate ONLY an -alt- cache first:
+    # Actually recalibrate_tpf(smear='alternate') builds BOTH standard and -alt-; delete standard!
+    recalibrate_tpf(
+        bundle.tpf_path,
+        ddir=bundle.ddir,
+        cache_dir=cache_dir,
+        smear="alternate",
+        offline=True,
+    )
+    for std_p in (cache_dir / "s0006").glob("*-smrow-*-0165-s_col-blf.fits"):
+        std_p.unlink()
+    alt_files = list((cache_dir / "s0006").glob("*-alt-s_col-blf.fits"))
+    assert len(alt_files) == 1
+
+    # 1. Standard wildcard lookup must NOT match the -alt- cache!
+    assert (
+        find_cached_blf(
+            sector=6,
+            camera=2,
+            ccd=3,
+            output="A",
+            kind="smrow",
+            smear_mode="standard",
+            cache_dir=cache_dir,
+        )
+        is None
+    )
+
+    # 2. prefetch_collateral must build the missing standard smrow -blf.fits (not skip!)
+    prefetch_collateral(
+        sector=6,
+        camera=2,
+        ccd=3,
+        outputs=("A",),
+        ddir=bundle.ddir,
+        cache_dir=cache_dir,
+        offline=True,
+    )
+    std_blf = find_cached_blf(
+        sector=6,
+        camera=2,
+        ccd=3,
+        output="A",
+        kind="smrow",
+        smear_mode="standard",
+        cache_dir=cache_dir,
+    )
+    assert std_blf is not None
+    assert "-alt-" not in std_blf.name
+
+    # 3. Verify TUNIT3/TUNIT4 == 'e-/frame', SMEARMOD == 'standard', and SMROW_SAT extension
+    with fits.open(std_blf) as hdul:
+        hdr = hdul[1].header
+        assert hdr["TUNIT3"] == "e-/frame"
+        assert hdr["TUNIT4"] == "e-/frame"
+        assert hdr["SMEARMOD"] == "standard"
+        assert "CRVAL1P" not in hdr
+        assert "SMROW_SAT" in hdul
+
+    # 4. In-memory TPF (tpf.path = None -> wildcard fallback) in smear='standard' offline mode
+    # must resolve the standard -blf.fits even though '-0000000322899250-' sorts ahead of '-0165-'!
+    for raw_col in bundle.ddir.glob("*-s_col.fits"):
+        raw_col.unlink()
+    in_mem_tpf = lk.read(bundle.tpf_path)
+    in_mem_tpf.path = None
+    cal_std = recalibrate_tpf(
+        in_mem_tpf,
+        ddir=bundle.ddir,
+        cache_dir=cache_dir,
+        smear="standard",
+        offline=True,
+    )
+    assert np.all(np.isfinite(cal_std.flux.value))
