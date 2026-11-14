@@ -34,6 +34,7 @@ from scipy.special import ndtri
 from ._contract import (
     PIXEL_QUALITY_EXTNAME,
     PixelQuality,
+    _is_fred_path,
     append_smear_err_column,
     resolve_cache_dir,
     write_mundey_provenance,
@@ -45,6 +46,7 @@ from .archive import (
     CadenceKind,
     StaticModelPaths,
     collateral_blf_cache_path,
+    collateral_suffix,
     find_all_cached_blf,
     infer_cadence_kind,
     iter_collateral_chunks,
@@ -54,6 +56,8 @@ from .archive import (
     write_onedblack_blf,
     write_smear_blf,
 )
+
+_MISSING = object()
 
 CadenceMatchMode = Literal["cadenceno", "positional"]
 MissingCadenceMode = Literal["nan", "error"]
@@ -245,6 +249,89 @@ def effective_frame_count(
     if num_frm <= 0.0:
         raise ValueError(f"NUM_FRM must be positive, got {num_frm}.")
     return factor * num_frm
+
+
+# Exact variance of the sample median of n i.i.d. N(0, 1) variates for 1 <= n <= 20
+# (averaging order statistics X_{(m)} and X_{(m+1)} for even n = 2m); at n = 10 TESS
+# smear rows, Var(median) = 0.138326435836 vs asymptotic pi / (2n) = 0.157079632679.
+# See https://en.wikipedia.org/wiki/Median#Sampling_distribution
+_UNIT_NORMAL_MEDIAN_VAR_1_TO_20: np.ndarray = np.array(
+    [
+        1.0,  # n = 0 guard
+        1.000000000000,  # n = 1
+        0.500000000000,  # n = 2
+        0.448671104578,  # n = 3
+        0.298199618435,  # n = 4
+        0.286833661606,  # n = 5
+        0.214742666582,  # n = 6
+        0.210446861535,  # n = 7
+        0.168180855159,  # n = 8
+        0.166101281359,  # n = 9
+        0.138326435836,  # n = 10
+        0.137162433548,  # n = 11
+        0.117516187119,  # n = 12
+        0.116798995001,  # n = 13
+        0.102167836796,  # n = 14
+        0.101694652082,  # n = 15
+        0.090375211225,  # n = 16
+        0.090046581423,  # n = 17
+        0.081028510053,  # n = 18
+        0.080790975073,  # n = 19
+        0.073437027705,  # n = 20
+    ],
+    dtype=np.float64,
+)
+
+# Variance ratio of the symmetric 8-of-10 truncated mean of i.i.d. N(0, 1) frames
+# (0.105356 * sigma^2; Sarhan & Greenberg 1956) relative to an untrimmed 8-frame mean
+# (sigma^2 / 8 = 0.125 * sigma^2): 8 * 0.105356 = 0.84285.
+# See https://en.wikipedia.org/wiki/Truncated_mean#Statistical_issues
+CRMITEN_BLOCK10_VAR_FACTOR: float = 0.84285
+
+
+def _unit_normal_median_variance(n: np.ndarray | int) -> np.ndarray:
+    """Return exact unit-normal sample-median variance for ``1 <= n <= 20`` and ``pi / (2n)`` above.
+
+    See `Median — Sampling distribution <https://en.wikipedia.org/wiki/Median#Sampling_distribution>`_.
+    """
+    n_arr = np.maximum(np.asarray(n, dtype=np.int64), 1)
+    clipped = np.minimum(n_arr, 20)
+    exact = _UNIT_NORMAL_MEDIAN_VAR_1_TO_20[clipped]
+    asymptotic = np.pi / (2.0 * n_arr.astype(np.float64))
+    return np.where(n_arr <= 20, exact, asymptotic)
+
+
+def _crmiten_variance_factor(
+    hdr0: fits.Header | None,
+    hdr1: fits.Header | None,
+    *,
+    fallback_hdr0: fits.Header | None = None,
+    fallback_hdr1: fits.Header | None = None,
+) -> float:
+    """Return order-statistic variance factor for onboard ``CRMITEN`` cosmic-ray trimming.
+
+    When ``CRMITEN=True`` and ``int(CRBLKSZ) == 10``, TESS discards the minimum and
+    maximum of each 10-frame block and sums the middle 8 frames, scaling Gaussian /
+    high-count frame-mean variance by ``8 * 0.105356 = 0.84285`` relative to ``1 / N_eff``
+    (`truncated mean <https://en.wikipedia.org/wiki/Truncated_mean#Statistical_issues>`_,
+    Sarhan & Greenberg 1956). Returns ``1.0`` otherwise.
+    """
+
+    def _lookup(key: str) -> Any:
+        for hdr in (hdr0, hdr1, fallback_hdr0, fallback_hdr1):
+            if hdr is not None and key in hdr:
+                return hdr[key]
+        return None
+
+    crmiten_raw = _lookup("CRMITEN")
+    crmiten = bool(crmiten_raw) if crmiten_raw is not None else False
+    if not crmiten:
+        return 1.0
+    crblksz_raw = _lookup("CRBLKSZ")
+    crblksz = int(round(float(crblksz_raw))) if crblksz_raw is not None else 10
+    if crblksz == 10:
+        return CRMITEN_BLOCK10_VAR_FACTOR
+    return 1.0
 
 
 TESS_PARALLEL_SHIFTS: int = 2058  # 2048 imaging rows + 10 lower buffer rows into frame-store
@@ -1236,7 +1323,7 @@ def _estimate_alternate_smear_stamp(
             np.array(collat_smear_err_stamp, dtype=np.float64, copy=True)
             if collat_smear_err_stamp is not None
             else np.sqrt(
-                (np.pi / 20.0) * np.maximum(np.abs(m_hat), 1.0)
+                float(_unit_normal_median_variance(10)) * np.maximum(np.abs(m_hat), 1.0)
             )
         )
     else:
@@ -1655,6 +1742,7 @@ def _calibrate_smrow_chunk_e_per_frame(
     b1d_err_sm: np.ndarray | None,
     u_coeff: float,
     lin_channel: LinearityChannel,
+    crmiten_var_factor: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Calibrate a ``(N_c, 10, 512)`` ``SMROW_RAW`` chunk to electrons per frame."""
     scale_1d = n_eff_sm / n_eff_tv
@@ -1681,9 +1769,14 @@ def _calibrate_smrow_chunk_e_per_frame(
         )
 
     n_valid = np.sum(np.isfinite(sm_e_np), axis=1)  # (N_c, 512)
-    emp_var = (np.pi / (2.0 * np.maximum(n_valid, 1))) * (mad_rows * mad_rows)
-    row_shot_read = (np.maximum(smear_med, 0.0) + read_noise_e * read_noise_e) / n_eff_sm
-    theo_var = (np.pi / (2.0 * np.maximum(n_valid, 1))) * row_shot_read
+    med_var = _unit_normal_median_variance(n_valid)
+    emp_var = med_var * (mad_rows * mad_rows)
+    row_shot_read = (
+        float(crmiten_var_factor)
+        * (np.maximum(smear_med, 0.0) + read_noise_e * read_noise_e)
+        / n_eff_sm
+    )
+    theo_var = med_var * row_shot_read
     if b1d_err_sm is not None:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
@@ -1695,7 +1788,10 @@ def _calibrate_smrow_chunk_e_per_frame(
     else:
         b1d_var = 0.0
 
-    smear_err = np.sqrt(np.maximum(emp_var, theo_var) + b1d_var)
+    # Gate 10-row MAD variance so pure Gaussian fluctuations are not rectified upward,
+    # while genuine unmodelled row scatter (e.g. bleed/strap structure > 2.5 * theo_var) overrides.
+    gated_var = np.where(emp_var > 2.5 * theo_var, emp_var, theo_var)
+    smear_err = np.sqrt(gated_var + b1d_var)
     smear_err = np.where(n_valid > 0, smear_err, np.nan)
     sm_sat_2d = np.any(sm_sat_np, axis=1)  # (N_c, 512)
     sm_sat_cols = np.any(sm_sat_2d, axis=0)  # (512,)
@@ -1721,6 +1817,9 @@ def _calibrate_smrow_raw_to_standard_blf(
     sm_hdr0, sm_hdr1, sm_time, sm_cad = read_collateral_headers_and_index(sm_col_path)
     n_total = len(sm_cad)
     n_eff_sm = effective_frame_count(
+        sm_hdr0, sm_hdr1, fallback_hdr0=sci_hdr0, fallback_hdr1=sci_hdr1
+    )
+    crmiten_var_sm = _crmiten_variance_factor(
         sm_hdr0, sm_hdr1, fallback_hdr0=sci_hdr0, fallback_hdr1=sci_hdr1
     )
 
@@ -1788,6 +1887,7 @@ def _calibrate_smrow_raw_to_standard_blf(
             b1d_err_sm=err_chunk,
             u_coeff=u_coeff,
             lin_channel=lin_channel,
+            crmiten_var_factor=crmiten_var_sm,
         )
         smear_all[t0:t1] = np.where(chunk_matched[:, None], sm_med, np.nan)
         smear_err_all[t0:t1] = np.where(
@@ -1893,6 +1993,7 @@ def build_sector_output_blf_caches(
     stage_dir: Path | None = None,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
     offline: bool = False,
+    strict_hpc: bool = True,
     cleanup_staged_raw: bool = True,
     s3_fs: Any = None,
     verbose: bool = False,
@@ -1902,11 +2003,7 @@ def build_sector_output_blf_caches(
     if out_upper not in OUTPUT_ORDER:
         raise ValueError(f"Invalid CCD output {output!r}; expected one of {OUTPUT_ORDER}.")
 
-    resolved_cache = (
-        Path(cache_dir).expanduser()
-        if cache_dir is not None
-        else resolve_cache_dir(create=True)
-    )
+    resolved_cache = resolve_cache_dir(cache_dir, strict_hpc=strict_hpc, create=True)
     sec_dir = resolved_cache / f"s{sector:04d}"
 
     tv_cached = _find_valid_tvcol_blf(
@@ -2109,7 +2206,7 @@ def _recalibrate_hdulist_inplace(
     cadence_match: CadenceMatchMode = "cadenceno",
     missing_cadence: MissingCadenceMode = "nan",
     offline: bool = False,
-    strict_hpc: bool = False,
+    strict_hpc: bool = True,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
     s3_fs: Any = None,
     verbose: bool = False,
@@ -2165,14 +2262,24 @@ def _recalibrate_hdulist_inplace(
     )
 
     # Resolve cache / write directory: when ddir is explicitly supplied without cache_dir,
-    # write -blf.fits into ddir for seamless drop-in compatibility; otherwise use cache_dir.
+    # write -blf.fits into ddir for seamless drop-in compatibility unless ddir resides on /fred.
     resolved_cache: Path | None
     if cache_dir is not None:
         resolved_cache = resolve_cache_dir(cache_dir, strict_hpc=strict_hpc, create=True)
     elif ddir is not None:
-        if strict_hpc:
-            resolve_cache_dir(ddir, strict_hpc=True, create=False)
-        resolved_cache = None
+        ddir_path = Path(ddir).expanduser()
+        if _is_fred_path(ddir_path):
+            has_env_cache = any(
+                os.environ.get(var, "").strip()
+                for var in ("MUNDEY_CACHE_DIR", "TESS_BRIGHT_CACHE_DIR", "SCRATCH")
+            )
+            if has_env_cache:
+                resolved_cache = resolve_cache_dir(None, strict_hpc=strict_hpc, create=True)
+            else:
+                resolve_cache_dir(ddir_path, strict_hpc=strict_hpc, create=False)
+                resolved_cache = None
+        else:
+            resolved_cache = None
     else:
         resolved_cache = resolve_cache_dir(None, strict_hpc=strict_hpc, create=True)
 
@@ -2216,6 +2323,7 @@ def _recalibrate_hdulist_inplace(
         )
 
     n_eff_sci = effective_frame_count(hdr0, hdr1)
+    crmiten_var_sci = _crmiten_variance_factor(hdr0, hdr1)
     fxdoff_sci = float(hdr1.get("FXDOFF", 209700.0))
     int_time = float(hdr1["INT_TIME"])
     tpf_time = np.asarray(hdu1.data["TIME"], dtype=np.float64)
@@ -2394,7 +2502,11 @@ def _recalibrate_hdulist_inplace(
         first_read_idx = (n_loc - 1) if OUTPUT_REVERSE_READOUT[out] else 0
         u_mult[first_read_idx] = 1.0 / ((1.0 - u_coeff) ** 2)
 
-        shot_read_var = (np.maximum(e_out_np, 0.0) + readnoi_sci * readnoi_sci) / n_eff_sci
+        shot_read_var = (
+            crmiten_var_sci
+            * (np.maximum(e_out_np, 0.0) + readnoi_sci * readnoi_sci)
+            / n_eff_sci
+        )
         b1d_var_sci = ((g_out_np * b1d_err_sci_rows[:, :, np.newaxis]) / n_eff_tv) ** 2
         b1d_var_sci = np.where(np.isfinite(b1d_var_sci), b1d_var_sci, 0.0)
         sig_out = np.sqrt(u_mult[None, None, :] * (shot_read_var + b1d_var_sci))
@@ -2424,7 +2536,8 @@ def _recalibrate_hdulist_inplace(
                     ]
                 else:
                     alt_err_512 = np.sqrt(
-                        (np.pi / 20.0)
+                        float(_unit_normal_median_variance(10))
+                        * crmiten_var_sci
                         * (np.maximum(alt_sm_512, 0.0) + readnoi_sci**2)
                         / n_eff_sci
                     )
@@ -2515,7 +2628,8 @@ def _recalibrate_hdulist_inplace(
                         )[safe_sm_idx]
                     else:
                         sm_err_512 = np.sqrt(
-                            (np.pi / 20.0)
+                            float(_unit_normal_median_variance(10))
+                            * crmiten_var_sci
                             * (np.maximum(sm_512, 0.0) + readnoi_sci**2)
                             / n_eff_sci
                         )
@@ -2562,6 +2676,9 @@ def _recalibrate_hdulist_inplace(
                 n_eff_sm = effective_frame_count(
                     sm_hdr0, sm_hdr1, fallback_hdr0=hdr0, fallback_hdr1=hdr1
                 )
+                crmiten_var_sm = _crmiten_variance_factor(
+                    sm_hdr0, sm_hdr1, fallback_hdr0=hdr0, fallback_hdr1=hdr1
+                )
                 fxdoff_sm = float(sm_hdr1.get("FXDOFF", fxdoff_sci))
                 meanblc_sm = float(sm_hdr1.get(f"MEANBLC{out}", meanblc_sci))
                 gain_sm = float(sm_hdr1.get(f"GAIN{out}", gain_sci))
@@ -2600,6 +2717,7 @@ def _recalibrate_hdulist_inplace(
                         b1d_err_sm=b1d_err_full[tpf_sel, 2058:2068],
                         u_coeff=u_coeff,
                         lin_channel=lin_channel,
+                        crmiten_var_factor=crmiten_var_sm,
                     )
                     sm_512[tpf_sel] = sm_med_c
                     sm_err_512[tpf_sel] = sm_err_c
@@ -2625,7 +2743,7 @@ def _recalibrate_hdulist_inplace(
                     off_mad = 1.4826 * np.nanmedian(
                         np.abs(sm_512[:, off_mask] - off_med[:, None]), axis=1
                     )
-                    se_theo = np.sqrt(np.pi / (2.0 * float(n_off))) * np.nanmedian(
+                    se_theo = np.sqrt(float(_unit_normal_median_variance(n_off))) * np.nanmedian(
                         sm_err_512[:, off_mask], axis=1
                     )
                 se_theo = np.where(np.isfinite(se_theo), se_theo, 0.0)
@@ -2720,7 +2838,7 @@ def _recalibrate_hdulist_inplace(
                 tpf_parts=tpf_parts,
                 col_stem=(
                     f"tess-s{sector:04d}-smrow-{camera}-{ccd}-{out.lower()}-"
-                    f"{int(ticid):016d}"
+                    f"{int(ticid):016d}-{collateral_suffix(cadence_kind)}"
                     if ticid is not None and tpf_parts is None
                     else None
                 ),
@@ -2770,7 +2888,11 @@ def _recalibrate_hdulist_inplace(
 
     append_smear_err_column(hdul, cal_smear_err.astype(np.float32))
     write_pixel_quality(hdul, pq_out)
-    write_mundey_provenance(target_obj if target_obj is not None else hdul, bkgsub=False)
+    write_mundey_provenance(
+        target_obj if target_obj is not None else hdul,
+        bkgsub=False,
+        smear_mode=eff_smear,
+    )
 
     hdul[0].header["CADMATCH"] = (cadence_match, "Collateral cadence pairing mode")
     hdul[0].header["CADMISS"] = (int(n_missing), "Unmatched TPF cadences masked to NaN")
@@ -2795,8 +2917,14 @@ def _clone_input_tpf(
     if hasattr(tpf, "hdu") and isinstance(tpf.hdu, fits.HDUList):
         hdul = fits.HDUList([h.copy() for h in tpf.hdu])
         raw_path = getattr(tpf, "path", None)
-        src_path = Path(raw_path).expanduser() if raw_path else None
-        qmask = getattr(tpf, "quality_bitmask", "default") or "default"
+        src_path = (
+            Path(raw_path).expanduser()
+            if isinstance(raw_path, (str, os.PathLike)) and os.fspath(raw_path)
+            else None
+        )
+        qmask = getattr(tpf, "quality_bitmask", _MISSING)
+        if qmask is _MISSING:
+            qmask = "default"
         return hdul, src_path, qmask
 
     raise TypeError(
@@ -2813,7 +2941,7 @@ def recalibrate_tpf(
     cadence_match: CadenceMatchMode = "cadenceno",
     missing_cadence: MissingCadenceMode = "nan",
     offline: bool = False,
-    strict_hpc: bool = False,
+    strict_hpc: bool = True,
     verbose: bool = False,
 ) -> lk.TargetPixelFile:
     """Recalibrate a TESS Target Pixel File from ``RAW_CNTS`` under ``HALOCVER = 1``.
@@ -2970,7 +3098,9 @@ def desmear_calibrated_cutout(
 
     append_smear_err_column(hdul, delta_m_err.astype(np.float32))
     write_pixel_quality(hdul, pq_out)
-    write_mundey_provenance(hdul, bkgsub=False)
+    write_mundey_provenance(hdul, bkgsub=False, smear_mode="cutout")
+    hdul[0].header["CADMATCH"] = ("none", "Collateral cadence pairing mode")
+    hdul[0].header["CADMISS"] = (0, "Unmatched TPF cadences masked to NaN")
 
     out_tpf = lk.TessTargetPixelFile(hdul, quality_bitmask=quality_bitmask)
     if src_path is not None and hasattr(out_tpf, "path"):

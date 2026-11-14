@@ -13,11 +13,20 @@ from astropy.io import fits
 from mundey import (
     PixelQuality,
     desmear_calibrated_cutout,
+    mundey_tpf,
     read_pixel_quality,
+    read_smear_err,
     read_smear_err_column,
     recalibrate_tpf,
 )
-from mundey.calibration import _detect_bloom_columns, fit_onedblack_legendre
+from mundey.calibration import (
+    CRMITEN_BLOCK10_VAR_FACTOR,
+    OUTPUT_BOUNDS_0BASED,
+    _detect_bloom_columns,
+    _unit_normal_median_variance,
+    fit_onedblack_legendre,
+    load_undershoot_coeff,
+)
 
 
 def test_unbleeding_roundtrip_1_2_and_4_outputs_within_1e4(
@@ -684,3 +693,458 @@ def test_upper_register_bloom_stellar_wing_smear_and_desmear_exposure_scaling(
     assert np.all((pq_20s[:, 5] & int(PixelQuality.SMEAR_UNRESOLVED)) != 0)
     ratio_scale = float(np.median(serr_20s_10x[:, 5]) / np.median(serr_20s[:, 5]))
     np.testing.assert_allclose(ratio_scale, 10.0, rtol=0.05)
+
+
+def test_sliced_lightkurve_tpf_hdulist_path_fallback_mund01(
+    tpf_builder,
+    tmp_path: Path,
+) -> None:
+    """[MUND-01] Contiguous & boolean-sliced TPFs (path=HDUList) must calibrate cleanly."""
+    bundle_2m = tpf_builder(
+        tmp_path / "sliced_2m",
+        col0_1based=210,
+        row0_1based=1500,
+        nx=8,
+        ny=10,
+        n_cadences=12,
+        include_bleed=False,
+        flag_bad_cadence=False,
+        noise_sigma=0.0,
+        seed=801,
+    )
+    orig_2m = lk.read(bundle_2m.tpf_path)
+    full_cal_2m = recalibrate_tpf(
+        orig_2m, ddir=bundle_2m.ddir, cache_dir=tmp_path / "c_full", smear="standard", offline=True
+    )
+
+    # 1. Contiguous slice: Lightkurve sets sliced.path to an in-memory fits.HDUList
+    sliced_contig = orig_2m[3:9]
+    assert isinstance(sliced_contig.path, fits.HDUList)
+    cal_contig = recalibrate_tpf(
+        sliced_contig,
+        ddir=bundle_2m.ddir,
+        cache_dir=tmp_path / "c_contig",
+        smear="standard",
+        offline=True,
+    )
+    np.testing.assert_allclose(cal_contig.flux.value, full_cal_2m.flux.value[3:9], rtol=1e-6)
+
+    # 2. Boolean mask slice
+    bool_mask = np.zeros(len(orig_2m), dtype=bool)
+    bool_mask[[0, 2, 5, 8, 11]] = True
+    sliced_bool = orig_2m[bool_mask]
+    assert isinstance(sliced_bool.path, fits.HDUList)
+    cal_bool = recalibrate_tpf(
+        sliced_bool,
+        ddir=bundle_2m.ddir,
+        cache_dir=tmp_path / "c_bool",
+        smear="standard",
+        offline=True,
+    )
+    np.testing.assert_allclose(cal_bool.flux.value, full_cal_2m.flux.value[bool_mask], rtol=1e-6)
+
+    # 3. Sliced 20-s fast TPF must infer '20s' from TIMEDEL / NUM_FRM headers when path is HDUList
+    bundle_20s = tpf_builder(
+        tmp_path / "sliced_20s",
+        col0_1based=210,
+        row0_1based=1500,
+        nx=8,
+        ny=10,
+        n_cadences=8,
+        fast_20s=True,
+        include_bleed=False,
+        flag_bad_cadence=False,
+        noise_sigma=0.0,
+        seed=802,
+    )
+    orig_20s = lk.read(bundle_20s.tpf_path)
+    sliced_20s = orig_20s[2:7]
+    assert isinstance(sliced_20s.path, fits.HDUList)
+    cal_20s = recalibrate_tpf(
+        sliced_20s,
+        ddir=bundle_20s.ddir,
+        cache_dir=tmp_path / "c_20s",
+        smear="standard",
+        offline=True,
+    )
+    full_cal_20s = recalibrate_tpf(
+        orig_20s,
+        ddir=bundle_20s.ddir,
+        cache_dir=tmp_path / "c_20s_full",
+        smear="standard",
+        offline=True,
+    )
+    np.testing.assert_allclose(cal_20s.flux.value, full_cal_20s.flux.value[2:7], rtol=1e-6)
+
+    # 4. Deprecated mundey_tpf sliced before .calibrate() also works cleanly
+    mtpf_sliced = mundey_tpf(str(bundle_2m.tpf_path))[1:5]
+    assert isinstance(mtpf_sliced.path, fits.HDUList)
+    with pytest.warns(DeprecationWarning, match="recalibrate_tpf"):
+        mtpf_sliced.calibrate(
+            verbose=False,
+            smear="standard",
+            ddir=bundle_2m.ddir,
+            cache_dir=tmp_path / "c_shim",
+            offline=True,
+        )
+    np.testing.assert_allclose(mtpf_sliced.flux.value, full_cal_2m.flux.value[1:5], rtol=1e-6)
+
+
+def test_falsy_quality_bitmask_zero_and_none_preserved_mund02(
+    tpf_builder,
+    tmp_path: Path,
+) -> None:
+    """[MUND-02] quality_bitmask=0 and quality_bitmask=None must be preserved verbatim."""
+    n_cad = 10
+    bundle = tpf_builder(
+        tmp_path / "qmask_falsy",
+        col0_1based=210,
+        row0_1based=1500,
+        nx=8,
+        ny=10,
+        n_cadences=n_cad,
+        include_bleed=False,
+        flag_bad_cadence=True,  # flags one cadence with non-zero QUALITY
+        noise_sigma=0.0,
+        seed=803,
+    )
+    tpf_default = lk.read(bundle.tpf_path, quality_bitmask="default")
+    assert len(tpf_default) == n_cad - 1
+
+    for falsy_mask in (0, None):
+        tpf_unfiltered = lk.read(bundle.tpf_path, quality_bitmask=falsy_mask)
+        assert tpf_unfiltered.quality_bitmask == falsy_mask
+        assert len(tpf_unfiltered) == n_cad
+
+        cal = recalibrate_tpf(
+            tpf_unfiltered,
+            ddir=bundle.ddir,
+            cache_dir=tmp_path / f"cache_{falsy_mask}",
+            smear="standard",
+            offline=True,
+        )
+        assert cal.quality_bitmask == falsy_mask
+        assert len(cal) == n_cad
+        assert read_smear_err(cal).shape == (n_cad, 8)
+
+        desmeared = desmear_calibrated_cutout(tpf_unfiltered)
+        assert desmeared.quality_bitmask == falsy_mask
+        assert len(desmeared) == n_cad
+
+
+def test_desmear_and_recalibrate_provenance_headers_mund04(
+    tpf_builder,
+    tmp_path: Path,
+) -> None:
+    """[MUND-04] desmear_calibrated_cutout & recalibrate_tpf stamp SMEARMOD/CADMATCH/CADMISS."""
+    bundle = tpf_builder(
+        tmp_path / "prov_cards",
+        col0_1based=210,
+        row0_1based=1993,
+        nx=8,
+        ny=56,
+        n_cadences=4,
+        bleed_in_smrow=True,
+        flag_bad_cadence=False,
+        noise_sigma=0.0,
+        seed=804,
+    )
+    cal_std = recalibrate_tpf(
+        bundle.tpf_path,
+        ddir=bundle.ddir,
+        cache_dir=tmp_path / "c_std",
+        smear="standard",
+        offline=True,
+    )
+    assert cal_std.hdu[0].header["SMEARMOD"] == "standard"
+    assert cal_std.meta["SMEARMOD"] == "standard"
+    assert cal_std.hdu[0].header["CADMATCH"] == "cadenceno"
+    assert cal_std.hdu[0].header["CADMISS"] == 0
+
+    cal_alt = recalibrate_tpf(
+        bundle.tpf_path,
+        ddir=bundle.ddir,
+        cache_dir=tmp_path / "c_alt",
+        smear="automatic",
+        offline=True,
+    )
+    assert cal_alt.hdu[0].header["SMEARMOD"] == "alternate"
+    assert cal_alt.meta["SMEARMOD"] == "alternate"
+
+    rep = desmear_calibrated_cutout(bundle.tpf_path)
+    assert rep.hdu[0].header["CADMATCH"] == "none"
+    assert rep.hdu[0].header["CADMISS"] == 0
+    assert rep.hdu[0].header["SMEARMOD"] == "cutout"
+    assert rep.meta["CADMATCH"] == "none"
+    assert rep.meta["CADMISS"] == 0
+    assert rep.meta["SMEARMOD"] == "cutout"
+
+
+def test_order_statistic_smear_err_and_crmiten_flux_err_mc_pull_mund03(
+    tmp_path: Path,
+) -> None:
+    """[MUND-03] 20-s SMEAR_ERR and 2-min CRMITEN FLUX_ERR & SMEAR_ERR match MC std within +/-6%."""
+    # 1. Direct lookup & asymptotic boundary checks
+    np.testing.assert_allclose(float(_unit_normal_median_variance(1)), 1.0, rtol=1e-12)
+    np.testing.assert_allclose(float(_unit_normal_median_variance(2)), 0.5, rtol=1e-12)
+    np.testing.assert_allclose(float(_unit_normal_median_variance(10)), 0.138326435836, rtol=1e-9)
+    np.testing.assert_allclose(float(_unit_normal_median_variance(25)), np.pi / 50.0, rtol=1e-12)
+    np.testing.assert_allclose(CRMITEN_BLOCK10_VAR_FACTOR, 0.84285, rtol=1e-6)
+
+    def _forward_undershoot(x_adu: np.ndarray, u_coeff: float) -> np.ndarray:
+        w = np.empty_like(x_adu, dtype=np.float64)
+        w[..., 0] = (1.0 - u_coeff) * x_adu[..., 0]
+        w[..., 1:] = x_adu[..., 1:] - u_coeff * x_adu[..., :-1]
+        return w
+
+    def _simulate_frames(
+        rng: np.random.Generator,
+        mean_e: np.ndarray,
+        n_cad: int,
+        *,
+        num_frm: int,
+        crmiten: bool,
+        read_noise_e: float,
+        gain: float,
+    ) -> np.ndarray:
+        full_shape = (n_cad, num_frm, *mean_e.shape)
+        photons = rng.poisson(np.broadcast_to(mean_e, full_shape))
+        frames_e = photons.astype(np.float64) + rng.normal(0.0, read_noise_e, size=full_shape)
+        frames_adu = frames_e / gain
+        if crmiten:
+            n_blocks = num_frm // 10
+            blocks = frames_adu.reshape(n_cad, n_blocks, 10, *mean_e.shape)
+            sorted_blocks = np.sort(blocks, axis=2)
+            return np.sum(sorted_blocks[:, :, 1:-1], axis=(1, 2))
+        return np.sum(frames_adu, axis=1)
+
+    def _run_mc_pull(
+        case_dir: Path,
+        *,
+        fast_20s: bool,
+        seed: int,
+        inject_smrow_outlier_col: bool = False,
+    ) -> tuple[float, float, np.ndarray]:
+        rng = np.random.default_rng(seed)
+        case_dir.mkdir(parents=True, exist_ok=True)
+        n_mc = 256
+        ny, nx = 6, 12
+        col0_1based, row0_1based = 200, 1500
+        camera, ccd, out = 2, 3, "A"
+        gain, read_noise_e, meanblc, fxdoff, int_time = 5.2, 8.5, 850.0, 209700.0, 1.98
+        num_frm = 10 if fast_20s else 60
+        crmiten = not fast_20s
+        n_eff = float(num_frm) if fast_20s else 0.8 * float(num_frm)
+        u_coeff = load_undershoot_coeff(camera, ccd, out)
+
+        true_sci_e_frame = np.full((ny, nx), 320.0, dtype=np.float64)
+        true_smear_e_frame = 65.0
+        sci_adu = _simulate_frames(
+            rng,
+            true_sci_e_frame + true_smear_e_frame,
+            n_mc,
+            num_frm=num_frm,
+            crmiten=crmiten,
+            read_noise_e=read_noise_e,
+            gain=gain,
+        )
+        sci_raw = np.rint(_forward_undershoot(sci_adu, u_coeff) + fxdoff).astype(np.int32)
+
+        sx1, _, _, _ = OUTPUT_BOUNDS_0BASED[out]
+        sm_c0 = col0_1based - 1 - sx1
+        sm_sub_w = nx + 8
+        sm_c_start = max(sm_c0 - 4, 0)
+        sm_adu_sub = _simulate_frames(
+            rng,
+            np.full((10, sm_sub_w), true_smear_e_frame, dtype=np.float64),
+            n_mc,
+            num_frm=num_frm,
+            crmiten=crmiten,
+            read_noise_e=read_noise_e,
+            gain=gain,
+        )
+        sm_adu_full = np.full(
+            (n_mc, 10, 512), n_eff * true_smear_e_frame / gain, dtype=np.float64
+        )
+        sm_adu_full[:, :, sm_c_start : sm_c_start + sm_sub_w] = sm_adu_sub
+        if inject_smrow_outlier_col:
+            # Inject strong unmodelled row-to-row structure on stamp col 0 (> 2.5 * theo_var)
+            row_step = np.linspace(-60.0, 60.0, 10, dtype=np.float64) * (n_eff / gain)
+            sm_adu_full[:, :, sm_c0] += row_step[None, :]
+        sm_raw = np.rint(_forward_undershoot(sm_adu_full, u_coeff) + fxdoff).astype(np.int32)
+
+        tv_sigma_adu = np.sqrt(
+            (CRMITEN_BLOCK10_VAR_FACTOR if crmiten else 1.0) * n_eff
+        ) * (read_noise_e / gain)
+        tv_raw = np.rint(
+            fxdoff + rng.normal(0.0, tv_sigma_adu, size=(n_mc, 2078, 11))
+        ).astype(np.int32)
+
+        b2d = np.full((2078, 2136), meanblc, dtype=np.float32)
+        fits.HDUList([fits.PrimaryHDU(), fits.ImageHDU(b2d)]).writeto(
+            case_dir / f"tess2018323-{camera}-{ccd}-2dblack.fits"
+        )
+        flat = np.ones((2078, 2136), dtype=np.float32)
+        fits.HDUList([fits.PrimaryHDU(), fits.ImageHDU(flat)]).writeto(
+            case_dir / f"tess2018323-{camera}-{ccd}-flat.fits"
+        )
+        lin_lines = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<ns1:linearityModel xmlns:ns1="http://tess.mit.edu/pip">',
+        ]
+        for ch_out in ("A", "B", "C", "D"):
+            lin_lines.append(
+                f'  <channel cameraNumber="{camera}" ccdNumber="{ccd}" ccdOutput="{ch_out}">'
+                '<linearityPoly order="0" originx="0.0" scalex="1.0" offsetx="0.0" '
+                'maxDomain="60000.0"><coeffs><coeff value="1.0"/></coeffs></linearityPoly>'
+                "</channel>"
+            )
+        lin_lines.append("</ns1:linearityModel>")
+        (case_dir / "tess2018143203310-41006_100-linearity.xml").write_text("\n".join(lin_lines))
+
+        cad = np.arange(10000, 10000 + n_mc, dtype=np.int32)
+        dt_days = (20.0 if fast_20s else 120.0) / 86400.0
+        time_arr = 1500.0 + np.arange(n_mc, dtype=np.float64) * dt_days
+        tag = "a_fast-col" if fast_20s else "s_col"
+        tp_tag = "a_fast-tp" if fast_20s else "s_tp"
+
+        hdr0 = fits.Header()
+        hdr0["MISSION"] = "TESS"
+        hdr0["TELESCOP"] = "TESS"
+        hdr0["INSTRUME"] = "TESS Photometer"
+        hdr0["SECTOR"] = 27
+        hdr0["CAMERA"] = camera
+        hdr0["CCD"] = ccd
+        hdr0["TICID"] = 999888777
+        hdr0["CRMITEN"] = crmiten
+        hdr0["CRBLKSZ"] = 10
+
+        hdr1 = fits.Header()
+        hdr1["INT_TIME"] = int_time
+        hdr1["NUM_FRM"] = num_frm
+        hdr1["TIMEDEL"] = dt_days
+        hdr1["CRMITEN"] = crmiten
+        hdr1["CRBLKSZ"] = 10
+        hdr1["FXDOFF"] = fxdoff
+        hdr1["GAINA"] = gain
+        hdr1["MEANBLCA"] = meanblc
+        hdr1["READNOIA"] = read_noise_e
+
+        tv_h1 = fits.BinTableHDU.from_columns(
+            [
+                fits.Column(name="TIME", format="D", array=time_arr),
+                fits.Column(name="CADENCENO", format="J", array=cad),
+                fits.Column(
+                    name="TVCOL_RAW", format=f"{2078 * 11}J", dim="(11,2078)", array=tv_raw
+                ),
+            ],
+            header=hdr1.copy(),
+            name="COLLATERAL_PIXEL_TABLE",
+        )
+        fits.HDUList([fits.PrimaryHDU(header=hdr0.copy()), tv_h1]).writeto(
+            case_dir / f"tess2020200000000-s0027-tvcol-{camera}-{ccd}-a-0190-{tag}.fits"
+        )
+
+        sm_h1 = fits.BinTableHDU.from_columns(
+            [
+                fits.Column(name="TIME", format="D", array=time_arr),
+                fits.Column(name="CADENCENO", format="J", array=cad),
+                fits.Column(
+                    name="SMROW_RAW", format=f"{10 * 512}J", dim="(512,10)", array=sm_raw
+                ),
+            ],
+            header=hdr1.copy(),
+            name="COLLATERAL_PIXEL_TABLE",
+        )
+        fits.HDUList([fits.PrimaryHDU(header=hdr0.copy()), sm_h1]).writeto(
+            case_dir / f"tess2020200000000-s0027-smrow-{camera}-{ccd}-a-0190-{tag}.fits"
+        )
+
+        zeros_f32 = np.zeros((n_mc, ny, nx), dtype=np.float32)
+        tp_h1 = fits.BinTableHDU.from_columns(
+            [
+                fits.Column(
+                    name="TIME", format="D", unit="BJD - 2457000, days", array=time_arr
+                ),
+                fits.Column(name="CADENCENO", format="J", array=cad),
+                fits.Column(
+                    name="RAW_CNTS", format=f"{ny * nx}J", dim=f"({nx},{ny})", array=sci_raw
+                ),
+                fits.Column(
+                    name="FLUX",
+                    format=f"{ny * nx}E",
+                    unit="e-/s",
+                    dim=f"({nx},{ny})",
+                    array=zeros_f32,
+                ),
+                fits.Column(
+                    name="FLUX_ERR",
+                    format=f"{ny * nx}E",
+                    unit="e-/s",
+                    dim=f"({nx},{ny})",
+                    array=zeros_f32,
+                ),
+                fits.Column(
+                    name="FLUX_BKG",
+                    format=f"{ny * nx}E",
+                    unit="e-/s",
+                    dim=f"({nx},{ny})",
+                    array=zeros_f32,
+                ),
+                fits.Column(
+                    name="FLUX_BKG_ERR",
+                    format=f"{ny * nx}E",
+                    unit="e-/s",
+                    dim=f"({nx},{ny})",
+                    array=zeros_f32,
+                ),
+                fits.Column(name="QUALITY", format="J", array=np.zeros(n_mc, dtype=np.int32)),
+            ],
+            header=hdr1.copy(),
+            name="PIXELS",
+        )
+        for ci in range(4, 9):
+            tp_h1.header[f"1CRV{ci}P"] = col0_1based
+            tp_h1.header[f"2CRV{ci}P"] = row0_1based
+        ap_h2 = fits.ImageHDU(data=np.full((ny, nx), 3, dtype=np.int32), name="APERTURE")
+        ap_h2.header["CRVAL1P"] = col0_1based
+        ap_h2.header["CRVAL2P"] = row0_1based
+
+        tpf_path = case_dir / f"tess2020200000000-s0027-0000000999888777-0190-{tp_tag}.fits"
+        fits.HDUList([fits.PrimaryHDU(header=hdr0.copy()), tp_h1, ap_h2]).writeto(tpf_path)
+
+        cache_dir = case_dir / "cache"
+        cal = recalibrate_tpf(
+            tpf_path, ddir=case_dir, cache_dir=cache_dir, smear="standard", offline=True
+        )
+
+        true_rate = true_sci_e_frame / int_time
+        emp_flux_std = float(np.std(cal.flux.value[:, :, 1:] - true_rate[None, :, 1:], ddof=1))
+        rep_flux_err = float(np.median(cal.flux_err.value[:, :, 1:]))
+
+        sm_blf = next((cache_dir / "s0027").glob("*-smrow-*-blf.fits"))
+        with fits.open(sm_blf) as sh:
+            sm_est_rate = (
+                np.asarray(sh[1].data["SMEAR"][:, sm_c0 : sm_c0 + nx], dtype=np.float64)
+                / int_time
+            )
+        emp_smear_std = float(np.std(sm_est_rate[:, 1:] - (true_smear_e_frame / int_time), ddof=1))
+        serr_arr = read_smear_err(cal)
+        rep_smear_err = float(np.median(serr_arr[:, 1:]))
+        return rep_flux_err / emp_flux_std, rep_smear_err / emp_smear_std, serr_arr
+
+    # 2. 20-second fast mode (CRMITEN=False): both FLUX_ERR & SMEAR_ERR within +/-6% of MC std
+    flux_ratio_20s, smear_ratio_20s, _ = _run_mc_pull(
+        tmp_path / "mc_20s", fast_20s=True, seed=202601
+    )
+    assert abs(flux_ratio_20s - 1.0) <= 0.06
+    assert abs(smear_ratio_20s - 1.0) <= 0.06
+
+    # 3. 2-minute cosmic-ray-mitigated mode (CRMITEN=True, CRBLKSZ=10) + MAD gate check on col 0
+    flux_ratio_2m, smear_ratio_2m, serr_2m = _run_mc_pull(
+        tmp_path / "mc_2min", fast_20s=False, seed=202602, inject_smrow_outlier_col=True
+    )
+    assert abs(flux_ratio_2m - 1.0) <= 0.06
+    assert abs(smear_ratio_2m - 1.0) <= 0.06
+    # Column 0 with injected row-to-row scatter (> 2.5 * theo_var) triggers empirical MAD override
+    assert float(np.median(serr_2m[:, 0])) > 3.0 * float(np.median(serr_2m[:, 1:]))

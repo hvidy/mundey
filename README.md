@@ -86,14 +86,20 @@ The image below shows the Sirius target pixel file after correction with `mundey
 `mundey` installs a `mundey` CLI with two subcommands:
 
 ```bash
-# Stage 1 (login/mover or --tmp=25G Slurm array): stream 4,096-row chunks from MAST S3
+# Stage 1 (trevor node or --tmp=25G Slurm array on trevor): stream 4,096-row chunks from MAST S3
 mundey prefetch --sector 6 --camera 2 --ccd 3 --outputs B --cadence 2min --strict-hpc
 
 # Stage 2 (offline compute nodes): recalibrate with zero network access
 mundey calibrate tess...-s_tp.fits -o recalibrated_tp.fits --offline --strict-hpc --overwrite
 ```
 
-A ready-to-submit Slurm array template for Swinburne Ngarrgu Tindebeek (`milan` CPU nodes, `$JOBFS` local NVMe staging, `$SCRATCH/.cache/tess_bright` lockless atomic `-blf.fits` publishing, pinned XLA/BLAS threads, and `EXIT`-trapped `.tar` archival to `/fred`) is provided at `hpc/mundey_prefetch.sbatch`.
+A ready-to-submit Slurm array template for Swinburne Ngarrgu Tindebeek (`$MYFRED/containers/halo.sif` Apptainer runtime, `$JOBFS` local NVMe staging, `$SCRATCH/.cache/tess_bright` lockless atomic `-blf.fits` publishing, `/aphid/scratch-3month/%u/logs` Slurm logs, pinned XLA/BLAS threads, and `EXIT`-trapped `.tar` archival to `/fred`) is provided at `hpc/mundey_prefetch.sbatch`.
+
+Because Swinburne NT compute nodes have **no outbound internet**, Stage-1 S3 prefetching (`mundey_prefetch.sbatch`) must be submitted from a **`trevor`** node (creating `/aphid/scratch-3month/$USER/logs` beforehand so Slurm logs never consume `/fred/oz440` inodes or `/home` quota, and adjusting the path to `hpc/mundey_prefetch.sbatch` if your checkout is outside `$HOME`):
+
+```bash
+ssh trevor 'mkdir -p /aphid/scratch-3month/$USER/logs && sbatch --export=ALL,SECTOR=6 hpc/mundey_prefetch.sbatch'
+```
 
 ## License
 
