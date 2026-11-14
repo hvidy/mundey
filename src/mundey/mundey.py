@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import importlib.resources
+import os
 import warnings
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
@@ -176,7 +177,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
         cadence_match: CadenceMatchMode = "cadenceno",
         missing_cadence: MissingCadenceMode = "nan",
         offline: bool = False,
-        strict_hpc: bool = False,
+        strict_hpc: bool = True,
     ) -> None:
         """Recalibrate ``self.hdu`` in place via the ``mundey`` v2.0 JAX engine."""
         resolved_target = _resolve_target_name(
@@ -196,7 +197,11 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
             _maybe_display_union_link()
 
         raw_path = getattr(self, "path", None)
-        src_path = Path(raw_path).expanduser() if raw_path else None
+        src_path = (
+            Path(raw_path).expanduser()
+            if isinstance(raw_path, (str, os.PathLike)) and os.fspath(raw_path)
+            else None
+        )
 
         _recalibrate_hdulist_inplace(
             self.hdu,

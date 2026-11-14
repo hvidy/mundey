@@ -38,33 +38,38 @@ class StaticModelPaths:
 
 def infer_cadence_kind(
     *,
-    tpf_path: str | os.PathLike[str] | None = None,
+    tpf_path: str | os.PathLike[str] | Any = None,
     hdu0_header: fits.Header | None = None,
     hdu1_header: fits.Header | None = None,
 ) -> CadenceKind:
     """Infer whether a TPF requires 2-minute (``2min``) or 20-second (``20s``) collateral data."""
-    if tpf_path is not None:
+    if isinstance(tpf_path, (str, os.PathLike)) and os.fspath(tpf_path):
         name = Path(tpf_path).name.lower()
         if "fast-tp" in name or "fast_tp" in name or "-a_fast" in name:
             return "20s"
         if "-s_tp" in name:
             return "2min"
 
-    if hdu1_header is not None:
-        if "TIMEDEL" in hdu1_header:
+    for hdr in (hdu1_header, hdu0_header):
+        if hdr is not None and "TIMEDEL" in hdr:
             try:
-                dt_sec = float(hdu1_header["TIMEDEL"]) * 86400.0
+                dt_sec = float(hdr["TIMEDEL"]) * 86400.0
                 if 0.0 < dt_sec < 45.0:
                     return "20s"
             except (TypeError, ValueError):
                 pass
-        if "NUM_FRM" in hdu1_header:
+    for hdr in (hdu1_header, hdu0_header):
+        if hdr is not None and "NUM_FRM" in hdr:
             try:
-                num_frm = int(hdu1_header["NUM_FRM"])
+                num_frm = int(hdr["NUM_FRM"])
                 crmiten = bool(
                     hdu0_header.get("CRMITEN", False)
                     if hdu0_header is not None and "CRMITEN" in hdu0_header
-                    else hdu1_header.get("CRMITEN", True)
+                    else (
+                        hdu1_header.get("CRMITEN", True)
+                        if hdu1_header is not None
+                        else True
+                    )
                 )
                 if num_frm <= 15 and not crmiten:
                     return "20s"
@@ -399,10 +404,18 @@ def find_all_cached_blf(
             )
             patterns.append(
                 f"tess-s{sector:04d}-smrow-{camera}-{ccd}-"
-                f"{out_lower}-{int(ticid):016d}-alt-blf.fits"
+                f"{out_lower}-{int(ticid):016d}-{col_tag}-alt-blf.fits"
             )
+            if cadence == "2min":
+                patterns.append(
+                    f"tess-s{sector:04d}-smrow-{camera}-{ccd}-"
+                    f"{out_lower}-{int(ticid):016d}-alt-blf.fits"
+                )
         patterns.append(
-            f"tess*-s{sector:04d}-smrow-{camera}-{ccd}-{out_lower}-*-alt*-blf.fits"
+            f"tess*-s{sector:04d}-smrow-{camera}-{ccd}-{out_lower}-*-alt-{col_tag}-blf.fits"
+        )
+        patterns.append(
+            f"tess*-s{sector:04d}-smrow-{camera}-{ccd}-{out_lower}-*-{col_tag}-alt-blf.fits"
         )
         predicate: Callable[[Path], bool] = _is_alt_blf_name
     else:
@@ -788,7 +801,7 @@ def prefetch_collateral(
     stage_dir: str | os.PathLike[str] | None = None,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
     offline: bool = False,
-    strict_hpc: bool = False,
+    strict_hpc: bool = True,
     cleanup_staged_raw: bool = True,
     s3_fs: Any = None,
     verbose: bool = False,
@@ -842,6 +855,7 @@ def prefetch_collateral(
                 stage_dir=resolved_stage,
                 chunk_rows=chunk_rows,
                 offline=offline,
+                strict_hpc=strict_hpc,
                 cleanup_staged_raw=cleanup_staged_raw,
                 s3_fs=s3_fs,
                 verbose=verbose,

@@ -13,6 +13,7 @@ import os
 import shutil
 import socket
 import uuid
+import warnings
 from collections.abc import Iterator
 from enum import IntFlag
 from pathlib import Path
@@ -67,6 +68,7 @@ def write_mundey_provenance(
     *,
     bkgsub: bool = False,
     halocver: int = HALOCVER,
+    smear_mode: str | None = None,
 ) -> fits.HDUList:
     """Write ``HALOCVER`` and ``BKGSUB`` provenance cards to ``hdu[0]`` and ``hdu[1]``.
 
@@ -75,6 +77,7 @@ def write_mundey_provenance(
     instances without mutating the read-only ``MappingProxyType``. When SPOC's
     standard ``BACKAPP`` card is present, it is synchronized to ``bool(bkgsub)``
     so FITS consumers never observe contradictory background-subtraction flags.
+    When ``smear_mode`` is provided, ``SMEARMOD`` is also stamped in ``hdu[0].header``.
     """
     hdul = _unwrap_hdulist(target)
     if len(hdul) < 2:
@@ -93,6 +96,11 @@ def write_mundey_provenance(
         )
         if "BACKAPP" in hdr:
             hdr["BACKAPP"] = bkgsub_bool
+    if smear_mode is not None:
+        hdul[0].header["SMEARMOD"] = (
+            str(smear_mode),
+            "Mundey smear estimation mode",
+        )
     meta = getattr(target, "meta", None)
     meta_dict = getattr(meta, "_dict", None)
     if isinstance(meta_dict, dict):
@@ -100,6 +108,8 @@ def write_mundey_provenance(
         meta_dict["BKGSUB"] = bkgsub_bool
         if "BACKAPP" in meta_dict:
             meta_dict["BACKAPP"] = bkgsub_bool
+        if smear_mode is not None:
+            meta_dict["SMEARMOD"] = str(smear_mode)
     return hdul
 
 
@@ -268,8 +278,11 @@ def read_smear_err_column(
     target: fits.HDUList | Any,
     *,
     quality_masked: bool = True,
+    apply_quality_mask: bool | None = None,
 ) -> np.ndarray:
     """Read ``SMEAR_ERR`` as ``float32`` ``(N, nx)``, optionally applying ``quality_mask``."""
+    if apply_quality_mask is not None:
+        quality_masked = bool(apply_quality_mask)
     hdul = _unwrap_hdulist(target)
     if len(hdul) < 2 or hdul[1].data is None:
         raise KeyError("HDU[1] PIXELS table is missing or empty.")
@@ -285,6 +298,9 @@ def read_smear_err_column(
     return raw
 
 
+read_smear_err = read_smear_err_column
+
+
 def _is_fred_path(path: Path) -> bool:
     """Return True if ``path`` or its resolved target resides under ``/fred``."""
     lexical = Path(os.path.abspath(os.fspath(path)))
@@ -293,27 +309,32 @@ def _is_fred_path(path: Path) -> bool:
 
 
 def resolve_cache_dir(
-    cache_dir: str | os.PathLike[str] | None = None,
+    cache_dir: str | Path | None = None,
     *,
-    strict_hpc: bool = False,
+    strict_hpc: bool = True,
     create: bool = False,
 ) -> Path:
     """Resolve the ``mundey`` cache directory, guarding against ``/fred`` on HPC.
 
     Default resolution order when ``cache_dir`` is ``None``:
     1. ``$MUNDEY_CACHE_DIR`` if set and non-empty.
-    2. ``$SCRATCH/.cache/tess_bright`` when ``$SCRATCH`` is set and non-empty.
-    3. ``$XDG_CACHE_HOME/tess_bright`` when ``$XDG_CACHE_HOME`` is set and non-empty.
-    4. ``~/.cache/tess_bright`` otherwise.
+    2. ``$TESS_BRIGHT_CACHE_DIR`` if set and non-empty.
+    3. ``$SCRATCH/.cache/tess_bright`` when ``$SCRATCH`` is set and non-empty.
+    4. ``$XDG_CACHE_HOME/tess_bright`` when ``$XDG_CACHE_HOME`` is set and non-empty.
+    5. ``~/.cache/tess_bright`` otherwise.
 
-    When ``strict_hpc=True``, paths pointing under ``/fred`` (either directly or
-    via symlinks) raise ``ValueError`` to protect Swinburne NT / OzSTAR project
-    inode quotas.
+    Symlinks are resolved via ``expanduser().resolve(strict=False)`` before testing
+    whether the target resides under ``/fred``. When under ``/fred``:
+    - ``strict_hpc=True`` (default) raises :class:`ValueError` to protect Swinburne
+      NT / OzSTAR shared project inode quotas;
+    - ``strict_hpc=False`` emits a :class:`UserWarning` and proceeds.
     """
     if cache_dir is not None:
         candidate = Path(cache_dir).expanduser()
     elif os.environ.get("MUNDEY_CACHE_DIR", "").strip():
         candidate = Path(os.environ["MUNDEY_CACHE_DIR"].strip()).expanduser()
+    elif os.environ.get("TESS_BRIGHT_CACHE_DIR", "").strip():
+        candidate = Path(os.environ["TESS_BRIGHT_CACHE_DIR"].strip()).expanduser()
     elif os.environ.get("SCRATCH", "").strip():
         candidate = Path(os.environ["SCRATCH"].strip()).expanduser() / ".cache" / "tess_bright"
     elif os.environ.get("XDG_CACHE_HOME", "").strip():
@@ -321,15 +342,20 @@ def resolve_cache_dir(
     else:
         candidate = Path.home() / ".cache" / "tess_bright"
 
-    if strict_hpc and _is_fred_path(candidate):
-        raise ValueError(
-            f"Refusing cache directory {candidate!s} under /fred in strict_hpc=True mode "
-            "(violates Swinburne NT/OzSTAR shared inode quota); use $SCRATCH/.cache/tess_bright."
+    resolved = candidate.resolve(strict=False)
+    if _is_fred_path(candidate) or resolved.parts[:2] == ("/", "fred"):
+        msg = (
+            f"Refusing cache directory {resolved!s} under /fred "
+            "(violates Swinburne NT/OzSTAR shared inode quota); "
+            "use $SCRATCH/.cache/tess_bright instead."
         )
+        if strict_hpc:
+            raise ValueError(msg)
+        warnings.warn(msg, UserWarning, stacklevel=2)
 
     if create:
-        candidate.mkdir(parents=True, exist_ok=True)
-    return candidate
+        resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
 
 
 def make_atomic_tmp_path(dst: str | os.PathLike[str]) -> Path:
