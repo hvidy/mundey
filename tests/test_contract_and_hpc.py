@@ -26,6 +26,7 @@ from mundey import (
     read_pixel_quality,
     read_smear_err,
     read_smear_err_column,
+    recalibrate_tpf,
     resolve_cache_dir,
     write_mundey_provenance,
     write_pixel_quality,
@@ -253,19 +254,77 @@ def test_resolve_cache_dir_scratch_default_and_fred_hpc_guard(
     assert resolve_cache_dir("/frederick/cache") == Path("/frederick/cache").resolve(strict=False)
 
 
+def test_recalibrate_ddir_on_fred_routes_to_xdg_and_scratch_env_caches(
+    tpf_builder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """When ddir resides on /fred, recalibrate_tpf must route caches to XDG_CACHE_HOME/SCRATCH."""
+    for var in ("MUNDEY_CACHE_DIR", "TESS_BRIGHT_CACHE_DIR", "SCRATCH", "XDG_CACHE_HOME"):
+        monkeypatch.delenv(var, raising=False)
+
+    bundle = tpf_builder(
+        tmp_path / "fred_src",
+        col0_1based=200,
+        row0_1based=1800,
+        nx=8,
+        ny=10,
+        n_cadences=4,
+        flag_bad_cadence=False,
+        seed=105,
+    )
+    tpf = lk.read(bundle.tpf_path)
+
+    # 1. Without any cache env var set, ddir under /fred fails under strict_hpc=True
+    with pytest.raises(ValueError, match="Refusing cache directory .* under /fred"):
+        recalibrate_tpf(tpf, ddir="/fred/oz440/input", offline=True)
+
+    def _seed_cache_root(root: Path) -> None:
+        models_dir = root / "models"
+        sec_dir = root / "s0020"
+        models_dir.mkdir(parents=True, exist_ok=True)
+        sec_dir.mkdir(parents=True, exist_ok=True)
+        for p in bundle.ddir.iterdir():
+            if not p.is_file():
+                continue
+            if p.name.endswith(("2dblack.fits", "flat.fits", "linearity.xml")):
+                (models_dir / p.name).symlink_to(p)
+            elif "-smrow-" in p.name or "-tvcol-" in p.name:
+                (sec_dir / p.name).symlink_to(p)
+
+    # 2. With only XDG_CACHE_HOME set (SCRATCH unset), ddir under /fred routes cleanly to XDG
+    xdg_dir = tmp_path / "aphid_xdg"
+    _seed_cache_root(xdg_dir / "tess_bright")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(xdg_dir))
+    cal_xdg = recalibrate_tpf(tpf, ddir="/fred/oz440/input", smear="standard", offline=True)
+    assert np.all(np.isfinite(cal_xdg.flux.value))
+    assert len(list((xdg_dir / "tess_bright" / "s0020").glob("*-blf.fits"))) == 2
+
+    # 3. With SCRATCH set, ddir under /fred routes cleanly to $SCRATCH/.cache/tess_bright
+    scratch_dir = tmp_path / "aphid_scratch_run"
+    _seed_cache_root(scratch_dir / ".cache" / "tess_bright")
+    monkeypatch.setenv("SCRATCH", str(scratch_dir))
+    cal_scr = recalibrate_tpf(tpf, ddir="/fred/oz440/input", smear="standard", offline=True)
+    np.testing.assert_allclose(cal_scr.flux.value, cal_xdg.flux.value, rtol=1e-6)
+    assert len(list((scratch_dir / ".cache" / "tess_bright" / "s0020").glob("*-blf.fits"))) == 2
+
+
 def test_version_2_0_0_and_read_smear_err_export_symmetry(
     synthetic_1output_bundle,
+    tmp_path: Path,
 ) -> None:
-    """mundey v2.0.0 must export read_smear_err alias and SMEARMOD provenance card."""
+    """mundey v2.0.0 must export read_smear_err with FITS-path and quality_mask=None symmetry."""
     assert mundey.__version__ == "2.0.0"
     assert "read_smear_err" in mundey.__all__
     assert read_smear_err is read_smear_err_column
 
     tpf = lk.read(synthetic_1output_bundle.tpf_path)
     n_raw = len(tpf.hdu[1].data)
-    nx = tpf.shape[2]
+    _, ny, nx = tpf.shape
     vals = np.arange(n_raw * nx, dtype=np.float32).reshape(n_raw, nx)
+    pq = np.full((ny, nx), int(PixelQuality.STRAP_COL), dtype=np.uint16)
     append_smear_err_column(tpf, vals)
+    write_pixel_quality(tpf, pq)
     write_mundey_provenance(tpf, bkgsub=False, smear_mode="standard")
 
     assert tpf.hdu[0].header["SMEARMOD"] == "standard"
@@ -278,6 +337,33 @@ def test_version_2_0_0_and_read_smear_err_export_symmetry(
         read_smear_err(tpf, apply_quality_mask=False),
         vals,
     )
+
+    # Path / str symmetry with halophot.read_smear_err, read_pixel_quality, read_mundey_provenance
+    fits_out = tmp_path / "sym_calibrated_tp.fits"
+    tpf.to_fits(str(fits_out), overwrite=True)
+    for path_arg in (fits_out, str(fits_out)):
+        np.testing.assert_array_equal(read_smear_err(path_arg), vals)
+        np.testing.assert_array_equal(read_pixel_quality(path_arg), pq)
+        assert read_mundey_provenance(path_arg) == {"halocver": 1, "bkgsub": False}
+
+    # Wrapper with quality_mask = None must NOT insert a spurious leading axis raw[None]
+    class _NullMaskWrapper:
+        def __init__(self, hdu) -> None:
+            self.hdu = hdu
+            self.quality_mask = None
+
+    null_wrapped = _NullMaskWrapper(tpf.hdu)
+    assert read_smear_err(null_wrapped).shape == (n_raw, nx)
+    np.testing.assert_array_equal(read_smear_err(null_wrapped), vals)
+
+    # Mismatched quality_mask length raises clear ValueError
+    class _BadMaskWrapper:
+        def __init__(self, hdu) -> None:
+            self.hdu = hdu
+            self.quality_mask = np.ones(n_raw - 1, dtype=bool)
+
+    with pytest.raises(ValueError, match="quality_mask shape"):
+        read_smear_err(_BadMaskWrapper(tpf.hdu))
 
 
 def test_atomic_publish_same_dir_cross_dir_and_fsync(

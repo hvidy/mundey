@@ -789,6 +789,126 @@ def test_sliced_lightkurve_tpf_hdulist_path_fallback_mund01(
         )
     np.testing.assert_allclose(mtpf_sliced.flux.value, full_cal_2m.flux.value[1:5], rtol=1e-6)
 
+    # 5. Shared cache_dir in smear="automatic" -> "alternate" (stamp reaching row 2048):
+    # calibrating a slice must never poison subsequent disjoint slices or full-TPF runs.
+    bundle_alt = tpf_builder(
+        tmp_path / "sliced_alt",
+        col0_1based=210,
+        row0_1based=1993,
+        nx=8,
+        ny=56,
+        n_cadences=12,
+        bleed_in_smrow=True,
+        flag_bad_cadence=False,
+        noise_sigma=0.0,
+        thermal_step_cadence=5,
+        thermal_step_smear_e=120.0,
+        seed=804,
+    )
+    orig_alt = lk.read(bundle_alt.tpf_path)
+    full_alt_ref = recalibrate_tpf(
+        orig_alt,
+        ddir=bundle_alt.ddir,
+        cache_dir=tmp_path / "c_alt_ref",
+        smear="automatic",
+        missing_cadence="error",
+        offline=True,
+    )
+
+    shared_alt = tmp_path / "c_alt_shared"
+    cal_alt_s1 = recalibrate_tpf(
+        orig_alt[2:5],
+        ddir=bundle_alt.ddir,
+        cache_dir=shared_alt,
+        smear="automatic",
+        missing_cadence="error",
+        offline=True,
+    )
+    cal_alt_s2 = recalibrate_tpf(
+        orig_alt[6:10],
+        ddir=bundle_alt.ddir,
+        cache_dir=shared_alt,
+        smear="automatic",
+        missing_cadence="error",
+        offline=True,
+    )
+    cal_alt_full = recalibrate_tpf(
+        orig_alt,
+        ddir=bundle_alt.ddir,
+        cache_dir=shared_alt,
+        smear="automatic",
+        missing_cadence="error",
+        offline=True,
+    )
+    cal_alt_s3 = recalibrate_tpf(
+        orig_alt[1:4],
+        ddir=bundle_alt.ddir,
+        cache_dir=shared_alt,
+        smear="automatic",
+        missing_cadence="error",
+        offline=True,
+    )
+    for sub_cal in (cal_alt_s1, cal_alt_s2, cal_alt_full, cal_alt_s3):
+        assert sub_cal.hdu[0].header["SMEARMOD"] == "alternate"
+        assert sub_cal.hdu[0].header["CADMISS"] == 0
+        assert np.all(np.isfinite(sub_cal.flux.value))
+
+    np.testing.assert_allclose(cal_alt_s1.flux.value, full_alt_ref.flux.value[2:5], rtol=1e-5)
+    np.testing.assert_allclose(cal_alt_s2.flux.value, full_alt_ref.flux.value[6:10], rtol=1e-5)
+    np.testing.assert_allclose(cal_alt_full.flux.value, full_alt_ref.flux.value, rtol=1e-5)
+    np.testing.assert_allclose(cal_alt_s3.flux.value, full_alt_ref.flux.value[1:4], rtol=1e-5)
+
+    # Full 12-row -alt-blf.fits must exist and not be shrunk when smaller slice [1:4] runs
+    alt_blfs = list((shared_alt / "s0020").glob("*-alt*blf.fits"))
+    assert len(alt_blfs) >= 1
+    row_counts = []
+    for bp in alt_blfs:
+        with fits.open(bp) as bh:
+            row_counts.append(len(bh[1].data["CADENCENO"]))
+    assert max(row_counts) == 12
+
+    # Also verify pure in-memory slice orig_alt[:] (tpf_parts=None) writes 12 rows and is
+    # preserved if a partial write check runs against the exact same ticid-scoped filename
+    inmem_cache = tmp_path / "c_alt_inmem"
+    recalibrate_tpf(
+        orig_alt[:],
+        ddir=bundle_alt.ddir,
+        cache_dir=inmem_cache,
+        smear="automatic",
+        offline=True,
+    )
+    recalibrate_tpf(
+        orig_alt[1:4],
+        ddir=bundle_alt.ddir,
+        cache_dir=inmem_cache,
+        smear="automatic",
+        offline=True,
+    )
+    inmem_alt_blfs = list((inmem_cache / "s0020").glob("*-alt*blf.fits"))
+    assert len(inmem_alt_blfs) == 1
+    with fits.open(inmem_alt_blfs[0]) as bh:
+        assert len(bh[1].data["CADENCENO"]) == 12
+
+    # Positional pairing must also reject a shifted slice [6:10] cache when running [0:4]
+    shared_pos = tmp_path / "c_alt_pos"
+    recalibrate_tpf(
+        orig_alt[6:10],
+        ddir=bundle_alt.ddir,
+        cache_dir=shared_pos,
+        smear="automatic",
+        cadence_match="cadenceno",
+        offline=True,
+    )
+    cal_pos_0_4 = recalibrate_tpf(
+        orig_alt[0:4],
+        ddir=bundle_alt.ddir,
+        cache_dir=shared_pos,
+        smear="automatic",
+        cadence_match="positional",
+        offline=True,
+    )
+    np.testing.assert_allclose(cal_pos_0_4.flux.value, full_alt_ref.flux.value[0:4], rtol=1e-5)
+
 
 def test_falsy_quality_bitmask_zero_and_none_preserved_mund02(
     tpf_builder,

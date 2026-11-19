@@ -199,7 +199,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
         raw_path = getattr(self, "path", None)
         src_path = (
             Path(raw_path).expanduser()
-            if isinstance(raw_path, (str, os.PathLike)) and os.fspath(raw_path)
+            if isinstance(raw_path, str | os.PathLike) and os.fspath(raw_path)
             else None
         )
 

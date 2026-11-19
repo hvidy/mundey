@@ -49,6 +49,18 @@ def _unwrap_hdulist(target: fits.HDUList | Any) -> fits.HDUList:
     )
 
 
+@contextlib.contextmanager
+def _open_hdulist(
+    target: str | os.PathLike[str] | fits.HDUList | Any,
+) -> Iterator[fits.HDUList]:
+    """Yield an ``HDUList`` from a FITS path, ``HDUList``, or ``TargetPixelFile``."""
+    if isinstance(target, str | os.PathLike):
+        with fits.open(Path(target).expanduser(), mode="readonly", memmap=False) as hdul:
+            yield hdul
+        return
+    yield _unwrap_hdulist(target)
+
+
 def _infer_cutout_shape(hdul: fits.HDUList) -> tuple[int, int, int] | None:
     """Infer ``(n_raw, ny, nx)`` from HDU 1 ``PIXELS`` table columns if present."""
     if len(hdul) < 2 or getattr(hdul[1], "data", None) is None:
@@ -113,43 +125,45 @@ def write_mundey_provenance(
     return hdul
 
 
-def read_mundey_provenance(target: fits.HDUList | Any) -> dict[str, int | bool | None]:
+def read_mundey_provenance(
+    target: str | os.PathLike[str] | fits.HDUList | Any,
+) -> dict[str, int | bool | None]:
     """Read and validate ``HALOCVER`` and ``BKGSUB`` across ``hdu[0]`` and ``hdu[1]``."""
-    hdul = _unwrap_hdulist(target)
-    halocver: int | None = None
-    bkgsub: bool | None = None
-    for idx in range(min(2, len(hdul))):
-        hdr = hdul[idx].header
-        if "HALOCVER" in hdr:
-            raw_ver = hdr["HALOCVER"]
-            if not isinstance(raw_ver, (int, np.integer)) or isinstance(
-                raw_ver, (bool, np.bool_)
-            ):
-                raise ValueError(
-                    f"Invalid HALOCVER header value in HDU[{idx}] (expected int): {raw_ver!r}."
-                )
-            ver_int = int(raw_ver)
-            if halocver is None:
-                halocver = ver_int
-            elif halocver != ver_int:
-                raise ValueError(
-                    f"Conflicting HALOCVER values between HDU[0] ({halocver}) "
-                    f"and HDU[{idx}] ({ver_int})."
-                )
-        if "BKGSUB" in hdr:
-            raw_bkg = hdr["BKGSUB"]
-            if not isinstance(raw_bkg, (bool, np.bool_)):
-                raise ValueError(
-                    f"Invalid BKGSUB header value in HDU[{idx}] (expected bool): {raw_bkg!r}."
-                )
-            bkg_bool = bool(raw_bkg)
-            if bkgsub is None:
-                bkgsub = bkg_bool
-            elif bkgsub != bkg_bool:
-                raise ValueError(
-                    f"Conflicting BKGSUB values between HDU[0] ({bkgsub}) "
-                    f"and HDU[{idx}] ({bkg_bool})."
-                )
+    with _open_hdulist(target) as hdul:
+        halocver: int | None = None
+        bkgsub: bool | None = None
+        for idx in range(min(2, len(hdul))):
+            hdr = hdul[idx].header
+            if "HALOCVER" in hdr:
+                raw_ver = hdr["HALOCVER"]
+                if not isinstance(raw_ver, int | np.integer) or isinstance(
+                    raw_ver, bool | np.bool_
+                ):
+                    raise ValueError(
+                        f"Invalid HALOCVER header value in HDU[{idx}] (expected int): {raw_ver!r}."
+                    )
+                ver_int = int(raw_ver)
+                if halocver is None:
+                    halocver = ver_int
+                elif halocver != ver_int:
+                    raise ValueError(
+                        f"Conflicting HALOCVER values between HDU[0] ({halocver}) "
+                        f"and HDU[{idx}] ({ver_int})."
+                    )
+            if "BKGSUB" in hdr:
+                raw_bkg = hdr["BKGSUB"]
+                if not isinstance(raw_bkg, bool | np.bool_):
+                    raise ValueError(
+                        f"Invalid BKGSUB header value in HDU[{idx}] (expected bool): {raw_bkg!r}."
+                    )
+                bkg_bool = bool(raw_bkg)
+                if bkgsub is None:
+                    bkgsub = bkg_bool
+                elif bkgsub != bkg_bool:
+                    raise ValueError(
+                        f"Conflicting BKGSUB values between HDU[0] ({bkgsub}) "
+                        f"and HDU[{idx}] ({bkg_bool})."
+                    )
     return {"halocver": halocver, "bkgsub": bkgsub}
 
 
@@ -193,12 +207,12 @@ def write_pixel_quality(
     return hdul
 
 
-def read_pixel_quality(target: fits.HDUList | Any) -> np.ndarray:
+def read_pixel_quality(target: str | os.PathLike[str] | fits.HDUList | Any) -> np.ndarray:
     """Read the ``PIXEL_QUALITY`` spatial bitmask as a ``uint16`` ``(ny, nx)`` array."""
-    hdul = _unwrap_hdulist(target)
-    if PIXEL_QUALITY_EXTNAME not in hdul:
-        raise KeyError(f"Extension {PIXEL_QUALITY_EXTNAME!r} not found in HDUList.")
-    return np.asarray(hdul[PIXEL_QUALITY_EXTNAME].data, dtype=np.uint16)
+    with _open_hdulist(target) as hdul:
+        if PIXEL_QUALITY_EXTNAME not in hdul:
+            raise KeyError(f"Extension {PIXEL_QUALITY_EXTNAME!r} not found in HDUList.")
+        return np.array(hdul[PIXEL_QUALITY_EXTNAME].data, dtype=np.uint16, copy=True)
 
 
 def _strip_smear_units(smear_err: Any) -> np.ndarray:
@@ -275,7 +289,7 @@ def append_smear_err_column(
 
 
 def read_smear_err_column(
-    target: fits.HDUList | Any,
+    target: str | os.PathLike[str] | fits.HDUList | Any,
     *,
     quality_masked: bool = True,
     apply_quality_mask: bool | None = None,
@@ -283,18 +297,25 @@ def read_smear_err_column(
     """Read ``SMEAR_ERR`` as ``float32`` ``(N, nx)``, optionally applying ``quality_mask``."""
     if apply_quality_mask is not None:
         quality_masked = bool(apply_quality_mask)
-    hdul = _unwrap_hdulist(target)
-    if len(hdul) < 2 or hdul[1].data is None:
-        raise KeyError("HDU[1] PIXELS table is missing or empty.")
-    names = hdul[1].data.names or ()
-    if SMEAR_ERR_COLNAME not in names:
-        raise KeyError(f"Column {SMEAR_ERR_COLNAME!r} not found in HDU[1].")
+    with _open_hdulist(target) as hdul:
+        if len(hdul) < 2 or hdul[1].data is None:
+            raise KeyError("HDU[1] PIXELS table is missing or empty.")
+        names = hdul[1].data.names or ()
+        if SMEAR_ERR_COLNAME not in names:
+            raise KeyError(f"Column {SMEAR_ERR_COLNAME!r} not found in HDU[1].")
 
-    raw = np.asarray(hdul[1].data[SMEAR_ERR_COLNAME], dtype=np.float32)
+        raw = np.array(hdul[1].data[SMEAR_ERR_COLNAME], dtype=np.float32, copy=True)
     if raw.ndim == 1:
         raw = raw[:, np.newaxis]
-    if quality_masked and hasattr(target, "quality_mask"):
-        return np.asarray(raw[target.quality_mask], dtype=np.float32)
+    qmask = getattr(target, "quality_mask", None)
+    if quality_masked and qmask is not None:
+        mask_arr = np.asarray(qmask, dtype=bool)
+        if mask_arr.shape != (raw.shape[0],):
+            raise ValueError(
+                f"TargetPixelFile quality_mask shape {mask_arr.shape} does not "
+                f"match HDU[1] row count ({raw.shape[0]},)."
+            )
+        return np.asarray(raw[mask_arr], dtype=np.float32)
     return raw
 
 

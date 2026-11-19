@@ -2,7 +2,7 @@
 
 All notable changes to `mundey` are documented in this file.
 
-## [2.0.0] - 2026-11-14
+## [2.0.0] - 2026-11-19
 
 ### Breaking & Default Behaviour Changes
 - **Functional `lightkurve` API (`mundey.recalibrate_tpf`, `mundey.desmear_calibrated_cutout`)**:
@@ -17,9 +17,9 @@ All notable changes to `mundey` are documented in this file.
   - Calibrated `SMEAR_ERR` with exact finite-sample unit-normal sample-median variances for `1 <= n <= 20` (`0.138326` at `n = 10` smear rows vs asymptotic `pi / 20 = 0.15708`) and gated empirical 10-row MAD variance (`emp_var > 2.5 * theo_var`) to prevent upward rectification bias on clean cadences while retaining unmodelled bleed/strap scatter.
   - Propagated the exact Sarhan & Greenberg (1956) symmetric 8-of-10 truncated-mean variance ratio (`8 * 0.105356 = 0.84285`) into 2-minute `CRMITEN=True` (`CRBLKSZ=10`) science `FLUX_ERR` and `smrow` `SMEAR_ERR` while preserving exact `N_eff = 0.8 * NUM_FRM` flux scaling.
 - **`HALOCVER = 1` FITS contract (`BKGSUB = False`, `SMEAR_ERR`, `PIXEL_QUALITY`) & HPC `/fred` guard**:
-  - Calibrated outputs preserve un-background-subtracted `FLUX` (`e-/s`), zero `FLUX_BKG` and `FLUX_BKG_ERR`, stamp `HALOCVER = 1`, `BKGSUB = False`, `BACKAPP = False`, and `SMEARMOD` (`"standard"`, `"alternate"`, or `"cutout"`) in `HDU[0]`, append column-coherent `(N_t, N_x)` `SMEAR_ERR` (`e-/s`) to `HDU[1]` (readable via `read_smear_err` / `read_smear_err_column`), and write spatial `uint16` `PIXEL_QUALITY` (`STRAP_COL`, `SAT_BLEED`, `SMEAR_UNRESOLVED`, `SOURCE_MASK`, `BKG_USED`).
-  - Standardized `resolve_cache_dir(cache_dir=None, *, strict_hpc=True, create=False)` across `mundey`, `tessbkgd`, and `halophot` with `$MUNDEY_CACHE_DIR` -> `$TESS_BRIGHT_CACHE_DIR` -> `$SCRATCH/.cache/tess_bright` -> `$XDG_CACHE_HOME/tess_bright` -> `~/.cache/tess_bright` precedence and symlink-resolved `/fred` protection enabled by default (`strict_hpc=True` raises `ValueError`; `strict_hpc=False` emits `UserWarning`).
-  - `-blf.fits` caches store integer `CADENCENO` (`TFORM2 = 'J'`), calibrated `SMEAR` and `SMEAR_ERR` in `e-/frame`, per-cadence `SMROW_SAT` saturation masks, and target-scoped `ALT_UNRES` masks.
+  - Calibrated outputs preserve un-background-subtracted `FLUX` (`e-/s`), zero `FLUX_BKG` and `FLUX_BKG_ERR`, stamp `HALOCVER = 1`, `BKGSUB = False`, `BACKAPP = False`, and `SMEARMOD` (`"standard"`, `"alternate"`, or `"cutout"`) in `HDU[0]`, append column-coherent `(N_t, N_x)` `SMEAR_ERR` (`e-/s`) to `HDU[1]` (readable from `TargetPixelFile`, `HDUList`, or FITS paths via `read_smear_err` / `read_smear_err_column`), and write spatial `uint16` `PIXEL_QUALITY` (`STRAP_COL`, `SAT_BLEED`, `SMEAR_UNRESOLVED`, `SOURCE_MASK`, `BKG_USED`).
+  - Standardized `resolve_cache_dir(cache_dir=None, *, strict_hpc=True, create=False)` across `mundey`, `tessbkgd`, and `halophot` with `$MUNDEY_CACHE_DIR` -> `$TESS_BRIGHT_CACHE_DIR` -> `$SCRATCH/.cache/tess_bright` -> `$XDG_CACHE_HOME/tess_bright` -> `~/.cache/tess_bright` precedence (including automatic rerouting when `ddir` resides under `/fred`) and symlink-resolved `/fred` protection enabled by default (`strict_hpc=True` raises `ValueError`; `strict_hpc=False` emits `UserWarning`).
+  - `-blf.fits` caches store integer `CADENCENO` (`TFORM2 = 'J'`), calibrated `SMEAR` and `SMEAR_ERR` in `e-/frame`, per-cadence `SMROW_SAT` saturation masks, and target-scoped `ALT_UNRES` masks with full `CADENCENO` coverage validation across sliced and full-sector TPFs.
 
 ### Added
 - Unified 2,048-column multi-output (`'A'`, `'B'`, `'C'`, `'D'`) TPF calibration across arbitrary 1-, 2-, 3-, and 4-output cutouts.

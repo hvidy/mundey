@@ -43,7 +43,7 @@ def infer_cadence_kind(
     hdu1_header: fits.Header | None = None,
 ) -> CadenceKind:
     """Infer whether a TPF requires 2-minute (``2min``) or 20-second (``20s``) collateral data."""
-    if isinstance(tpf_path, (str, os.PathLike)) and os.fspath(tpf_path):
+    if isinstance(tpf_path, str | os.PathLike) and os.fspath(tpf_path):
         name = Path(tpf_path).name.lower()
         if "fast-tp" in name or "fast_tp" in name or "-a_fast" in name:
             return "20s"

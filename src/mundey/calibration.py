@@ -1954,8 +1954,15 @@ def _find_valid_smrow_blf(
     ticid: int | None = None,
     cutout_bounds: tuple[int, int, int, int] | None = None,
     require_alt_unres: bool = False,
+    required_cadenceno: np.ndarray | None = None,
+    cadence_match: CadenceMatchMode = "cadenceno",
 ) -> Path | None:
     """Return the first cached ``smrow-...-blf.fits`` matching ``smear_mode`` and bounds."""
+    req_cad = (
+        np.asarray(required_cadenceno, dtype=np.int64)
+        if required_cadenceno is not None
+        else None
+    )
     for cand in find_all_cached_blf(
         sector=sector,
         camera=camera,
@@ -1976,8 +1983,39 @@ def _find_valid_smrow_blf(
                 continue
             if require_alt_unres and "ALT_UNRES" not in hdul:
                 continue
+            if req_cad is not None:
+                if "CADENCENO" not in (hdul[1].columns.names or ()):
+                    continue
+                cached_cad = np.asarray(hdul[1].data["CADENCENO"], dtype=np.int64)
+                if cadence_match == "positional":
+                    if len(cached_cad) < len(req_cad) or not np.array_equal(
+                        cached_cad[: len(req_cad)], req_cad
+                    ):
+                        continue
+                elif not np.all(np.isin(req_cad, cached_cad)):
+                    continue
             return cand
     return None
+
+
+def _alt_blf_has_more_cadences(
+    path: Path,
+    cutout_bounds: tuple[int, int, int, int],
+    n_new: int,
+) -> bool:
+    """Return True if ``path`` already holds a valid alternate cache with > ``n_new`` rows."""
+    if not path.is_file():
+        return False
+    with contextlib.suppress(OSError), fits.open(path, memmap=True) as hdul:
+        if (
+            len(hdul) >= 2
+            and "SMEAR" in (hdul[1].columns.names or ())
+            and "CADENCENO" in (hdul[1].columns.names or ())
+            and "ALT_UNRES" in hdul
+            and _smear_cache_matches_cutout(hdul[1].header, "alternate", cutout_bounds)
+        ):
+            return len(hdul[1].data["CADENCENO"]) > n_new
+    return False
 
 
 def build_sector_output_blf_caches(
@@ -2271,7 +2309,12 @@ def _recalibrate_hdulist_inplace(
         if _is_fred_path(ddir_path):
             has_env_cache = any(
                 os.environ.get(var, "").strip()
-                for var in ("MUNDEY_CACHE_DIR", "TESS_BRIGHT_CACHE_DIR", "SCRATCH")
+                for var in (
+                    "MUNDEY_CACHE_DIR",
+                    "TESS_BRIGHT_CACHE_DIR",
+                    "SCRATCH",
+                    "XDG_CACHE_HOME",
+                )
             )
             if has_env_cache:
                 resolved_cache = resolve_cache_dir(None, strict_hpc=strict_hpc, create=True)
@@ -2369,6 +2412,8 @@ def _recalibrate_hdulist_inplace(
                 ticid=ticid,
                 cutout_bounds=cutout_bounds,
                 require_alt_unres=True,
+                required_cadenceno=tpf_cad,
+                cadence_match=cadence_match,
             )
             if found_alt is not None:
                 alt_blf_by_out[out] = found_alt
@@ -2843,18 +2888,19 @@ def _recalibrate_hdulist_inplace(
                     else None
                 ),
             )
-            write_smear_blf(
-                alt_dst,
-                time=tpf_time,
-                cadenceno=tpf_cad,
-                smear=alt_sm_512,
-                smear_err=alt_err_512.astype(np.float32),
-                unresolved_cols=alt_unres_512,
-                smear_mode="alternate",
-                cutout_bounds=cutout_bounds,
-                int_time=int_time,
-                time_unit=time_unit,
-            )
+            if not _alt_blf_has_more_cadences(alt_dst, cutout_bounds, len(tpf_cad)):
+                write_smear_blf(
+                    alt_dst,
+                    time=tpf_time,
+                    cadenceno=tpf_cad,
+                    smear=alt_sm_512,
+                    smear_err=alt_err_512.astype(np.float32),
+                    unresolved_cols=alt_unres_512,
+                    smear_mode="alternate",
+                    cutout_bounds=cutout_bounds,
+                    int_time=int_time,
+                    time_unit=time_unit,
+                )
 
     # Subtract smear, divide by flat field and single-frame exposure time INT_TIME -> e-/s
     safe_flat = np.where(np.isfinite(flat_cutout) & (flat_cutout > 0.0), flat_cutout, np.nan)
@@ -2908,7 +2954,7 @@ def _clone_input_tpf(
     tpf: str | os.PathLike[str] | lk.TargetPixelFile,
 ) -> tuple[fits.HDUList, Path | None, Any]:
     """Return a deep-copied ``HDUList``, optional source path, and ``quality_bitmask``."""
-    if isinstance(tpf, (str, os.PathLike)):
+    if isinstance(tpf, str | os.PathLike):
         src_path = Path(tpf).expanduser()
         with fits.open(src_path, mode="readonly", memmap=False) as src_hdul:
             hdul = fits.HDUList([h.copy() for h in src_hdul])
@@ -2919,7 +2965,7 @@ def _clone_input_tpf(
         raw_path = getattr(tpf, "path", None)
         src_path = (
             Path(raw_path).expanduser()
-            if isinstance(raw_path, (str, os.PathLike)) and os.fspath(raw_path)
+            if isinstance(raw_path, str | os.PathLike) and os.fspath(raw_path)
             else None
         )
         qmask = getattr(tpf, "quality_bitmask", _MISSING)
