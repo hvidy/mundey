@@ -14,6 +14,7 @@ from ._contract import (
     make_atomic_tmp_path,
     read_mundey_provenance,
     read_pixel_quality,
+    read_smear_err,
     read_smear_err_column,
     resolve_cache_dir,
     write_mundey_provenance,
@@ -24,7 +25,7 @@ from .calibration import desmear_calibrated_cutout, recalibrate_tpf
 from .mundey import mundey_tpf
 
 name = "mundey"
-__version__ = "2.0.0a0"
+__version__ = "2.0.0"
 
 __all__ = [
     "HALOCVER",
@@ -46,6 +47,7 @@ __all__ = [
     "name",
     "read_mundey_provenance",
     "read_pixel_quality",
+    "read_smear_err",
     "read_smear_err_column",
     "recalibrate_tpf",
     "resolve_cache_dir",

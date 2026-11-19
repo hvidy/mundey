@@ -101,8 +101,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_pre.add_argument(
         "--strict-hpc",
-        action="store_true",
-        help="Raise ValueError if --cache-dir resolves under /fred.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Raise ValueError if --cache-dir resolves under /fred (default: True).",
     )
     p_pre.add_argument("-v", "--verbose", action="store_true", help="Print progress.")
 
@@ -141,8 +142,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_cal.add_argument("--offline", action="store_true", help="Forbid network access.")
     p_cal.add_argument(
         "--strict-hpc",
-        action="store_true",
-        help="Raise ValueError if --cache-dir resolves under /fred.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Raise ValueError if --cache-dir resolves under /fred (default: True).",
     )
     p_cal.add_argument("--overwrite", action="store_true", help="Overwrite existing output.")
     p_cal.add_argument("-v", "--verbose", action="store_true", help="Print progress.")

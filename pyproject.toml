@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mundey"
-version = "2.0.0a0"
+version = "2.0.0"
 description = "Recalibration of TESS target pixel files for saturated bright stars."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -79,6 +79,7 @@ exclude = [
 target-version = "py311"
 line-length = 100
 src = ["src", "tests"]
+extend-exclude = ["notebooks"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

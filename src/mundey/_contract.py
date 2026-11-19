@@ -13,6 +13,7 @@ import os
 import shutil
 import socket
 import uuid
+import warnings
 from collections.abc import Iterator
 from enum import IntFlag
 from pathlib import Path
@@ -48,6 +49,18 @@ def _unwrap_hdulist(target: fits.HDUList | Any) -> fits.HDUList:
     )
 
 
+@contextlib.contextmanager
+def _open_hdulist(
+    target: str | os.PathLike[str] | fits.HDUList | Any,
+) -> Iterator[fits.HDUList]:
+    """Yield an ``HDUList`` from a FITS path, ``HDUList``, or ``TargetPixelFile``."""
+    if isinstance(target, str | os.PathLike):
+        with fits.open(Path(target).expanduser(), mode="readonly", memmap=False) as hdul:
+            yield hdul
+        return
+    yield _unwrap_hdulist(target)
+
+
 def _infer_cutout_shape(hdul: fits.HDUList) -> tuple[int, int, int] | None:
     """Infer ``(n_raw, ny, nx)`` from HDU 1 ``PIXELS`` table columns if present."""
     if len(hdul) < 2 or getattr(hdul[1], "data", None) is None:
@@ -67,6 +80,7 @@ def write_mundey_provenance(
     *,
     bkgsub: bool = False,
     halocver: int = HALOCVER,
+    smear_mode: str | None = None,
 ) -> fits.HDUList:
     """Write ``HALOCVER`` and ``BKGSUB`` provenance cards to ``hdu[0]`` and ``hdu[1]``.
 
@@ -75,6 +89,7 @@ def write_mundey_provenance(
     instances without mutating the read-only ``MappingProxyType``. When SPOC's
     standard ``BACKAPP`` card is present, it is synchronized to ``bool(bkgsub)``
     so FITS consumers never observe contradictory background-subtraction flags.
+    When ``smear_mode`` is provided, ``SMEARMOD`` is also stamped in ``hdu[0].header``.
     """
     hdul = _unwrap_hdulist(target)
     if len(hdul) < 2:
@@ -93,6 +108,11 @@ def write_mundey_provenance(
         )
         if "BACKAPP" in hdr:
             hdr["BACKAPP"] = bkgsub_bool
+    if smear_mode is not None:
+        hdul[0].header["SMEARMOD"] = (
+            str(smear_mode),
+            "Mundey smear estimation mode",
+        )
     meta = getattr(target, "meta", None)
     meta_dict = getattr(meta, "_dict", None)
     if isinstance(meta_dict, dict):
@@ -100,46 +120,50 @@ def write_mundey_provenance(
         meta_dict["BKGSUB"] = bkgsub_bool
         if "BACKAPP" in meta_dict:
             meta_dict["BACKAPP"] = bkgsub_bool
+        if smear_mode is not None:
+            meta_dict["SMEARMOD"] = str(smear_mode)
     return hdul
 
 
-def read_mundey_provenance(target: fits.HDUList | Any) -> dict[str, int | bool | None]:
+def read_mundey_provenance(
+    target: str | os.PathLike[str] | fits.HDUList | Any,
+) -> dict[str, int | bool | None]:
     """Read and validate ``HALOCVER`` and ``BKGSUB`` across ``hdu[0]`` and ``hdu[1]``."""
-    hdul = _unwrap_hdulist(target)
-    halocver: int | None = None
-    bkgsub: bool | None = None
-    for idx in range(min(2, len(hdul))):
-        hdr = hdul[idx].header
-        if "HALOCVER" in hdr:
-            raw_ver = hdr["HALOCVER"]
-            if not isinstance(raw_ver, (int, np.integer)) or isinstance(
-                raw_ver, (bool, np.bool_)
-            ):
-                raise ValueError(
-                    f"Invalid HALOCVER header value in HDU[{idx}] (expected int): {raw_ver!r}."
-                )
-            ver_int = int(raw_ver)
-            if halocver is None:
-                halocver = ver_int
-            elif halocver != ver_int:
-                raise ValueError(
-                    f"Conflicting HALOCVER values between HDU[0] ({halocver}) "
-                    f"and HDU[{idx}] ({ver_int})."
-                )
-        if "BKGSUB" in hdr:
-            raw_bkg = hdr["BKGSUB"]
-            if not isinstance(raw_bkg, (bool, np.bool_)):
-                raise ValueError(
-                    f"Invalid BKGSUB header value in HDU[{idx}] (expected bool): {raw_bkg!r}."
-                )
-            bkg_bool = bool(raw_bkg)
-            if bkgsub is None:
-                bkgsub = bkg_bool
-            elif bkgsub != bkg_bool:
-                raise ValueError(
-                    f"Conflicting BKGSUB values between HDU[0] ({bkgsub}) "
-                    f"and HDU[{idx}] ({bkg_bool})."
-                )
+    with _open_hdulist(target) as hdul:
+        halocver: int | None = None
+        bkgsub: bool | None = None
+        for idx in range(min(2, len(hdul))):
+            hdr = hdul[idx].header
+            if "HALOCVER" in hdr:
+                raw_ver = hdr["HALOCVER"]
+                if not isinstance(raw_ver, int | np.integer) or isinstance(
+                    raw_ver, bool | np.bool_
+                ):
+                    raise ValueError(
+                        f"Invalid HALOCVER header value in HDU[{idx}] (expected int): {raw_ver!r}."
+                    )
+                ver_int = int(raw_ver)
+                if halocver is None:
+                    halocver = ver_int
+                elif halocver != ver_int:
+                    raise ValueError(
+                        f"Conflicting HALOCVER values between HDU[0] ({halocver}) "
+                        f"and HDU[{idx}] ({ver_int})."
+                    )
+            if "BKGSUB" in hdr:
+                raw_bkg = hdr["BKGSUB"]
+                if not isinstance(raw_bkg, bool | np.bool_):
+                    raise ValueError(
+                        f"Invalid BKGSUB header value in HDU[{idx}] (expected bool): {raw_bkg!r}."
+                    )
+                bkg_bool = bool(raw_bkg)
+                if bkgsub is None:
+                    bkgsub = bkg_bool
+                elif bkgsub != bkg_bool:
+                    raise ValueError(
+                        f"Conflicting BKGSUB values between HDU[0] ({bkgsub}) "
+                        f"and HDU[{idx}] ({bkg_bool})."
+                    )
     return {"halocver": halocver, "bkgsub": bkgsub}
 
 
@@ -183,12 +207,12 @@ def write_pixel_quality(
     return hdul
 
 
-def read_pixel_quality(target: fits.HDUList | Any) -> np.ndarray:
+def read_pixel_quality(target: str | os.PathLike[str] | fits.HDUList | Any) -> np.ndarray:
     """Read the ``PIXEL_QUALITY`` spatial bitmask as a ``uint16`` ``(ny, nx)`` array."""
-    hdul = _unwrap_hdulist(target)
-    if PIXEL_QUALITY_EXTNAME not in hdul:
-        raise KeyError(f"Extension {PIXEL_QUALITY_EXTNAME!r} not found in HDUList.")
-    return np.asarray(hdul[PIXEL_QUALITY_EXTNAME].data, dtype=np.uint16)
+    with _open_hdulist(target) as hdul:
+        if PIXEL_QUALITY_EXTNAME not in hdul:
+            raise KeyError(f"Extension {PIXEL_QUALITY_EXTNAME!r} not found in HDUList.")
+        return np.array(hdul[PIXEL_QUALITY_EXTNAME].data, dtype=np.uint16, copy=True)
 
 
 def _strip_smear_units(smear_err: Any) -> np.ndarray:
@@ -265,24 +289,37 @@ def append_smear_err_column(
 
 
 def read_smear_err_column(
-    target: fits.HDUList | Any,
+    target: str | os.PathLike[str] | fits.HDUList | Any,
     *,
     quality_masked: bool = True,
+    apply_quality_mask: bool | None = None,
 ) -> np.ndarray:
     """Read ``SMEAR_ERR`` as ``float32`` ``(N, nx)``, optionally applying ``quality_mask``."""
-    hdul = _unwrap_hdulist(target)
-    if len(hdul) < 2 or hdul[1].data is None:
-        raise KeyError("HDU[1] PIXELS table is missing or empty.")
-    names = hdul[1].data.names or ()
-    if SMEAR_ERR_COLNAME not in names:
-        raise KeyError(f"Column {SMEAR_ERR_COLNAME!r} not found in HDU[1].")
+    if apply_quality_mask is not None:
+        quality_masked = bool(apply_quality_mask)
+    with _open_hdulist(target) as hdul:
+        if len(hdul) < 2 or hdul[1].data is None:
+            raise KeyError("HDU[1] PIXELS table is missing or empty.")
+        names = hdul[1].data.names or ()
+        if SMEAR_ERR_COLNAME not in names:
+            raise KeyError(f"Column {SMEAR_ERR_COLNAME!r} not found in HDU[1].")
 
-    raw = np.asarray(hdul[1].data[SMEAR_ERR_COLNAME], dtype=np.float32)
+        raw = np.array(hdul[1].data[SMEAR_ERR_COLNAME], dtype=np.float32, copy=True)
     if raw.ndim == 1:
         raw = raw[:, np.newaxis]
-    if quality_masked and hasattr(target, "quality_mask"):
-        return np.asarray(raw[target.quality_mask], dtype=np.float32)
+    qmask = getattr(target, "quality_mask", None)
+    if quality_masked and qmask is not None:
+        mask_arr = np.asarray(qmask, dtype=bool)
+        if mask_arr.shape != (raw.shape[0],):
+            raise ValueError(
+                f"TargetPixelFile quality_mask shape {mask_arr.shape} does not "
+                f"match HDU[1] row count ({raw.shape[0]},)."
+            )
+        return np.asarray(raw[mask_arr], dtype=np.float32)
     return raw
+
+
+read_smear_err = read_smear_err_column
 
 
 def _is_fred_path(path: Path) -> bool:
@@ -293,27 +330,32 @@ def _is_fred_path(path: Path) -> bool:
 
 
 def resolve_cache_dir(
-    cache_dir: str | os.PathLike[str] | None = None,
+    cache_dir: str | Path | None = None,
     *,
-    strict_hpc: bool = False,
+    strict_hpc: bool = True,
     create: bool = False,
 ) -> Path:
     """Resolve the ``mundey`` cache directory, guarding against ``/fred`` on HPC.
 
     Default resolution order when ``cache_dir`` is ``None``:
     1. ``$MUNDEY_CACHE_DIR`` if set and non-empty.
-    2. ``$SCRATCH/.cache/tess_bright`` when ``$SCRATCH`` is set and non-empty.
-    3. ``$XDG_CACHE_HOME/tess_bright`` when ``$XDG_CACHE_HOME`` is set and non-empty.
-    4. ``~/.cache/tess_bright`` otherwise.
+    2. ``$TESS_BRIGHT_CACHE_DIR`` if set and non-empty.
+    3. ``$SCRATCH/.cache/tess_bright`` when ``$SCRATCH`` is set and non-empty.
+    4. ``$XDG_CACHE_HOME/tess_bright`` when ``$XDG_CACHE_HOME`` is set and non-empty.
+    5. ``~/.cache/tess_bright`` otherwise.
 
-    When ``strict_hpc=True``, paths pointing under ``/fred`` (either directly or
-    via symlinks) raise ``ValueError`` to protect Swinburne NT / OzSTAR project
-    inode quotas.
+    Symlinks are resolved via ``expanduser().resolve(strict=False)`` before testing
+    whether the target resides under ``/fred``. When under ``/fred``:
+    - ``strict_hpc=True`` (default) raises :class:`ValueError` to protect Swinburne
+      NT / OzSTAR shared project inode quotas;
+    - ``strict_hpc=False`` emits a :class:`UserWarning` and proceeds.
     """
     if cache_dir is not None:
         candidate = Path(cache_dir).expanduser()
     elif os.environ.get("MUNDEY_CACHE_DIR", "").strip():
         candidate = Path(os.environ["MUNDEY_CACHE_DIR"].strip()).expanduser()
+    elif os.environ.get("TESS_BRIGHT_CACHE_DIR", "").strip():
+        candidate = Path(os.environ["TESS_BRIGHT_CACHE_DIR"].strip()).expanduser()
     elif os.environ.get("SCRATCH", "").strip():
         candidate = Path(os.environ["SCRATCH"].strip()).expanduser() / ".cache" / "tess_bright"
     elif os.environ.get("XDG_CACHE_HOME", "").strip():
@@ -321,15 +363,20 @@ def resolve_cache_dir(
     else:
         candidate = Path.home() / ".cache" / "tess_bright"
 
-    if strict_hpc and _is_fred_path(candidate):
-        raise ValueError(
-            f"Refusing cache directory {candidate!s} under /fred in strict_hpc=True mode "
-            "(violates Swinburne NT/OzSTAR shared inode quota); use $SCRATCH/.cache/tess_bright."
+    resolved = candidate.resolve(strict=False)
+    if _is_fred_path(candidate) or resolved.parts[:2] == ("/", "fred"):
+        msg = (
+            f"Refusing cache directory {resolved!s} under /fred "
+            "(violates Swinburne NT/OzSTAR shared inode quota); "
+            "use $SCRATCH/.cache/tess_bright instead."
         )
+        if strict_hpc:
+            raise ValueError(msg)
+        warnings.warn(msg, UserWarning, stacklevel=2)
 
     if create:
-        candidate.mkdir(parents=True, exist_ok=True)
-    return candidate
+        resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
 
 
 def make_atomic_tmp_path(dst: str | os.PathLike[str]) -> Path:
