@@ -449,6 +449,27 @@ def _stamp_ccd_origin_1based(
     return col0, row0
 
 
+def _sync_stamp_ccd_origin(
+    hdr1: fits.Header | None,
+    hdr2: fits.Header | None,
+    col0_1based: int,
+    row0_1based: int,
+) -> None:
+    """Synchronize all ``1CRV{k}P``/``2CRV{k}P`` cards in ``hdr1`` and ``CRVAL1P``/``2P``."""
+    col_i = int(col0_1based)
+    row_i = int(row0_1based)
+    if hdr1 is not None:
+        for key in list(hdr1.keys()):
+            if len(key) >= 6 and key.endswith("P") and key[1:4] == "CRV" and key[4:-1].isdigit():
+                if key[0] == "1" and hdr1[key] != col_i:
+                    hdr1[key] = col_i
+                elif key[0] == "2" and hdr1[key] != row_i:
+                    hdr1[key] = row_i
+    if hdr2 is not None:
+        hdr2["CRVAL1P"] = col_i
+        hdr2["CRVAL2P"] = row_i
+
+
 def _source_mask_digest(source_mask_2d: np.ndarray | None) -> str:
     """Return a deterministic 16-hex-char SHA-256 digest of ``source_mask_2d``, or ``'NONE'``."""
     if source_mask_2d is None:
@@ -1304,6 +1325,7 @@ def _detect_bloom_columns(
     clean_rows_2d: np.ndarray,
     *,
     fwer_alpha: float = 1.0e-4,
+    coherent_spatial_err: float = 0.0,
 ) -> np.ndarray:
     """Detect columns whose clean rows are driven negative by upper-register smear bloom.
 
@@ -1311,9 +1333,14 @@ def _detect_bloom_columns(
     the actual number of clean rows ``n_r`` (for inverse-variance time-integrated
     row z-scores) and finite ``(t, r)`` pixels (for transient single-cadence bloom),
     avoiding Gaussian minimum order-statistic false positives on tall cutouts.
+    Any ``coherent_spatial_err`` (time-persistent spatial sky-model residual scale)
+    is added in quadrature after temporal averaging so systematic spatial misfit
+    never inflates as ``sqrt(N_t)``.
     """
     _, _, nx = sub_cube.shape
     col_has_bloom = np.zeros(nx, dtype=bool)
+    coh_err = max(float(coherent_spatial_err), 0.0)
+    coh_var = coh_err * coh_err
 
     for c in range(nx):
         r_mask = clean_rows_2d[:, c]
@@ -1338,7 +1365,9 @@ def _detect_bloom_columns(
                 np.where(valid[:, valid_r], w[:, valid_r] * sub[:, valid_r], 0.0),
                 axis=0,
             )
-            z_row = num / np.sqrt(w_sum[valid_r])
+            mean_r = num / w_sum[valid_r]
+            se_r = np.sqrt(1.0 / w_sum[valid_r] + coh_var)
+            z_row = mean_r / se_r
             p_row = min(max(0.5 * fwer_alpha / float(n_r_tests), 1.0e-300), 0.49)
             crit_row = -float(ndtri(p_row))
             if float(np.min(z_row)) < -crit_row:
@@ -1349,65 +1378,153 @@ def _detect_bloom_columns(
         n_pix_tests = int(np.sum(valid))
         p_pix = min(max(0.5 * fwer_alpha / float(max(n_pix_tests, 1)), 1.0e-300), 0.49)
         crit_pix = -float(ndtri(p_pix))
-        z_pix = sub[valid] / sig_safe[valid]
+        sig_pix = np.hypot(sig_safe[valid], coh_err) if coh_err > 0.0 else sig_safe[valid]
+        z_pix = sub[valid] / sig_pix
         if float(np.min(z_pix)) < -crit_pix:
             col_has_bloom[c] = True
 
     return col_has_bloom
 
 
+def _fit_upper_column_floor_line(
+    x_1d: np.ndarray,
+    col_floors: np.ndarray,
+) -> np.ndarray:
+    """Fit a robust linear trend across the upper-envelope column floors ``(m, nx)``."""
+    m, nx = col_floors.shape
+    pred_x = np.zeros((m, nx), dtype=np.float64)
+    for t in range(m):
+        cf = col_floors[t]
+        fin = np.isfinite(cf)
+        n_fin = int(np.sum(fin))
+        if n_fin == 0:
+            continue
+        idx_fin = np.flatnonzero(fin)
+        vals_fin = cf[idx_fin]
+        if n_fin == 1:
+            pred_x[t] = max(float(vals_fin[0]), 0.0)
+            continue
+        # Select top ~45% of columns by floor so even >50% positive-sky bloom trenches
+        # are excluded while tilted clean skies extrapolate linearly across all columns.
+        k = min(n_fin, max(3, int(np.ceil(0.45 * n_fin))))
+        top_order = np.argsort(vals_fin)[-k:]
+        xs = x_1d[idx_fin[top_order]]
+        ys = vals_fin[top_order]
+        # Pairwise Theil-Sen median slope resists a single star-filled column in the top set
+        slopes = []
+        for i in range(k):
+            for j in range(i + 1, k):
+                dx = float(xs[j] - xs[i])
+                if abs(dx) > 1e-12:
+                    slopes.append(float(ys[j] - ys[i]) / dx)
+        slope = float(np.median(slopes)) if slopes else 0.0
+        intercept = float(np.median(ys - slope * xs))
+        pred_x[t] = np.maximum(intercept + slope * x_1d, 0.0)
+    return pred_x
+
+
 def _estimate_cutout_sky_plane(
     u_in: np.ndarray,
     sigma_in: np.ndarray,
     clean_rows_2d: np.ndarray,
-) -> np.ndarray:
-    """Estimate a robust non-negative 2D linear sky baseline ``(N_t, ny, nx)``."""
+) -> tuple[np.ndarray, float]:
+    """Estimate a non-negative 2D sky baseline ``(N_t, ny, nx)`` and coherent spatial error.
+
+    Initializes from the upper envelope of per-column clean-row floors (so ``>= 50%``
+    multi-column positive-sky bloom trenches never capture the initial median), fits
+    a 2nd-order 2D polynomial ``[1, x, y, x^2, xy, y^2]`` (falling back to 1st-order
+    when spatial support is narrow), and returns the empirical coherent spatial
+    residual scale across time-averaged sky inliers.
+    """
     n_t, ny, nx = u_in.shape
     npix = ny * nx
-    if npix == 0 or n_t == 0:
-        return np.zeros_like(u_in, dtype=np.float64)
+    if npix == 0 or n_t == 0 or not np.any(clean_rows_2d):
+        return np.zeros_like(u_in, dtype=np.float64), 0.0
 
     x_1d = np.linspace(-1.0, 1.0, nx, dtype=np.float64) if nx > 1 else np.zeros(1, dtype=np.float64)
     y_1d = np.linspace(-1.0, 1.0, ny, dtype=np.float64) if ny > 1 else np.zeros(1, dtype=np.float64)
     yy, xx = np.meshgrid(y_1d, x_1d, indexing="ij")
-    design = np.column_stack([np.ones(npix, dtype=np.float64), xx.ravel(), yy.ravel()])
+    xr, yr = xx.ravel(), yy.ravel()
+
+    use_quad = (nx >= 4) and (ny >= 4)
+    design_lin = np.column_stack([np.ones(npix, dtype=np.float64), xr, yr])
+    design_quad = np.column_stack(
+        [np.ones(npix, dtype=np.float64), xr, yr, xr * xr, xr * yr, yr * yr]
+    )
+    ridge_lin = np.diag([1e-12, 1e-6, 1e-6])
+    ridge_quad = np.diag([1e-12, 1e-6, 1e-6, 1e-5, 1e-5, 1e-5])
     clean_flat = clean_rows_2d.ravel()
-    ridge = np.diag([1e-12, 1e-6, 1e-6])
 
     out = np.zeros((n_t, npix), dtype=np.float64)
+    inlier_count = np.zeros(npix, dtype=np.int64)
     step = 256
     for t0 in range(0, n_t, step):
         t1 = min(t0 + step, n_t)
         m = t1 - t0
-        u_flat = u_in[t0:t1].reshape(m, npix)
+        u_chunk = u_in[t0:t1]
+        u_flat = u_chunk.reshape(m, npix)
         sig_c = sigma_in[t0:t1]
         sig_flat = np.maximum(np.where(np.isfinite(sig_c), sig_c, 1.0), 1e-6).reshape(m, npix)
         valid = clean_flat[None, :] & np.isfinite(u_flat)
         u_safe = np.where(valid, u_flat, 0.0)
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            init_med = np.nanmedian(np.where(valid, u_flat, np.nan), axis=1)
-        has_valid = np.any(valid, axis=1) & np.isfinite(init_med)
-        pred = np.broadcast_to(
-            np.where(has_valid, np.maximum(init_med, 0.0), 0.0)[:, None],
-            (m, npix),
-        ).copy()
-
-        for it in range(5):
-            res = u_safe - pred
+        # Compute per-column clean-row 15th-percentile floor & within-column vertical MAD
+        col_floors = np.full((m, nx), np.nan, dtype=np.float64)
+        vert_mads = np.full((m, nx), np.nan, dtype=np.float64)
+        for c in range(nx):
+            r_ok = clean_rows_2d[:, c]
+            if not np.any(r_ok):
+                continue
+            uc = u_chunk[:, r_ok, c]
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
-                mad = 1.4826 * np.nanmedian(np.where(valid, np.abs(res), np.nan), axis=1)
-            mad = np.where(np.isfinite(mad), mad, 0.0)
-            scale_ref = mad[:, None] if it < 2 else np.minimum(mad[:, None], 3.0 * sig_flat)
-            scale = np.maximum(np.maximum(sig_flat, scale_ref), 1e-6)
+                p15 = np.nanpercentile(uc, 15.0, axis=1)
+                p30 = np.nanpercentile(uc, 30.0, axis=1)
+                low_m = np.isfinite(uc) & (uc <= p30[:, None])
+                low_med = np.nanmedian(np.where(low_m, uc, np.nan), axis=1)
+                vmad = 1.4826 * np.nanmedian(
+                    np.where(low_m, np.abs(uc - low_med[:, None]), np.nan), axis=1
+                )
+            col_floors[:, c] = p15
+            vert_mads[:, c] = vmad
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            cad_vert_mad = np.nanmedian(vert_mads, axis=1)
+        cad_vert_mad = np.where(np.isfinite(cad_vert_mad), cad_vert_mad, 0.0)
+
+        pred_x = _fit_upper_column_floor_line(x_1d, col_floors)  # (m, nx)
+        has_valid = np.any(valid, axis=1) & np.any(np.isfinite(col_floors), axis=1)
+        pred = np.broadcast_to(pred_x[:, None, :], (m, ny, nx)).reshape(m, npix).copy()
+
+        final_w_rob = np.zeros((m, npix), dtype=np.float64)
+        for it in range(5):
+            res = u_safe - pred
+            if it == 0:
+                scale = np.maximum(np.maximum(sig_flat, cad_vert_mad[:, None]), 1e-6)
+            else:
+                # Robust residual scale on non-bloomed pixels (res >= -3 * sig)
+                sky_cand = valid & (res >= -4.0 * sig_flat)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    mad = 1.4826 * np.nanmedian(np.where(sky_cand, np.abs(res), np.nan), axis=1)
+                mad = np.where(np.isfinite(mad), mad, 0.0)
+                mad_cap = np.minimum(mad[:, None], 3.0 * sig_flat)
+                scale = np.maximum(np.maximum(sig_flat, mad_cap), 1e-6)
+
             z = res / scale
-            w_pos = np.where(z <= 2.0, 1.0, np.where(z <= 3.0, 2.0 / np.maximum(z, 1e-6), 0.0))
+            # Soft Huber on positive side initially so curved sky stays weighted, then reject PSF
+            if it < 2:
+                w_pos = np.where(z <= 2.5, 1.0, 2.5 / np.maximum(z, 1e-6))
+            else:
+                w_pos = np.where(
+                    z <= 2.0, 1.0, np.where(z <= 3.5, 2.0 / np.maximum(z, 1e-6), 0.0)
+                )
             w_neg = np.where(
                 z >= -2.0, 1.0, np.where(z >= -4.0, 2.0 / np.maximum(-z, 1e-6), 0.0)
             )
             w_rob = np.where(z >= 0.0, w_pos, w_neg)
+            final_w_rob = w_rob
             w = np.where(valid, w_rob / (sig_flat * sig_flat), 0.0)
 
             too_few = has_valid & (np.sum(w, axis=1) <= 0.0)
@@ -1418,15 +1535,45 @@ def _estimate_cutout_sky_plane(
                     0.0,
                 )
 
-            atw = design.T[None, :, :] * w[:, None, :]
-            ata = np.einsum("tip,pj->tij", atw, design) + ridge[None, :, :]
+            # Use 2nd-order polynomial only when >= 4 distinct columns carry inlier weight
+            inlier_cols = np.any((w > 0.0).reshape(m, ny, nx), axis=1)  # (m, nx)
+            n_inlier_cols = (
+                int(np.min(np.sum(inlier_cols[has_valid], axis=1)))
+                if np.any(has_valid)
+                else 0
+            )
+            if use_quad and n_inlier_cols >= 4:
+                des = design_quad
+                rdg = ridge_quad
+            else:
+                des = design_lin
+                rdg = ridge_lin
+
+            atw = des.T[None, :, :] * w[:, None, :]
+            ata = np.einsum("tip,pj->tij", atw, des) + rdg[None, :, :]
             atu = np.einsum("tip,tp->ti", atw, u_safe)
             beta = np.linalg.solve(ata, atu[..., None])[..., 0]
-            pred = np.where(has_valid[:, None], beta @ design.T, 0.0)
+            pred = np.where(has_valid[:, None], beta @ des.T, 0.0)
 
         out[t0:t1] = np.maximum(pred, 0.0)
+        inlier_count += np.sum(valid & (final_w_rob > 0.5), axis=0)
 
-    return out.reshape(n_t, ny, nx)
+    sky_cube = out.reshape(n_t, ny, nx)
+
+    # Empirical coherent spatial residual scale across time-averaged sky inliers
+    inlier_2d = (inlier_count.reshape(ny, nx) >= max(1, n_t // 2)) & clean_rows_2d
+    coherent_spatial_err = 0.0
+    if int(np.sum(inlier_2d)) >= 6:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            res_mean_2d = np.nanmean(u_in - sky_cube, axis=0)
+            vals = res_mean_2d[inlier_2d]
+            vals = vals[np.isfinite(vals)]
+            if vals.size >= 6:
+                med_v = float(np.median(vals))
+                coherent_spatial_err = float(1.4826 * np.median(np.abs(vals - med_v)))
+
+    return sky_cube, coherent_spatial_err
 
 
 def _estimate_alternate_smear_stamp(
@@ -1496,12 +1643,18 @@ def _estimate_alternate_smear_stamp(
         bloom_src = bloom_detect_cube if bloom_detect_cube is not None else sci_pre_smear
         col_has_bloom = _detect_bloom_columns(bloom_src, sci_sigma_pre, clean_rows_2d)
         if nx >= 3 and not np.all(col_has_bloom):
-            sky_base = _estimate_cutout_sky_plane(sci_pre_smear, sci_sigma_pre, clean_rows_2d)
-            if np.any(sky_base > 0.0):
-                sig_sky = np.hypot(sci_sigma_pre, 0.005 * sky_base)
-                col_has_bloom |= _detect_bloom_columns(
-                    sci_pre_smear - sky_base, sig_sky, clean_rows_2d
+            sky_clean_2d = clean_rows_2d & (~col_has_bloom)[None, :]
+            if np.any(sky_clean_2d):
+                sky_base, coh_spatial_err = _estimate_cutout_sky_plane(
+                    sci_pre_smear, sci_sigma_pre, sky_clean_2d
                 )
+                if np.any(sky_base > 0.0):
+                    col_has_bloom |= _detect_bloom_columns(
+                        sci_pre_smear - sky_base,
+                        sci_sigma_pre,
+                        clean_rows_2d,
+                        coherent_spatial_err=coh_spatial_err,
+                    )
 
     c_bleed_mask = col_has_sci_sat | col_has_sm_sat | col_has_bloom  # (nx,)
 
@@ -1610,61 +1763,59 @@ def _estimate_alternate_smear_stamp(
 
         edge_cols = np.flatnonzero(edge_candidates)
         if edge_cols.size > 0:
-            n_below = max(int(row0_1based) - 1, 0)
-            n_above = max(2048 - (int(row0_1based) - 1 + ny), 0)
-            n_edge_r = min(3, ny)
+            # Measure floor on bloom_detect_cube (pre-restore flux_in) when FLUX_BKG was
+            # restored so Delta_M_bloom is estimated invariantly of positive sky B_bkg.
+            floor_src = bloom_detect_cube if bloom_detect_cube is not None else sci_pre_smear
+            z_q10 = -float(ndtri(0.10))  # 1.28155 Gaussian 10th-percentile offset
             for c in edge_cols:
                 r_ok = clean_rows_2d[:, c]
-                u_c_all = sci_pre_smear[:, :, c] / safe_flat[None, :, c]
+                u_c_all = floor_src[:, :, c] / safe_flat[None, :, c]
                 u_c_clean = u_c_all[:, r_ok]
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", RuntimeWarning)
-                    p20 = np.nanpercentile(u_c_clean, 20.0, axis=1)
-                    dim_mask = np.isfinite(u_c_clean) & (u_c_clean <= p20[:, None])
-                    col_floor = np.nanmedian(np.where(dim_mask, u_c_clean, np.nan), axis=1)
-                    dim_mad = 1.4826 * np.nanmedian(
-                        np.where(dim_mask, np.abs(u_c_clean - col_floor[:, None]), np.nan),
-                        axis=1,
-                    )
-                n_dim = np.maximum(np.sum(dim_mask, axis=1), 1)
-                floor_est = np.where(np.isfinite(col_floor), np.minimum(col_floor, 0.0), 0.0)
-
                 sig_u_c = np.where(
                     np.isfinite(sci_sigma_pre[:, :, c]),
                     sci_sigma_pre[:, :, c] / safe_flat[None, :, c],
                     0.0,
                 )
                 sig_dim = sig_u_c[:, r_ok]
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    p20 = np.nanpercentile(u_c_clean, 20.0, axis=1)
+                    p25 = np.nanpercentile(u_c_clean, 25.0, axis=1)
+                    p10 = np.nanpercentile(u_c_clean, 10.0, axis=1)
+                    dim_mask = np.isfinite(u_c_clean) & (u_c_clean <= p20[:, None])
+                    col_floor = np.nanmedian(np.where(dim_mask, u_c_clean, np.nan), axis=1)
+                    sig_dim_med = np.nanmedian(np.where(dim_mask, sig_dim, np.nan), axis=1)
+                sig_dim_med = np.where(np.isfinite(sig_dim_med), sig_dim_med, 0.0)
+                n_dim = np.maximum(np.sum(dim_mask, axis=1), 1)
+
+                # Debias pure-noise 10th-percentile downward shift while preserving bloom <= 0
+                col_floor_debiased = col_floor + z_q10 * sig_dim_med
+                floor_est = np.where(
+                    np.isfinite(col_floor_debiased),
+                    np.minimum(col_floor_debiased, 0.0),
+                    0.0,
+                )
+
+                med_var_dim = float(_unit_normal_median_variance(int(np.median(n_dim))))
                 theo_floor_var = (
-                    float(_unit_normal_median_variance(int(np.median(n_dim))))
+                    med_var_dim
                     * np.sum(np.where(dim_mask, sig_dim * sig_dim, 0.0), axis=1)
                     / n_dim
                 )
-                emp_floor_var = np.where(
-                    np.isfinite(dim_mad),
-                    float(_unit_normal_median_variance(int(np.median(n_dim))))
-                    * (dim_mad * dim_mad),
+                # Unit-sensitivity edge-halo pedestal uncertainty: local vertical rise across
+                # the dimmest quartile (p25 - p10) plus order-statistic zero-point uncertainty.
+                sigma_ped = np.where(
+                    np.isfinite(p25) & np.isfinite(p10),
+                    np.maximum(p25 - p10, 0.0),
                     0.0,
                 )
-                var_floor = np.maximum(theo_floor_var, emp_floor_var)
-
-                star_ex = np.where(
-                    np.isfinite(u_c_all),
-                    np.maximum(u_c_all - floor_est[:, None], 0.0),
-                    0.0,
-                )
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", RuntimeWarning)
-                    edge_below = np.nanmedian(star_ex[:, :n_edge_r], axis=1)
-                    edge_above = np.nanmedian(star_ex[:, ny - n_edge_r :], axis=1)
-                edge_below = np.where(np.isfinite(edge_below), edge_below, 0.0)
-                edge_above = np.where(np.isfinite(edge_above), edge_above, 0.0)
-                sigma_out = float(row_smear_weight) * (
-                    float(n_below) * edge_below + float(n_above) * edge_above
-                )
-
                 m_hat[:, c] = floor_est
-                m_err[:, c] = np.sqrt(np.maximum(var_floor + sigma_out * sigma_out, 1e-12))
+                m_err[:, c] = np.sqrt(
+                    np.maximum(
+                        theo_floor_var + sig_dim_med * sig_dim_med + sigma_ped * sigma_ped,
+                        1e-12,
+                    )
+                )
                 c_bleed_mask[c] = False
 
     if not np.any(c_bleed_mask):
@@ -2160,6 +2311,9 @@ def _calibrate_smrow_raw_to_standard_blf(
         smear_sat_all[t0:t1] = np.where(chunk_matched[:, None], sm_sat_2d, False)
 
     time_unit = str(sm_hdr1.get("TUNIT1", "BJD - 2457000, days"))
+    tv_all_matched = bool(
+        np.all(matched_tv) and np.array_equal(tv_idx, np.arange(len(sm_cad), dtype=np.int64))
+    )
     return write_smear_blf(
         blf_dst,
         time=sm_time,
@@ -2170,6 +2324,7 @@ def _calibrate_smrow_raw_to_standard_blf(
         smear_mode="standard",
         cadence_match=cadence_match,
         source_mask_digest="NONE",
+        tv_all_matched=tv_all_matched,
         int_time=int_time,
         time_unit=time_unit,
         stage_dir=stage_dir,
@@ -2470,8 +2625,10 @@ def _smear_cache_matches_cutout(
     """Verify a cached smear ``-blf.fits`` matches mode, cutout bounds, and provenance."""
     if "SMEARMOD" in hdr and str(hdr["SMEARMOD"]).strip() != smear_mode:
         return False
-    if str(hdr.get("CADMATCH", "")).strip() != str(cadence_match):
-        return False
+    cad_matches = str(hdr.get("CADMATCH", "")).strip() == str(cadence_match)
+    if not cad_matches:
+        if not (smear_mode == "standard" and hdr.get("TVMATCH") is True):
+            return False
     if str(hdr.get("SRCMASK", "")).strip() != str(source_mask_digest):
         return False
     if smear_mode == "standard":
@@ -2570,10 +2727,7 @@ def _recalibrate_hdulist_inplace(
     x1_ccd0 = col0_1based - 1
     y1_ccd0 = row0_1based - 1
     cutout_bounds = (col0_1based, nx, row0_1based, ny)
-    if "CRVAL1P" in hdr2 and int(hdr2["CRVAL1P"]) != col0_1based:
-        hdr2["CRVAL1P"] = col0_1based
-    if "CRVAL2P" in hdr2 and int(hdr2["CRVAL2P"]) != row0_1based:
-        hdr2["CRVAL2P"] = row0_1based
+    _sync_stamp_ccd_origin(hdr1, hdr2, col0_1based, row0_1based)
 
     cols_1based = np.arange(col0_1based, col0_1based + nx, dtype=np.int64)
     col_outputs = tuple(output_for_rawx_col(int(c)) for c in cols_1based)
@@ -2635,9 +2789,10 @@ def _recalibrate_hdulist_inplace(
         tpf_parts = None
 
     if verbose:
+        smear_label = smear if defer_auto_smear else eff_smear
         print(
             f"Recalibrating Sector {sector} Camera {camera} CCD {ccd} "
-            f"Outputs {list(unique_outputs)} (smear={eff_smear!r}, cadence={cadence_kind!r})"
+            f"Outputs {list(unique_outputs)} (smear={smear_label!r}, cadence={cadence_kind!r})"
         )
 
     models = resolve_static_models(
@@ -2867,8 +3022,11 @@ def _recalibrate_hdulist_inplace(
                     cadence_match=cadence_match,
                     label=f"smrow-alt-blf ({out})",
                 )
-                combined_matched &= alt_matched
                 safe_alt_idx = np.where(alt_matched, alt_idx, 0)
+                if "COLMATCH" in (alt_hdu1.data.names or ()):
+                    col_ok = np.asarray(alt_hdu1.data["COLMATCH"], dtype=bool)[safe_alt_idx]
+                    alt_matched = alt_matched & col_ok
+                combined_matched &= alt_matched
                 alt_sm_512 = np.asarray(alt_hdu1.data["SMEAR"], dtype=np.float64)[safe_alt_idx]
                 if "SMEAR_ERR" in (alt_hdu1.data.names or ()):
                     alt_err_512 = np.asarray(alt_hdu1.data["SMEAR_ERR"], dtype=np.float64)[
@@ -3131,6 +3289,81 @@ def _recalibrate_hdulist_inplace(
             )
         ):
             eff_smear = "alternate"
+            # Check warm -alt-*-blf.fits caches before recomputing on sub-row-2048 cutouts
+            deferred_alt_blf: dict[str, Path] = {}
+            for out in unique_outputs:
+                found_alt = _find_valid_smrow_blf(
+                    sector=sector,
+                    camera=camera,
+                    ccd=ccd,
+                    output=out,
+                    cadence=cadence_kind,
+                    smear_mode="alternate",
+                    ddir=ddir,
+                    cache_dir=resolved_cache,
+                    tpf_parts=tpf_parts,
+                    ticid=ticid,
+                    cutout_bounds=cutout_bounds,
+                    require_alt_unres=True,
+                    required_cadenceno=tpf_cad,
+                    cadence_match=cadence_match,
+                    source_mask_digest=srcmask_digest,
+                )
+                if found_alt is not None:
+                    deferred_alt_blf[out] = found_alt
+            if len(deferred_alt_blf) == len(unique_outputs):
+                for out in unique_outputs:
+                    local_cols = np.flatnonzero(
+                        np.asarray([o == out for o in col_outputs], dtype=bool)
+                    )
+                    c0_loc, c1_loc = int(local_cols[0]), int(local_cols[-1]) + 1
+                    sm_col_start = int(cols_1based[c0_loc] - 1 - OUTPUT_BOUNDS_0BASED[out][0])
+                    sm_col_end = sm_col_start + (c1_loc - c0_loc)
+                    readnoi_sci = float(hdr1.get(f"READNOI{out}", 8.5))
+                    with fits.open(deferred_alt_blf[out], memmap=True) as alt_hdul:
+                        alt_hdu1 = alt_hdul[1]
+                        alt_cad = np.asarray(alt_hdu1.data["CADENCENO"], dtype=np.int64)
+                        alt_matched, alt_idx = match_cadenceno(
+                            tpf_cad,
+                            alt_cad,
+                            cadence_match=cadence_match,
+                            label=f"smrow-alt-blf ({out})",
+                        )
+                        safe_alt_idx = np.where(alt_matched, alt_idx, 0)
+                        if "COLMATCH" in (alt_hdu1.data.names or ()):
+                            col_ok = np.asarray(alt_hdu1.data["COLMATCH"], dtype=bool)[
+                                safe_alt_idx
+                            ]
+                            alt_matched = alt_matched & col_ok
+                        alt_sm_512 = np.asarray(alt_hdu1.data["SMEAR"], dtype=np.float64)[
+                            safe_alt_idx
+                        ]
+                        if "SMEAR_ERR" in (alt_hdu1.data.names or ()):
+                            alt_err_512 = np.asarray(
+                                alt_hdu1.data["SMEAR_ERR"], dtype=np.float64
+                            )[safe_alt_idx]
+                        else:
+                            alt_err_512 = np.sqrt(
+                                float(_unit_normal_median_variance(10))
+                                * crmiten_var_sci
+                                * (np.maximum(alt_sm_512, 0.0) + readnoi_sci**2)
+                                / n_eff_sci
+                            )
+                        alt_cached_smear_stamp[:, c0_loc:c1_loc] = np.where(
+                            alt_matched[:, None],
+                            alt_sm_512[:, sm_col_start:sm_col_end],
+                            np.nan,
+                        )
+                        alt_cached_smear_err_stamp[:, c0_loc:c1_loc] = np.where(
+                            alt_matched[:, None],
+                            alt_err_512[:, sm_col_start:sm_col_end],
+                            np.nan,
+                        )
+                        alt_unres_512 = np.asarray(alt_hdul["ALT_UNRES"].data, dtype=bool)
+                        alt_cached_unres_cols[c0_loc:c1_loc] = alt_unres_512[
+                            sm_col_start:sm_col_end
+                        ]
+                all_outputs_have_alt_cache = True
 
     # Compute final smear M_hat (e-/frame) and M_err (e-/frame) across the stamp
     if eff_smear == "standard":
@@ -3205,23 +3438,22 @@ def _recalibrate_hdulist_inplace(
                     else None
                 ),
             )
-            matched_rows = combined_matched
-            n_matched_alt = int(np.sum(matched_rows))
-            if n_matched_alt > 0 and not _alt_blf_has_more_cadences(
+            if not _alt_blf_has_more_cadences(
                 alt_dst,
                 cutout_bounds,
-                n_matched_alt,
+                len(tpf_cad),
                 cadence_match=cadence_match,
                 source_mask_digest=srcmask_digest,
             ):
                 try:
                     write_smear_blf(
                         alt_dst,
-                        time=tpf_time[matched_rows],
-                        cadenceno=tpf_cad[matched_rows],
-                        smear=alt_sm_512[matched_rows],
-                        smear_err=alt_err_512[matched_rows].astype(np.float32),
+                        time=tpf_time,
+                        cadenceno=tpf_cad,
+                        smear=alt_sm_512,
+                        smear_err=alt_err_512.astype(np.float32),
                         unresolved_cols=alt_unres_512,
+                        col_matched=combined_matched,
                         smear_mode="alternate",
                         cutout_bounds=cutout_bounds,
                         cadence_match=cadence_match,
@@ -3364,11 +3596,13 @@ def desmear_calibrated_cutout(
     """Repair collateral-bleed smear corruption on calibrated FFI cutouts (e.g. ``TessCut``).
 
     Designed for full-frame-image cutouts where raw ``RAW_CNTS`` and collateral
-    ``_col.fits`` tables are unavailable. Restores any previously subtracted
-    ``FLUX_BKG`` when ``BKGSUB`` / ``BACKAPP`` is ``True``, bridges clean flank
-    columns across bloomed/saturated columns with inverse-wing-weighted Huber
-    row-location estimation, writes ``SMEAR_ERR`` and ``PIXEL_QUALITY``, zeroes
-    ``FLUX_BKG`` / ``FLUX_BKG_ERR``, and sets ``HALOCVER = 1``, ``BKGSUB = False``.
+    ``_col.fits`` tables are unavailable. Restores any previously subtracted finite
+    ``FLUX_BKG`` when ``BKGSUB`` / ``BACKAPP`` is ``True`` (zeroing ``FLUX_BKG`` /
+    ``FLUX_BKG_ERR`` and setting ``BKGSUB = False``), or preserves ``BKGSUB = True``
+    / ``BACKAPP = True`` when prior background subtraction cannot be restored because
+    ``FLUX_BKG`` is absent or all-``NaN``. Bridges clean flank columns across
+    bloomed/saturated columns with inverse-wing-weighted Huber row-location
+    estimation, writes ``SMEAR_ERR`` and ``PIXEL_QUALITY``, and stamps ``HALOCVER = 1``.
     """
     hdul, src_path, quality_bitmask = _clone_input_tpf(tpf)
     hdr0 = hdul[0].header
@@ -3397,12 +3631,13 @@ def desmear_calibrated_cutout(
         bkg_nonzero = False
 
     bkg_all_nan = has_bkg_col and not bkg_has_finite
+    bkg_unrestorable = (not has_bkg_col) or bkg_all_nan
     should_restore_bkg = bkg_nonzero and (
         (bkgsub_hdr is True) or (bkgsub_hdr is None and backapp_hdr)
     )
     preserve_bkgsub = (
         not should_restore_bkg
-        and bkg_all_nan
+        and bkg_unrestorable
         and ((bkgsub_hdr is True) or (bkgsub_hdr is None and backapp_hdr))
     )
     if should_restore_bkg:
@@ -3423,10 +3658,7 @@ def desmear_calibrated_cutout(
         sigma_in = np.sqrt(np.maximum(np.abs(u_in), 1.0) / exp_sec)
 
     col0_1based, row0_1based = _stamp_ccd_origin_1based(hdr1, hdr2, default=(45, 1))
-    if "CRVAL1P" in hdr2 and int(hdr2["CRVAL1P"]) != col0_1based:
-        hdr2["CRVAL1P"] = col0_1based
-    if "CRVAL2P" in hdr2 and int(hdr2["CRVAL2P"]) != row0_1based:
-        hdr2["CRVAL2P"] = row0_1based
+    _sync_stamp_ccd_origin(hdr1, hdr2, col0_1based, row0_1based)
     cols_1based = np.arange(col0_1based, col0_1based + nx, dtype=np.int64)
     in_sci_range = (cols_1based >= 45) & (cols_1based <= 2092)
     if np.all(in_sci_range):

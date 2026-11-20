@@ -132,9 +132,12 @@ def _find_all_local_matches(
                 candidates = [exact] if exact.is_file() else []
             else:
                 candidates = sorted(
-                    p
-                    for p in directory.glob(pat)
-                    if p.is_file() and not p.name.endswith(".tmp")
+                    (
+                        p
+                        for p in directory.glob(pat)
+                        if p.is_file() and not p.name.endswith(".tmp")
+                    ),
+                    reverse=True,
                 )
             for p in candidates:
                 if p.name.endswith(".tmp"):
@@ -394,6 +397,10 @@ def find_all_cached_blf(
     if kind == "smrow" and smear_mode == "alternate":
         if tpf_parts is not None and len(tpf_parts) >= 4:
             patterns.append(
+                f"tess*-s{sector:04d}-smrow-{camera}-{ccd}-"
+                f"{out_lower}-{tpf_parts[2]}-{tpf_parts[3]}-alt-{col_tag}-blf.fits"
+            )
+            patterns.append(
                 f"{tpf_parts[0]}-{tpf_parts[1]}-smrow-{camera}-{ccd}-"
                 f"{out_lower}-{tpf_parts[2]}-{tpf_parts[3]}-alt-{col_tag}-blf.fits"
             )
@@ -420,6 +427,10 @@ def find_all_cached_blf(
         predicate: Callable[[Path], bool] = _is_alt_blf_name
     else:
         if tpf_parts is not None and len(tpf_parts) >= 4:
+            patterns.append(
+                f"tess*-s{sector:04d}-{kind}-{camera}-{ccd}-"
+                f"{out_lower}-{tpf_parts[3]}-{col_tag}-blf.fits"
+            )
             patterns.append(
                 f"{tpf_parts[0]}-{tpf_parts[1]}-{kind}-{camera}-{ccd}-"
                 f"{out_lower}-{tpf_parts[3]}-{col_tag}-blf.fits"
@@ -493,6 +504,10 @@ def resolve_collateral_file(
 
     patterns: list[str] = []
     if tpf_parts is not None and len(tpf_parts) >= 4:
+        patterns.append(
+            f"tess*-s{sector:04d}-{kind}-{camera}-{ccd}-"
+            f"{out_lower}-{tpf_parts[3]}-{col_tag}.fits"
+        )
         patterns.append(
             f"{tpf_parts[0]}-{tpf_parts[1]}-{kind}-{camera}-{ccd}-"
             f"{out_lower}-{tpf_parts[3]}-{col_tag}.fits"
@@ -705,10 +720,12 @@ def write_smear_blf(
     smear_err: np.ndarray | None = None,
     smear_sat: np.ndarray | None = None,
     unresolved_cols: np.ndarray | None = None,
+    col_matched: np.ndarray | None = None,
     smear_mode: str = "standard",
     cutout_bounds: tuple[int, int, int, int] | None = None,
     cadence_match: str = "cadenceno",
     source_mask_digest: str = "NONE",
+    tv_all_matched: bool | None = None,
     int_time: float | None = None,
     time_unit: str = "BJD - 2457000, days",
     stage_dir: Path | None = None,
@@ -754,6 +771,14 @@ def write_smear_blf(
                 array=np.asarray(smear_err, dtype=np.float32),
             )
         )
+    if col_matched is not None:
+        cols.append(
+            fits.Column(
+                name="COLMATCH",
+                format="L",
+                array=np.asarray(col_matched, dtype=bool),
+            )
+        )
 
     hdu1 = fits.BinTableHDU.from_columns(fits.ColDefs(cols), name="SMEAR")
     hdu1.header["BLFVER"] = (2, "Mundey -blf cache schema version")
@@ -763,6 +788,11 @@ def write_smear_blf(
         str(source_mask_digest),
         "SHA-256 prefix of SOURCE_MASK (or NONE)",
     )
+    if tv_all_matched is not None:
+        hdu1.header["TVMATCH"] = (
+            bool(tv_all_matched),
+            "Whether all smrow cadences matched tvcol 1:1",
+        )
     if int_time is not None:
         hdu1.header["INT_TIME"] = (float(int_time), "Single-frame integration time (s)")
     if cutout_bounds is not None:

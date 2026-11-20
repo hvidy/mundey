@@ -437,6 +437,42 @@ def test_s3_discovery_matches_run_id_and_picks_latest_timestamp_mund_p1(tmp_path
     assert col_latest.name == "tess2020001000000-s0006-smrow-2-3-b-0165-s_col.fits"
     assert col_latest.read_bytes() == b"run0165-latest"
 
+    # Warm local directory with the exact same multi-timestamp / multi-run-ID file set
+    # must match cold S3 selection (latest timestamp and matching run ID)!
+    local_dir = tmp_path / "local_mirror"
+    local_dir.mkdir()
+    for s3_k, payload in s3_files.items():
+        (local_dir / Path(s3_k).name).write_bytes(payload)
+
+    local_models = resolve_static_models(2, 3, ddir=local_dir, offline=True)
+    assert local_models.black2d_path.name == models.black2d_path.name
+    assert local_models.flat_path.name == models.flat_path.name
+    assert local_models.linearity_path.name == models.linearity_path.name
+
+    local_col_0126 = resolve_collateral_file(
+        sector=6,
+        camera=2,
+        ccd=3,
+        output="B",
+        kind="smrow",
+        ddir=local_dir,
+        tpf_parts=tpf_parts_0126,
+        offline=True,
+    )
+    assert local_col_0126.name == col_0126.name
+
+    local_col_latest = resolve_collateral_file(
+        sector=6,
+        camera=2,
+        ccd=3,
+        output="B",
+        kind="smrow",
+        ddir=local_dir,
+        tpf_parts=None,
+        offline=True,
+    )
+    assert local_col_latest.name == col_latest.name
+
 
 def test_cli_prefetch_honours_1crv5p_build_alt_and_readonly_cache_mund_p2(
     tpf_builder,
@@ -554,3 +590,21 @@ def test_cli_prefetch_honours_1crv5p_build_alt_and_readonly_cache_mund_p2(
     finally:
         cache_ro.chmod(0o755)
         sec_ro.chmod(0o755)
+
+    # Stage-1 prefetched standard BLF (TVMATCH=True) must remain reusable offline under
+    # cadence_match='positional' even when raw _col.fits files are absent!
+    raw_free_dir = tmp_path / "models_only"
+    raw_free_dir.mkdir()
+    for p in bundle.ddir.iterdir():
+        if p.name.endswith(("2dblack.fits", "flat.fits", "linearity.xml")):
+            (raw_free_dir / p.name).symlink_to(p)
+    cal_pos_offline = recalibrate_tpf(
+        bundle.tpf_path,
+        ddir=raw_free_dir,
+        cache_dir=cache_ro,
+        smear="standard",
+        cadence_match="positional",
+        offline=True,
+    )
+    assert cal_pos_offline.hdu[0].header["CADMATCH"] == "positional"
+    assert np.all(np.isfinite(cal_pos_offline.flux.value))

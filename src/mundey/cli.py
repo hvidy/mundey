@@ -240,7 +240,7 @@ def _run_prefetch(args: argparse.Namespace) -> int:
                 tpf_path,
                 cache_dir=args.cache_dir,
                 ddir=args.ddir,
-                smear="automatic",
+                smear="alternate",
                 offline=True,
                 strict_hpc=args.strict_hpc,
                 verbose=args.verbose,
