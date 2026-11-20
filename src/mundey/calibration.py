@@ -3477,15 +3477,13 @@ def _recalibrate_hdulist_inplace(
     denom_rate = safe_flat[np.newaxis, :, :] * int_time
 
     cal_flux = (sci_e_frame - m_hat_stamp[:, np.newaxis, :]) / denom_rate
-    cal_flux_err = (
-        np.sqrt(sci_sigma_pre * sci_sigma_pre + (m_err_stamp * m_err_stamp)[:, np.newaxis, :])
-        / denom_rate
-    )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         col_mean_flat = np.nanmean(safe_flat, axis=0)
     col_mean_flat = np.where(np.isfinite(col_mean_flat) & (col_mean_flat > 0.0), col_mean_flat, 1.0)
     cal_smear_err = m_err_stamp / (col_mean_flat[np.newaxis, :] * int_time)
+    cal_pix_err = sci_sigma_pre / denom_rate
+    cal_flux_err = np.hypot(cal_pix_err, cal_smear_err[:, np.newaxis, :])
 
     if not np.all(combined_matched):
         cal_flux[~combined_matched] = np.nan

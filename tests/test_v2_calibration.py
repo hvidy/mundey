@@ -1830,3 +1830,76 @@ def test_lightkurve_cutout_1crv5p_2crv5p_origin_mund_v201_05(
     desm_strap = desmear_calibrated_cutout(lk.TessTargetPixelFile(fits.HDUList([h0, h1, h2])))
     pq_strap = read_pixel_quality(desm_strap)
     assert np.any((pq_strap & int(PixelQuality.STRAP_COL)) != 0)
+
+
+def test_flux_err_ge_smear_err_invariant_with_varying_flat_and_sirius_s06(
+    tpf_builder,
+    tmp_path: Path,
+) -> None:
+    """HALOCVER=1 invariant: FLUX_ERR^2 >= SMEAR_ERR^2 on every row across varying flat fields."""
+    eps_f32 = float(np.finfo(np.float32).eps)
+
+    # 1. Synthetic cutout with a steep ±15% vertical flat-field gradient
+    bundle = tpf_builder(
+        tmp_path / "flat_grad",
+        col0_1based=210,
+        row0_1based=1993,
+        nx=10,
+        ny=56,
+        n_cadences=6,
+        bleed_in_smrow=True,
+        include_bleed=True,
+        flag_bad_cadence=False,
+        noise_sigma=0.0,
+        sky_dark_level=120.0,
+        seed=2017,
+    )
+    flat_path = next(bundle.ddir.glob("*-flat.fits"))
+    with fits.open(flat_path, mode="update", memmap=False) as fh:
+        grad = np.linspace(0.85, 1.15, 2048, dtype=np.float32)[:, None]
+        fh[1].data[:] = np.broadcast_to(grad, fh[1].data.shape).copy()
+        fh.flush()
+
+    cal_grad = recalibrate_tpf(
+        bundle.tpf_path,
+        ddir=bundle.ddir,
+        cache_dir=tmp_path / "flat_grad_cache",
+        smear="automatic",
+        offline=True,
+    )
+    fe_grad = np.asarray(cal_grad.hdu[1].data["FLUX_ERR"], dtype=np.float64)
+    se_grad = np.broadcast_to(
+        np.asarray(read_smear_err_column(cal_grad, quality_masked=False), dtype=np.float64)[
+            :, None, :
+        ],
+        fe_grad.shape,
+    )
+    fin_grad = np.isfinite(fe_grad) & np.isfinite(se_grad)
+    assert np.any(fin_grad)
+    assert np.all(
+        (fe_grad**2)[fin_grad] >= (se_grad**2)[fin_grad] * (1.0 - 2.0 * eps_f32)
+    )
+
+    # 2. Bundled Sirius Sector 6 SPOC TPF (real TESS flat field)
+    nb_dir = Path(__file__).resolve().parent.parent / "notebooks"
+    sirius_tpf = nb_dir / "tess2018349182459-s0006-0000000322899250-0126-s_tp.fits"
+    with pytest.warns(UserWarning, match="8 / 100"):
+        cal_sir = recalibrate_tpf(
+            sirius_tpf,
+            ddir=nb_dir,
+            cache_dir=tmp_path / "sirius_fe_se",
+            smear="automatic",
+            offline=True,
+        )
+    fe_sir = np.asarray(cal_sir.hdu[1].data["FLUX_ERR"], dtype=np.float64)
+    se_sir = np.broadcast_to(
+        np.asarray(read_smear_err_column(cal_sir, quality_masked=False), dtype=np.float64)[
+            :, None, :
+        ],
+        fe_sir.shape,
+    )
+    fin_sir = np.isfinite(fe_sir) & np.isfinite(se_sir)
+    assert np.any(fin_sir)
+    assert np.all(
+        (fe_sir**2)[fin_sir] >= (se_sir**2)[fin_sir] * (1.0 - 2.0 * eps_f32)
+    )

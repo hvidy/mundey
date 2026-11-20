@@ -16,7 +16,7 @@ All notable changes to `mundey` are documented in this file.
 - **`Lightkurve.cutout()` CCD coordinate handling (`_stamp_ccd_origin_1based`, `[MUND-05]`)**:
   Prefer `HDU[1]` `1CRV5P`/`2CRV5P` (and `1CRV4P`/`2CRV4P`) over stale `HDU[2]` `CRVAL1P`/`CRVAL2P` across `recalibrate_tpf`, `desmear_calibrated_cutout`, and `mundey prefetch --tpf`, synchronizing `HDU[2]` origin cards on output.
 - **`HALOCVER = 1` contract validation (`[TBKG-03a]`)**:
-  Reject booleans and `HALOCVER != 1` in `write_mundey_provenance`/`read_mundey_provenance`, and reject negative `SMEAR_ERR` values in `append_smear_err_column` and `read_smear_err_column`.
+  Reject booleans and `HALOCVER != 1` in `write_mundey_provenance`/`read_mundey_provenance`, reject negative `SMEAR_ERR` values in `append_smear_err_column` and `read_smear_err_column`, and compute `FLUX_ERR = hypot(cal_pix_err, SMEAR_ERR)` consistently with column-mean flat scaling so `FLUX_ERR^2 >= SMEAR_ERR^2` holds on every row.
 - **MAST S3 collateral and model selection (`[MUND-P1]`)**:
   Filter S3 collateral matches by `tpf_parts` run ID when available and select the latest reprocessing timestamp (`sorted(...)[-1]`) instead of the oldest (`[0]`).
 - **Sirius example notebook (`notebooks/sirius_example.ipynb`, `[MUND-06]`)**:
