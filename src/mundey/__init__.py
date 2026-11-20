@@ -25,7 +25,7 @@ from .calibration import desmear_calibrated_cutout, recalibrate_tpf
 from .mundey import mundey_tpf
 
 name = "mundey"
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 __all__ = [
     "HALOCVER",

@@ -11,6 +11,7 @@ from astropy.io import fits
 from .archive import DEFAULT_CHUNK_ROWS, CadenceKind, infer_cadence_kind, prefetch_collateral
 from .calibration import (
     OUTPUT_ORDER,
+    _stamp_ccd_origin_1based,
     desmear_calibrated_cutout,
     output_for_rawx_col,
     recalibrate_tpf,
@@ -95,6 +96,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Retain staged raw _col.fits inside --stage-dir after publishing -blf.fits.",
     )
     p_pre.add_argument(
+        "--build-alt",
+        action="store_true",
+        help="Pre-build target-scoped -alt-*-blf.fits caches for --tpf inputs.",
+    )
+    p_pre.add_argument(
         "--offline",
         action="store_true",
         help="Forbid all outbound S3 network calls (verify local staging only).",
@@ -165,7 +171,7 @@ def _run_prefetch(args: argparse.Namespace) -> int:
                 sec = int(hdr0["SECTOR"])
                 cam = int(hdr0["CAMERA"])
                 ccd = int(hdr0["CCD"])
-                col0 = int(hdr2["CRVAL1P"])
+                col0, _ = _stamp_ccd_origin_1based(hdr1, hdr2)
                 nx = int(hdr2["NAXIS1"])
                 outs = {output_for_rawx_col(col0 + i) for i in range(nx)}
                 cad = infer_cadence_kind(
@@ -223,6 +229,21 @@ def _run_prefetch(args: argparse.Namespace) -> int:
         if args.verbose:
             print(
                 f"Prefetched {len(published)} artefacts for s{sec:04d} cam={cam} ccd={ccd}."
+            )
+
+    if getattr(args, "build_alt", False):
+        if not args.tpf:
+            raise ValueError("--build-alt requires --tpf.")
+        for tpf_str in args.tpf:
+            tpf_path = Path(tpf_str).expanduser()
+            recalibrate_tpf(
+                tpf_path,
+                cache_dir=args.cache_dir,
+                ddir=args.ddir,
+                smear="automatic",
+                offline=True,
+                strict_hpc=args.strict_hpc,
+                verbose=args.verbose,
             )
     return 0
 

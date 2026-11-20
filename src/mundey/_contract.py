@@ -95,7 +95,15 @@ def write_mundey_provenance(
     if len(hdul) < 2:
         raise ValueError("Expected HDUList with at least primary HDU[0] and PIXELS HDU[1].")
     bkgsub_bool = bool(bkgsub)
+    if not isinstance(halocver, int | np.integer) or isinstance(halocver, bool | np.bool_):
+        raise ValueError(
+            f"Invalid HALOCVER value (expected int == {HALOCVER}): {halocver!r}."
+        )
     halocver_int = int(halocver)
+    if halocver_int != HALOCVER:
+        raise ValueError(
+            f"Unsupported HALOCVER={halocver_int}; expected HALOCVER == {HALOCVER}."
+        )
     for idx in (0, 1):
         hdr = hdul[idx].header
         hdr["HALOCVER"] = (
@@ -164,6 +172,10 @@ def read_mundey_provenance(
                         f"Conflicting BKGSUB values between HDU[0] ({bkgsub}) "
                         f"and HDU[{idx}] ({bkg_bool})."
                     )
+        if halocver is not None and halocver != HALOCVER:
+            raise ValueError(
+                f"Unsupported HALOCVER={halocver}; expected HALOCVER == {HALOCVER}."
+            )
     return {"halocver": halocver, "bkgsub": bkgsub}
 
 
@@ -259,6 +271,8 @@ def append_smear_err_column(
         raise ValueError(
             f"SMEAR_ERR shape {arr.shape} does not match HDU[1] (N_raw, nx) = {expected}."
         )
+    if np.any(arr < 0.0):
+        raise ValueError("SMEAR_ERR must be non-negative (found negative values).")
 
     existing_names = list(hdu1.columns.names or ())
     if SMEAR_ERR_COLNAME in existing_names:
@@ -305,6 +319,8 @@ def read_smear_err_column(
             raise KeyError(f"Column {SMEAR_ERR_COLNAME!r} not found in HDU[1].")
 
         raw = np.array(hdul[1].data[SMEAR_ERR_COLNAME], dtype=np.float32, copy=True)
+    if np.any(raw < 0.0):
+        raise ValueError("SMEAR_ERR column contains negative values.")
     if raw.ndim == 1:
         raw = raw[:, np.newaxis]
     qmask = getattr(target, "quality_mask", None)
