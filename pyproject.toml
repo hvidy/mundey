@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mundey"
-version = "2.0.0"
+version = "2.0.1"
 description = "Recalibration of TESS target pixel files for saturated bright stars."
 readme = "README.md"
 license = { file = "LICENSE" }

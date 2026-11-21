@@ -2,6 +2,26 @@
 
 All notable changes to `mundey` are documented in this file.
 
+## [2.0.1] - 2026-11-20
+
+### Fixed
+- **Physical shutterless row-smear weight (`_frame_transfer_row_weight`, `[MUND-01]`)**:
+  Compute `READTIME / (INT_TIME * 2058)` directly whenever positive `READTIME` and `INT_TIME` cards exist in `HDU[1]`/`HDU[0]`, instead of plugging SPOC's `CRMITEN` duty-cycle `DEADC = 0.792` into `(1 - DEADC) / (DEADC * 2058)`. Only fall back to `DEADC` when `READTIME`/`INT_TIME` are absent, removing the `(CRBLKSZ - 2) / CRBLKSZ` cosmic-ray trimming factor when `CRMITEN` is `True`. Eliminates the `26.0x` row-smear weight inflation (`-56.7 e-/s` sky over-subtraction on Sirius Sector 6 and `26x` inflated `SMEAR_UNRESOLVED` fallback error).
+- **Deferred bloom/saturation detection in `smear="automatic"` (`[MUND-02]`)**:
+  Defer `eff_smear` resolution for stamps ending below CCD row 2048 until after pre-smear calibration and collateral `smrow` loading, automatically switching to `"alternate"` whenever `y1_ccd0 + ny >= 2048`, `collat_sm_sat_cols` is saturated, `raw_sat_2d` is saturated, or `_detect_bloom_columns` flags negative smear bloom.
+- **`-blf.fits` cache provenance validation (`[MUND-03]`, `[MUND-P2]`)**:
+  Stamp `CADMATCH` (`cadenceno`/`positional`) and a deterministic 16-hex-character SHA-256 `SRCMASK` digest (`"NONE"` when no `SOURCE_MASK` bits are set) in `write_smear_blf`, require exact provenance match in `_find_valid_smrow_blf` and `_alt_blf_has_more_cadences`, persist only matched cadences into `-alt-*-blf.fits`, and tolerate read-only cache directories with a `UserWarning` when persisting optional `-alt-` caches. Added `--build-alt` to `mundey prefetch --tpf` to pre-stage target-scoped alternate BLFs for read-only compute nodes.
+- **Calibrated cutout desmearing on positive-sky and all-bloomed stamps (`desmear_calibrated_cutout`, `[MUND-04]`)**:
+  Detect negative bloom streaks before restoring `FLUX_BKG` and against a robust non-negative 2D linear sky plane when `sky > |bloom|`, anchor all-bloomed collateral-free cutouts to their unsaturated clean-row lower envelope instead of leaving 100% of columns `SMEAR_UNRESOLVED`, and preserve `BACKAPP`/`BKGSUB` when `FLUX_BKG` is all-`NaN`.
+- **`Lightkurve.cutout()` CCD coordinate handling (`_stamp_ccd_origin_1based`, `[MUND-05]`)**:
+  Prefer `HDU[1]` `1CRV5P`/`2CRV5P` (and `1CRV4P`/`2CRV4P`) over stale `HDU[2]` `CRVAL1P`/`CRVAL2P` across `recalibrate_tpf`, `desmear_calibrated_cutout`, and `mundey prefetch --tpf`, synchronizing `HDU[2]` origin cards on output.
+- **`HALOCVER = 1` contract validation (`[TBKG-03a]`)**:
+  Reject booleans and `HALOCVER != 1` in `write_mundey_provenance`/`read_mundey_provenance`, reject negative `SMEAR_ERR` values in `append_smear_err_column` and `read_smear_err_column`, and compute `FLUX_ERR = hypot(cal_pix_err, SMEAR_ERR)` consistently with column-mean flat scaling so `FLUX_ERR^2 >= SMEAR_ERR^2` holds on every row.
+- **MAST S3 collateral and model selection (`[MUND-P1]`)**:
+  Filter S3 collateral matches by `tpf_parts` run ID when available and select the latest reprocessing timestamp (`sorted(...)[-1]`) instead of the oldest (`[0]`).
+- **Sirius example notebook (`notebooks/sirius_example.ipynb`, `[MUND-06]`)**:
+  Updated Cell 8 to the `HALOCVER = 1` v2 functional workflow (`mundey.recalibrate_tpf` -> `tessbkgd.subtract_background` -> `halophot.extract_halo_lightcurve`) and executed all cells cleanly.
+
 ## [2.0.0] - 2026-11-19
 
 ### Breaking & Default Behaviour Changes
