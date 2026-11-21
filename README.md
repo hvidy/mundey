@@ -47,7 +47,7 @@ tpf = lk.read("tess2018349182459-s0006-0000000322899250-0126-s_tp.fits")
 cal_tpf = mundey.recalibrate_tpf(
     tpf,
     ddir="./notebooks",       # or fetched automatically from anonymous MAST S3 into cache_dir
-    smear="automatic",        # 'alternate' when stamp reaches row 2048, else 'standard'
+    smear="automatic",        # 'alternate' on row 2048, saturation, or bloom; else 'standard'
     cadence_match="cadenceno",
     offline=True,
 )
@@ -88,6 +88,9 @@ The image below shows the Sirius target pixel file after correction with `mundey
 ```bash
 # Stage 1 (trevor node or --tmp=25G Slurm array on trevor): stream 4,096-row chunks from MAST S3
 mundey prefetch --sector 6 --camera 2 --ccd 3 --outputs B --cadence 2min --strict-hpc
+
+# Or infer (sector, camera, ccd, outputs, cadence) from TPF(s) and pre-build -alt- caches:
+mundey prefetch --tpf tess...-s_tp.fits --build-alt --strict-hpc
 
 # Stage 2 (offline compute nodes): recalibrate with zero network access
 mundey calibrate tess...-s_tp.fits -o recalibrated_tp.fits --offline --strict-hpc --overwrite

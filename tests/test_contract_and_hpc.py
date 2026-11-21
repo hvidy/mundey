@@ -175,6 +175,30 @@ def test_contract_validation_errors(synthetic_1output_tpf: lk.TessTargetPixelFil
     with pytest.raises(ValueError, match="Conflicting HALOCVER"):
         read_mundey_provenance(tpf)
 
+    # [TBKG-03a] HALOCVER != 1 and boolean HALOCVER must be rejected on write & read
+    with pytest.raises(ValueError, match="Unsupported HALOCVER"):
+        write_mundey_provenance(tpf, bkgsub=False, halocver=99)
+
+    with pytest.raises(ValueError, match="Invalid HALOCVER"):
+        write_mundey_provenance(tpf, bkgsub=False, halocver=True)
+
+    tpf.hdu[0].header["HALOCVER"] = 99
+    tpf.hdu[1].header["HALOCVER"] = 99
+    with pytest.raises(ValueError, match="Unsupported HALOCVER"):
+        read_mundey_provenance(tpf)
+
+    # [TBKG-03a] Negative SMEAR_ERR must be rejected on write & read
+    n_raw = len(tpf.hdu[1].data)
+    bad_smear_err = np.full((n_raw, nx), -5.0, dtype=np.float32)
+    with pytest.raises(ValueError, match="non-negative"):
+        append_smear_err_column(tpf, bad_smear_err)
+
+    good_smear_err = np.full((n_raw, nx), 2.5, dtype=np.float32)
+    append_smear_err_column(tpf, good_smear_err)
+    tpf.hdu[1].data["SMEAR_ERR"][0, 0] = np.float32(-1.0)
+    with pytest.raises(ValueError, match="negative"):
+        read_smear_err_column(tpf)
+
 
 def test_resolve_cache_dir_scratch_default_and_fred_hpc_guard(
     monkeypatch: pytest.MonkeyPatch,
@@ -309,12 +333,12 @@ def test_recalibrate_ddir_on_fred_routes_to_xdg_and_scratch_env_caches(
     assert len(list((scratch_dir / ".cache" / "tess_bright" / "s0020").glob("*-blf.fits"))) == 2
 
 
-def test_version_2_0_0_and_read_smear_err_export_symmetry(
+def test_version_2_0_1_and_read_smear_err_export_symmetry(
     synthetic_1output_bundle,
     tmp_path: Path,
 ) -> None:
-    """mundey v2.0.0 must export read_smear_err with FITS-path and quality_mask=None symmetry."""
-    assert mundey.__version__ == "2.0.0"
+    """mundey v2.0.1 must export read_smear_err with FITS-path and quality_mask=None symmetry."""
+    assert mundey.__version__ == "2.0.1"
     assert "read_smear_err" in mundey.__all__
     assert read_smear_err is read_smear_err_column
 
