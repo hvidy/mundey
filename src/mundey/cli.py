@@ -8,12 +8,14 @@ from pathlib import Path
 
 from astropy.io import fits
 
-from .archive import DEFAULT_CHUNK_ROWS, CadenceKind, infer_cadence_kind, prefetch_collateral
+from ._contract import atomic_temp_path
+from .archive import DEFAULT_CHUNK_ROWS, CadenceKind, infer_cadence_kind
 from .calibration import (
     OUTPUT_ORDER,
     _stamp_ccd_origin_1based,
     desmear_calibrated_cutout,
     output_for_rawx_col,
+    prefetch_collateral,
     recalibrate_tpf,
 )
 
@@ -108,8 +110,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pre.add_argument(
         "--strict-hpc",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Raise ValueError if --cache-dir resolves under /fred (default: True).",
+        default=False,
+        help="Raise ValueError if --cache-dir resolves under /fred (default: False).",
     )
     p_pre.add_argument("-v", "--verbose", action="store_true", help="Print progress.")
 
@@ -143,14 +145,20 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run collateral-free FFI cutout desmearing (TessCut mode).",
     )
+    p_cal.add_argument(
+        "--saturation-threshold",
+        type=float,
+        default=1.0e5,
+        help="Flux saturation threshold (e-/s) for --desmear-cutout (default: 1e5).",
+    )
     p_cal.add_argument("--cache-dir", type=str, default=None, help="Cache directory path.")
     p_cal.add_argument("--ddir", type=str, default=None, help="Local reference directory.")
     p_cal.add_argument("--offline", action="store_true", help="Forbid network access.")
     p_cal.add_argument(
         "--strict-hpc",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Raise ValueError if --cache-dir resolves under /fred (default: True).",
+        default=False,
+        help="Raise ValueError if --cache-dir resolves under /fred (default: False).",
     )
     p_cal.add_argument("--overwrite", action="store_true", help="Overwrite existing output.")
     p_cal.add_argument("-v", "--verbose", action="store_true", help="Print progress.")
@@ -165,18 +173,12 @@ def _run_prefetch(args: argparse.Namespace) -> int:
         for tpf_str in args.tpf:
             tpf_path = Path(tpf_str).expanduser()
             with fits.open(tpf_path, mode="readonly", memmap=True) as hdul:
-                hdr0 = hdul[0].header
-                hdr1 = hdul[1].header
-                hdr2 = hdul[2].header
-                sec = int(hdr0["SECTOR"])
-                cam = int(hdr0["CAMERA"])
-                ccd = int(hdr0["CCD"])
+                hdr0, hdr1, hdr2 = hdul[0].header, hdul[1].header, hdul[2].header
+                sec, cam, ccd = int(hdr0["SECTOR"]), int(hdr0["CAMERA"]), int(hdr0["CCD"])
                 col0, _ = _stamp_ccd_origin_1based(hdr1, hdr2)
                 nx = int(hdr2["NAXIS1"])
                 outs = {output_for_rawx_col(col0 + i) for i in range(nx)}
-                cad = infer_cadence_kind(
-                    tpf_path=tpf_path, hdu0_header=hdr0, hdu1_header=hdr1
-                )
+                cad = infer_cadence_kind(tpf_path=tpf_path, hdu0_header=hdr0, hdu1_header=hdr1)
             key = (sec, cam, ccd)
             if key not in jobs:
                 jobs[key] = (set(), set())
@@ -188,11 +190,9 @@ def _run_prefetch(args: argparse.Namespace) -> int:
         if args.task_id is not None:
             if not (0 <= args.task_id <= 15):
                 raise ValueError(f"--task-id must be in 0..15, got {args.task_id}.")
-            cam = (args.task_id // 4) + 1
-            ccd = (args.task_id % 4) + 1
+            cam, ccd = (args.task_id // 4) + 1, (args.task_id % 4) + 1
         elif args.camera is not None and args.ccd is not None:
-            cam = args.camera
-            ccd = args.ccd
+            cam, ccd = args.camera, args.ccd
         else:
             raise ValueError("Provide either --camera and --ccd, or --task-id 0..15.")
         jobs[(args.sector, cam, ccd)] = (set(OUTPUT_ORDER), {"2min"})
@@ -227,30 +227,36 @@ def _run_prefetch(args: argparse.Namespace) -> int:
             verbose=args.verbose,
         )
         if args.verbose:
-            print(
-                f"Prefetched {len(published)} artefacts for s{sec:04d} cam={cam} ccd={ccd}."
-            )
+            print(f"Prefetched {len(published)} artefacts for s{sec:04d} cam={cam} ccd={ccd}.")
 
     if getattr(args, "build_alt", False):
         if not args.tpf:
             raise ValueError("--build-alt requires --tpf.")
         for tpf_str in args.tpf:
-            tpf_path = Path(tpf_str).expanduser()
             recalibrate_tpf(
-                tpf_path,
+                Path(tpf_str).expanduser(),
                 cache_dir=args.cache_dir,
                 ddir=args.ddir,
                 smear="alternate",
                 offline=True,
                 strict_hpc=args.strict_hpc,
+                chunk_rows=args.chunk_rows,
                 verbose=args.verbose,
             )
     return 0
 
 
 def _run_calibrate(args: argparse.Namespace) -> int:
+    out_path = Path(args.output).expanduser()
+    if out_path.exists() and not args.overwrite:
+        raise FileExistsError(f"Output file already exists: {out_path} (pass --overwrite).")
+
     if args.desmear_cutout:
-        cal_tpf = desmear_calibrated_cutout(args.tpf, verbose=args.verbose)
+        cal_tpf = desmear_calibrated_cutout(
+            args.tpf,
+            saturation_flux_threshold=args.saturation_threshold,
+            verbose=args.verbose,
+        )
     else:
         cal_tpf = recalibrate_tpf(
             args.tpf,
@@ -263,9 +269,8 @@ def _run_calibrate(args: argparse.Namespace) -> int:
             strict_hpc=args.strict_hpc,
             verbose=args.verbose,
         )
-    out_path = Path(args.output).expanduser()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    cal_tpf.to_fits(str(out_path), overwrite=args.overwrite)
+    with atomic_temp_path(out_path) as tmp:
+        cal_tpf.to_fits(str(tmp), overwrite=True)
     return 0
 
 

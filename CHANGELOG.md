@@ -7,8 +7,18 @@ All notable changes to `mundey` are documented in this file.
 ### Fixed
 - **Physical shutterless row-smear weight (`_frame_transfer_row_weight`, `[MUND-01]`)**:
   Compute `READTIME / (INT_TIME * 2058)` directly whenever positive `READTIME` and `INT_TIME` cards exist in `HDU[1]`/`HDU[0]`, instead of plugging SPOC's `CRMITEN` duty-cycle `DEADC = 0.792` into `(1 - DEADC) / (DEADC * 2058)`. Only fall back to `DEADC` when `READTIME`/`INT_TIME` are absent, removing the `(CRBLKSZ - 2) / CRBLKSZ` cosmic-ray trimming factor when `CRMITEN` is `True`. Eliminates the `26.0x` row-smear weight inflation (`-56.7 e-/s` sky over-subtraction on Sirius Sector 6 and `26x` inflated `SMEAR_UNRESOLVED` fallback error).
-- **Deferred bloom/saturation detection in `smear="automatic"` (`[MUND-02]`)**:
-  Defer `eff_smear` resolution for stamps ending below CCD row 2048 until after pre-smear calibration and collateral `smrow` loading, automatically switching to `"alternate"` whenever `y1_ccd0 + ny >= 2048`, `collat_sm_sat_cols` is saturated, `raw_sat_2d` is saturated, or `_detect_bloom_columns` flags negative smear bloom.
+- **Deferred bloom detection in `smear="automatic"` (`[MUND-02]`)**:
+  Defer `eff_smear` resolution for stamps ending below CCD row 2048 until after pre-smear calibration and collateral `smrow` loading, switching to `"alternate"` only when `y1_ccd0 + ny >= 2048`, `collat_sm_sat_cols` is saturated, or `_detect_bloom_columns` flags negative smear bloom on quality-passing cadences (never on ordinary science-pixel saturation alone).
+- **Bleed-neighbour masking, time-medianed `inv_wing_w`, `QUALITY` isolation, causal LDE `NaN`-gap reset, and Huber / variance fixes**:
+  - Exclude `sat_bleed_2d` and `±1`-column lateral bleed neighbours from `clean_rows_2d` in `_estimate_alternate_smear_stamp` (eliminating `-51`/`-64 e-/s` trenches on Sirius Sector 6 columns 4 and 6).
+  - Compute `inv_wing_w` from the time-medianed, 10th-percentile-floored flank profile instead of per-cadence `min(j_act)`, eliminating the `+1.5σ/cadence` selection bias.
+  - Respect `QUALITY` flags / `quality_mask` when constructing `raw_sat_2d`, `sat_bleed_2d`, `collat_sm_sat_cols`, and running bloom detection while still calibrating all `N_raw` rows into `HDU[1]`.
+  - Reset causal LDE undershoot inversion to steady state `w / (1 - u)` after any `NaN` gap (including column 0).
+  - Initialize the Huber location solver with an exact weighted median, use the M-estimator Hessian bread `sum(w_base * (|u| <= c))`, and keep shared `off_target_smear` variance outside flank-column averaging.
+  - Warn and mark `BKGSUB = True` when `desmear_calibrated_cutout` zero-references an all-bloomed cutout without collateral data or `FLUX_BKG`.
+- **Architecture, memory, and UX cleanup**:
+  - Adopted the canonical cross-package `_precision.py` (`cast_tree` inside `run_in(dtype)` preserving Astropy `Quantity` units) and `_contract.py` verbatim.
+  - Broke the `archive.py <-> calibration.py` static import cycle, extracted `smear.py`, chunked science cube calibration in 4,096-cadence slices, added `CalibrationConfig` and `plot_diagnostics`, moved `astroquery` to optional `[simbad]`, defaulted `strict_hpc=False` in the Python API, and trimmed `mundey.__all__` to the 9 user-facing symbols.
 - **`-blf.fits` cache provenance validation (`[MUND-03]`, `[MUND-P2]`)**:
   Stamp `CADMATCH` (`cadenceno`/`positional`) and a deterministic 16-hex-character SHA-256 `SRCMASK` digest (`"NONE"` when no `SOURCE_MASK` bits are set) in `write_smear_blf`, require exact provenance match in `_find_valid_smrow_blf` and `_alt_blf_has_more_cadences`, persist only matched cadences into `-alt-*-blf.fits`, and tolerate read-only cache directories with a `UserWarning` when persisting optional `-alt-` caches. Added `--build-alt` to `mundey prefetch --tpf` to pre-stage target-scoped alternate BLFs for read-only compute nodes.
 - **Calibrated cutout desmearing on positive-sky and all-bloomed stamps (`desmear_calibrated_cutout`, `[MUND-04]`)**:

@@ -16,10 +16,9 @@ from mundey import (
     mundey_tpf,
     read_pixel_quality,
     read_smear_err,
-    read_smear_err_column,
     recalibrate_tpf,
-    write_pixel_quality,
 )
+from mundey._contract import read_smear_err_column, write_pixel_quality
 from mundey.calibration import (
     CRMITEN_BLOCK10_VAR_FACTOR,
     OUTPUT_BOUNDS_0BASED,
@@ -858,8 +857,14 @@ def test_sliced_lightkurve_tpf_hdulist_path_fallback_mund01(
         assert sub_cal.hdu[0].header["CADMISS"] == 0
         assert np.all(np.isfinite(sub_cal.flux.value))
 
-    np.testing.assert_allclose(cal_alt_s1.flux.value, full_alt_ref.flux.value[2:5], rtol=1e-5)
-    np.testing.assert_allclose(cal_alt_s2.flux.value, full_alt_ref.flux.value[6:10], rtol=1e-5)
+    # Cold sub-slices estimate time-medianed inv_wing_w over their own cadence subset (small
+    # ~0.1 e-/s shift across bright/dark sky-gradient subsets), while full & warm-cached match 1e-5
+    np.testing.assert_allclose(
+        cal_alt_s1.flux.value, full_alt_ref.flux.value[2:5], rtol=1e-3, atol=0.3
+    )
+    np.testing.assert_allclose(
+        cal_alt_s2.flux.value, full_alt_ref.flux.value[6:10], rtol=1e-3, atol=0.3
+    )
     np.testing.assert_allclose(cal_alt_full.flux.value, full_alt_ref.flux.value, rtol=1e-5)
     np.testing.assert_allclose(cal_alt_s3.flux.value, full_alt_ref.flux.value[1:4], rtol=1e-5)
 
@@ -912,7 +917,9 @@ def test_sliced_lightkurve_tpf_hdulist_path_fallback_mund01(
         cadence_match="positional",
         offline=True,
     )
-    np.testing.assert_allclose(cal_pos_0_4.flux.value, full_alt_ref.flux.value[0:4], rtol=1e-5)
+    np.testing.assert_allclose(
+        cal_pos_0_4.flux.value, full_alt_ref.flux.value[0:4], rtol=1e-3, atol=0.3
+    )
 
 
 def test_falsy_quality_bitmask_zero_and_none_preserved_mund02(

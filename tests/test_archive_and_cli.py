@@ -13,12 +13,13 @@ from astropy.io import fits
 from mundey import recalibrate_tpf
 from mundey.archive import (
     S3_TESS_PUBLIC_ROOT,
-    find_cached_blf,
+    CollateralSpec,
+    find_all_cached_blf,
     iter_collateral_chunks,
-    prefetch_collateral,
     resolve_collateral_file,
     resolve_static_models,
 )
+from mundey.calibration import prefetch_collateral
 from mundey.cli import main as cli_main
 
 
@@ -62,10 +63,7 @@ def test_offline_guard_blocks_before_s3_instantiation(
 
     with pytest.raises(FileNotFoundError, match="offline=True"):
         resolve_collateral_file(
-            sector=6,
-            camera=2,
-            ccd=3,
-            output="B",
+            CollateralSpec(sector=6, camera=2, ccd=3, output="B"),
             kind="smrow",
             cache_dir=tmp_path,
             offline=True,
@@ -317,17 +315,15 @@ def test_blf_cache_wildcard_excludes_alt_files_and_stamps_e_per_frame_units(
     assert len(alt_files) == 1
 
     # 1. Standard wildcard lookup must NOT match the -alt- cache!
+    spec_s6_a = CollateralSpec(sector=6, camera=2, ccd=3, output="A")
     assert (
-        find_cached_blf(
-            sector=6,
-            camera=2,
-            ccd=3,
-            output="A",
+        find_all_cached_blf(
+            spec_s6_a,
             kind="smrow",
             smear_mode="standard",
             cache_dir=cache_dir,
         )
-        is None
+        == []
     )
 
     # 2. prefetch_collateral must build the missing standard smrow -blf.fits (not skip!)
@@ -340,16 +336,14 @@ def test_blf_cache_wildcard_excludes_alt_files_and_stamps_e_per_frame_units(
         cache_dir=cache_dir,
         offline=True,
     )
-    std_blf = find_cached_blf(
-        sector=6,
-        camera=2,
-        ccd=3,
-        output="A",
+    std_matches = find_all_cached_blf(
+        spec_s6_a,
         kind="smrow",
         smear_mode="standard",
         cache_dir=cache_dir,
     )
-    assert std_blf is not None
+    assert std_matches
+    std_blf = std_matches[0]
     assert "-alt-" not in std_blf.name
 
     # 3. Verify TUNIT3/TUNIT4 == 'e-/frame', SMEARMOD == 'standard', and SMROW_SAT extension
@@ -409,15 +403,13 @@ def test_s3_discovery_matches_run_id_and_picks_latest_timestamp_mund_p1(tmp_path
     assert models.linearity_path.name == "tess2021001000000-41006_100-linearity.xml"
 
     # Matching run ID '0126' picks latest timestamp for run '0126' (ignoring '0165')
-    tpf_parts_0126 = ["tess2018349182459", "s0006", "0000000322899250", "0126", "s_tp.fits"]
+    tpf_parts_0126 = ("tess2018349182459", "s0006", "0000000322899250", "0126", "s_tp.fits")
+    spec_0126 = CollateralSpec(sector=6, camera=2, ccd=3, output="B", tpf_parts=tpf_parts_0126)
+    spec_any = CollateralSpec(sector=6, camera=2, ccd=3, output="B")
     col_0126 = resolve_collateral_file(
-        sector=6,
-        camera=2,
-        ccd=3,
-        output="B",
+        spec_0126,
         kind="smrow",
         cache_dir=tmp_path / "ccache1",
-        tpf_parts=tpf_parts_0126,
         s3_fs=fake_s3,
     )
     assert col_0126.name == "tess2019001000000-s0006-smrow-2-3-b-0126-s_col.fits"
@@ -425,13 +417,9 @@ def test_s3_discovery_matches_run_id_and_picks_latest_timestamp_mund_p1(tmp_path
 
     # Without run ID (or unmatched run ID), picks latest reprocessing timestamp overall ('0165')
     col_latest = resolve_collateral_file(
-        sector=6,
-        camera=2,
-        ccd=3,
-        output="B",
+        spec_any,
         kind="smrow",
         cache_dir=tmp_path / "ccache2",
-        tpf_parts=None,
         s3_fs=fake_s3,
     )
     assert col_latest.name == "tess2020001000000-s0006-smrow-2-3-b-0165-s_col.fits"
@@ -450,25 +438,17 @@ def test_s3_discovery_matches_run_id_and_picks_latest_timestamp_mund_p1(tmp_path
     assert local_models.linearity_path.name == models.linearity_path.name
 
     local_col_0126 = resolve_collateral_file(
-        sector=6,
-        camera=2,
-        ccd=3,
-        output="B",
+        spec_0126,
         kind="smrow",
         ddir=local_dir,
-        tpf_parts=tpf_parts_0126,
         offline=True,
     )
     assert local_col_0126.name == col_0126.name
 
     local_col_latest = resolve_collateral_file(
-        sector=6,
-        camera=2,
-        ccd=3,
-        output="B",
+        spec_any,
         kind="smrow",
         ddir=local_dir,
-        tpf_parts=None,
         offline=True,
     )
     assert local_col_latest.name == col_latest.name

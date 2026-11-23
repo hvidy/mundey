@@ -47,11 +47,14 @@ tpf = lk.read("tess2018349182459-s0006-0000000322899250-0126-s_tp.fits")
 cal_tpf = mundey.recalibrate_tpf(
     tpf,
     ddir="./notebooks",       # or fetched automatically from anonymous MAST S3 into cache_dir
-    smear="automatic",        # 'alternate' on row 2048, saturation, or bloom; else 'standard'
+    smear="automatic",        # 'alternate' on row 2048, collateral saturation, or bloom; else 'standard'
     cadence_match="cadenceno",
     offline=True,
 )
 cal_tpf.to_fits("sirius_s06_recalibrated_tp.fits", overwrite=True)
+
+# Visual inspection (before/after median stamp, PIXEL_QUALITY overlay, per-column SMEAR_ERR)
+fig, axes = mundey.plot_diagnostics(cal_tpf, raw_tpf=tpf)
 ```
 
 For `TessCut` or HLSP full-frame-image cutouts where raw `RAW_CNTS` and collateral `_col.fits` files are unavailable, use `mundey.desmear_calibrated_cutout`:

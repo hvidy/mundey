@@ -85,3 +85,21 @@ def test_iterators_pass_through_unchanged_and_invalid_dtype_rejected() -> None:
     with pytest.raises(ValueError, match="dtype must be"):
         with run_in("float16"):
             pass
+
+
+def test_cast_tree_preserves_float64_precision_and_astropy_quantity_units() -> None:
+    """[MUND-ADV-8] cast_tree(..., 'float64') must not truncate to float32 or strip units."""
+    import astropy.units as u
+
+    assert jax.config.jax_enable_x64 is False
+    a64 = np.array([1.0 + 1e-12], dtype=np.float64)
+    c_out = cast_tree(a64, "float64")
+    assert c_out.dtype == jnp.float64
+    assert np.isclose(float(np.asarray(c_out)[0] - 1.0), 1e-12, rtol=1e-4)
+
+    q_in = a64 * (u.electron / u.s)
+    q_out = cast_tree(q_in, "float64")
+    assert isinstance(q_out, u.Quantity)
+    assert q_out.unit == (u.electron / u.s)
+    assert np.isclose(float(q_out.value[0] - 1.0), 1e-12, rtol=1e-4)
+    assert jax.config.jax_enable_x64 is False

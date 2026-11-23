@@ -5,9 +5,10 @@ Implements physical TESS readout calibration in locally scoped 64-bit JAX:
 2. Cancellation-free discrete orthonormal Legendre 1D-black fitting on clean
    trailing virtual columns (``cols 3..9``) with AIC degree selection.
 3. Causal serial LDE undershoot inversion via ``jax.lax.associative_scan`` in
-   ADU *before* per-frame ``[0, maxDomain]``-clamped nonlinearity and gain.
+   ADU *before* per-frame ``[0, maxDomain]``-clamped nonlinearity and gain, with
+   steady-state restart across ``NaN`` gaps.
 4. Exact ``CADENCENO`` collateral pairing across unified 2048-column multi-output
-   (``'A'``, ``'B'``, ``'C'``, ``'D'``) CCD cutouts.
+   (``'A'``, ``'B'``, ``'C'``, ``'D'``) CCD cutouts in 4,096-cadence chunks.
 5. Concavity-guarded collateral-anchored ``smear='alternate'`` and FFI cutout
    desmearing (:func:`desmear_calibrated_cutout`) under ``HALOCVER = 1``.
 """
@@ -31,7 +32,6 @@ import lightkurve as lk
 import numpy as np
 from astropy.io import fits
 from scipy import linalg as sp_linalg
-from scipy.special import ndtri
 
 from ._contract import (
     PIXEL_QUALITY_EXTNAME,
@@ -46,6 +46,7 @@ from ._precision import in_float64
 from .archive import (
     DEFAULT_CHUNK_ROWS,
     CadenceKind,
+    CollateralSpec,
     StaticModelPaths,
     collateral_blf_cache_path,
     collateral_suffix,
@@ -58,6 +59,18 @@ from .archive import (
     write_onedblack_blf,
     write_smear_blf,
 )
+from .smear import (
+    TESS_PARALLEL_SHIFTS,
+    AlternateSmearConfig,
+    _build_clean_rows_2d,
+    _detect_bloom_columns,  # noqa: F401
+    _dilate_vertical_bool,
+    _estimate_alternate_smear_stamp,
+    _eval_bloom_from_stats,
+    _select_bucket,
+    _solve_huber_smear_location,  # noqa: F401
+    _unit_normal_median_variance,
+)
 
 _MISSING = object()
 
@@ -65,8 +78,6 @@ CadenceMatchMode = Literal["cadenceno", "positional"]
 MissingCadenceMode = Literal["nan", "error"]
 SmearMode = Literal["automatic", "standard", "alternate"]
 
-# Output geometry on full 2136-column TESS CCD frame (0-based slice bounds):
-# Science imaging columns occupy 0-based [44, 2092) -> 1-based RAWX 45..2092.
 OUTPUT_ORDER: tuple[str, str, str, str] = ("A", "B", "C", "D")
 OUTPUT_BOUNDS_0BASED: dict[str, tuple[int, int, int, int]] = {
     "A": (44, 556, 2092, 2103),
@@ -74,66 +85,27 @@ OUTPUT_BOUNDS_0BASED: dict[str, tuple[int, int, int, int]] = {
     "C": (1068, 1580, 2114, 2125),
     "D": (1580, 2092, 2125, 2136),
 }
-OUTPUT_SCI0_OFFSET: dict[str, int] = {
-    "A": 0,
-    "B": 512,
-    "C": 1024,
-    "D": 1536,
-}
-OUTPUT_REVERSE_READOUT: dict[str, bool] = {
-    "A": False,
-    "B": True,
-    "C": False,
-    "D": True,
-}
+OUTPUT_REVERSE_READOUT: dict[str, bool] = {"A": False, "B": True, "C": False, "D": True}
+
+DEFAULT_2MIN_EXPOSURE_SECONDS: float = 95.04  # 60 frames * 0.8 CRMITEN * 1.98 s
+CRMITEN_BLOCK10_VAR_FACTOR: float = 0.84285
+_ONEDBLACK_CAD_BUCKETS: tuple[int, ...] = (32, 256, 4096)
+_PRESMEAR_WIDTH_BUCKETS: tuple[int, ...] = (16, 64, 512, 1056, 2048)
 
 
-def _build_ccid80_strap_cols_1based_imaging() -> tuple[int, ...]:
-    """Return the 116 TESS CCID-80 routing-strap columns (1-based imaging 1..2048).
+@dataclass(frozen=True)
+class CalibrationConfig:
+    """User-facing configuration for :func:`recalibrate_tpf`."""
 
-    Constructed from TESS Instrument Handbook Table 4.2 / Table A.3 with exact
-    bilateral CCID-80 symmetry ``c <-> 2049 - c``. Add 44 for 1-based FITS
-    ``RAWX`` coordinates (``45..2092``).
-    """
-    left: list[int] = []
-    for base in (77, 205, 333, 461, 589, 717, 845, 973):
-        left.extend((base, base + 1, base + 4, base + 5, base + 8, base + 9))
-    left.extend((516, 517, 520, 521, 524, 525))
-    left.extend((673, 674, 675, 676))
-    left_sorted = sorted(left)
-    right_sorted = sorted(2049 - c for c in left_sorted)
-    return tuple(left_sorted + right_sorted)
-
-
-CCID80_STRAP_COLS_IMAGING_1BASED: tuple[int, ...] = _build_ccid80_strap_cols_1based_imaging()
-CCID80_STRAP_COLS_RAWX_1BASED: np.ndarray = (
-    np.asarray(CCID80_STRAP_COLS_IMAGING_1BASED, dtype=np.int64) + 44
-)
-
-
-def strap_mask_for_rawx_columns(
-    cols_1based: np.ndarray,
-    *,
-    buffer_px: int = 2,
-) -> np.ndarray:
-    """Return boolean strap mask for 1-based FITS ``RAWX`` columns with ``±buffer_px``."""
-    cols = np.asarray(cols_1based, dtype=np.int64)[:, np.newaxis]
-    dist = np.min(np.abs(cols - CCID80_STRAP_COLS_RAWX_1BASED[np.newaxis, :]), axis=1)
-    return np.asarray(dist <= int(buffer_px), dtype=bool)
-
-
-def _build_orthonormal_legendre_basis(n_rows: int, max_degree: int) -> np.ndarray:
-    """Construct discrete orthonormal Legendre basis ``Q`` of shape ``(n_rows, max_degree + 1)``."""
-    x = np.linspace(-1.0, 1.0, n_rows, dtype=np.float64)
-    v = np.polynomial.legendre.legvander(x, max_degree)
-    q, r = np.linalg.qr(v, mode="reduced")
-    signs = np.where(np.diag(r) >= 0.0, 1.0, -1.0)
-    return np.asarray(q * signs[np.newaxis, :], dtype=np.float64)
-
-
-# Precomputed pure-NumPy float64 bases (zero import-time JAX x64 state change):
-_LEGENDRE_Q_SCI_NP: np.ndarray = _build_orthonormal_legendre_basis(2048, 49)  # (2048, 50)
-_LEGENDRE_Q_OV_NP: np.ndarray = _build_orthonormal_legendre_basis(30, 2)  # (30, 3)
+    smear: SmearMode = "automatic"
+    cadence_match: CadenceMatchMode = "cadenceno"
+    missing_cadence: MissingCadenceMode = "nan"
+    cache_dir: str | os.PathLike[str] | None = None
+    ddir: str | os.PathLike[str] | None = None
+    offline: bool = False
+    strict_hpc: bool = False
+    chunk_rows: int = DEFAULT_CHUNK_ROWS
+    verbose: bool = False
 
 
 @dataclass(frozen=True)
@@ -150,15 +122,43 @@ class LinearityChannel:
     coeffs: tuple[float, ...]
 
 
+def _build_ccid80_strap_cols_1based_imaging() -> tuple[int, ...]:
+    left: list[int] = []
+    for base in (77, 205, 333, 461, 589, 717, 845, 973):
+        left.extend((base, base + 1, base + 4, base + 5, base + 8, base + 9))
+    left.extend((516, 517, 520, 521, 524, 525, 673, 674, 675, 676))
+    left_sorted = sorted(left)
+    return tuple(left_sorted + sorted(2049 - c for c in left_sorted))
+
+
+CCID80_STRAP_COLS_IMAGING_1BASED: tuple[int, ...] = _build_ccid80_strap_cols_1based_imaging()
+CCID80_STRAP_COLS_RAWX_1BASED: np.ndarray = (
+    np.asarray(CCID80_STRAP_COLS_IMAGING_1BASED, dtype=np.int64) + 44
+)
+
+
+def strap_mask_for_rawx_columns(cols_1based: np.ndarray, *, buffer_px: int = 2) -> np.ndarray:
+    """Return boolean strap mask for 1-based FITS ``RAWX`` columns with ``±buffer_px``."""
+    cols = np.asarray(cols_1based, dtype=np.int64)[:, np.newaxis]
+    dist = np.min(np.abs(cols - CCID80_STRAP_COLS_RAWX_1BASED[np.newaxis, :]), axis=1)
+    return np.asarray(dist <= int(buffer_px), dtype=bool)
+
+
+def _build_orthonormal_legendre_basis(n_rows: int, max_degree: int) -> np.ndarray:
+    x = np.linspace(-1.0, 1.0, n_rows, dtype=np.float64)
+    q, r = np.linalg.qr(np.polynomial.legendre.legvander(x, max_degree), mode="reduced")
+    return np.asarray(q * np.where(np.diag(r) >= 0.0, 1.0, -1.0)[np.newaxis, :], dtype=np.float64)
+
+
+_LEGENDRE_Q_SCI_NP: np.ndarray = _build_orthonormal_legendre_basis(2048, 49)
+_LEGENDRE_Q_OV_NP: np.ndarray = _build_orthonormal_legendre_basis(30, 2)
+
+
 def load_linearity_channel(
-    xml_path: str | os.PathLike[str],
-    camera: int,
-    ccd: int,
-    output: str,
+    xml_path: str | os.PathLike[str], camera: int, ccd: int, output: str
 ) -> LinearityChannel:
     """Parse ``linearityPoly`` parameters (including ``maxDomain``) from ``linearity.xml``."""
-    tree = ET.parse(Path(xml_path))
-    root = tree.getroot()
+    root = ET.parse(Path(xml_path)).getroot()
     xpath = (
         f".//*[@cameraNumber='{int(camera)}']"
         f"[@ccdNumber='{int(ccd)}']"
@@ -212,6 +212,13 @@ def load_undershoot_coeff(camera: int, ccd: int, output: str) -> float:
     return float(node.attrib["undershoot"])
 
 
+def _hdr_lookup(key: str, *headers: fits.Header | None) -> Any:
+    for hdr in headers:
+        if hdr is not None and key in hdr:
+            return hdr[key]
+    return None
+
+
 def effective_frame_count(
     hdr0: fits.Header | None,
     hdr1: fits.Header | None,
@@ -219,88 +226,24 @@ def effective_frame_count(
     fallback_hdr0: fits.Header | None = None,
     fallback_hdr1: fits.Header | None = None,
 ) -> float:
-    """Compute effective co-added frame count ``N_eff = factor * NUM_FRM`` from FITS headers.
-
-    Supports both 2-minute cosmic-ray-mitigated data (``CRMITEN=True``, trimming 2
-    extrema per ``CRBLKSZ``-frame block) and 20-second fast data (``CRMITEN=False``,
-    ``factor = 1.0``). Reads independently from science or collateral headers, using
-    ``fallback_hdr*`` only when minimal synthetic collateral tables omit keywords.
-    """
-
-    def _lookup(key: str) -> Any:
-        for hdr in (hdr0, hdr1, fallback_hdr0, fallback_hdr1):
-            if hdr is not None and key in hdr:
-                return hdr[key]
-        return None
-
-    crmiten_raw = _lookup("CRMITEN")
-    crmiten = bool(crmiten_raw) if crmiten_raw is not None else False
+    """Compute effective co-added frame count ``N_eff = factor * NUM_FRM`` from FITS headers."""
+    hdrs = (hdr0, hdr1, fallback_hdr0, fallback_hdr1)
+    crmiten = bool(_hdr_lookup("CRMITEN", *hdrs) or False)
     if crmiten:
-        crblksz_raw = _lookup("CRBLKSZ")
+        crblksz_raw = _hdr_lookup("CRBLKSZ", *hdrs)
         crblksz = float(crblksz_raw) if crblksz_raw is not None else 10.0
         if crblksz <= 2.0:
             raise ValueError(f"Invalid CRBLKSZ={crblksz} with CRMITEN=True.")
         factor = (crblksz - 2.0) / crblksz
     else:
         factor = 1.0
-
-    num_frm_raw = _lookup("NUM_FRM")
+    num_frm_raw = _hdr_lookup("NUM_FRM", *hdrs)
     if num_frm_raw is None:
         raise KeyError("Missing NUM_FRM keyword in FITS headers.")
     num_frm = float(num_frm_raw)
     if num_frm <= 0.0:
         raise ValueError(f"NUM_FRM must be positive, got {num_frm}.")
     return factor * num_frm
-
-
-# Exact variance of the sample median of n i.i.d. N(0, 1) variates for 1 <= n <= 20
-# (averaging order statistics X_{(m)} and X_{(m+1)} for even n = 2m); at n = 10 TESS
-# smear rows, Var(median) = 0.138326435836 vs asymptotic pi / (2n) = 0.157079632679.
-# See https://en.wikipedia.org/wiki/Median#Sampling_distribution
-_UNIT_NORMAL_MEDIAN_VAR_1_TO_20: np.ndarray = np.array(
-    [
-        1.0,  # n = 0 guard
-        1.000000000000,  # n = 1
-        0.500000000000,  # n = 2
-        0.448671104578,  # n = 3
-        0.298199618435,  # n = 4
-        0.286833661606,  # n = 5
-        0.214742666582,  # n = 6
-        0.210446861535,  # n = 7
-        0.168180855159,  # n = 8
-        0.166101281359,  # n = 9
-        0.138326435836,  # n = 10
-        0.137162433548,  # n = 11
-        0.117516187119,  # n = 12
-        0.116798995001,  # n = 13
-        0.102167836796,  # n = 14
-        0.101694652082,  # n = 15
-        0.090375211225,  # n = 16
-        0.090046581423,  # n = 17
-        0.081028510053,  # n = 18
-        0.080790975073,  # n = 19
-        0.073437027705,  # n = 20
-    ],
-    dtype=np.float64,
-)
-
-# Variance ratio of the symmetric 8-of-10 truncated mean of i.i.d. N(0, 1) frames
-# (0.105356 * sigma^2; Sarhan & Greenberg 1956) relative to an untrimmed 8-frame mean
-# (sigma^2 / 8 = 0.125 * sigma^2): 8 * 0.105356 = 0.84285.
-# See https://en.wikipedia.org/wiki/Truncated_mean#Statistical_issues
-CRMITEN_BLOCK10_VAR_FACTOR: float = 0.84285
-
-
-def _unit_normal_median_variance(n: np.ndarray | int) -> np.ndarray:
-    """Return exact unit-normal sample-median variance for ``1 <= n <= 20`` and ``pi / (2n)`` above.
-
-    See `Median — Sampling distribution <https://en.wikipedia.org/wiki/Median#Sampling_distribution>`_.
-    """
-    n_arr = np.maximum(np.asarray(n, dtype=np.int64), 1)
-    clipped = np.minimum(n_arr, 20)
-    exact = _UNIT_NORMAL_MEDIAN_VAR_1_TO_20[clipped]
-    asymptotic = np.pi / (2.0 * n_arr.astype(np.float64))
-    return np.where(n_arr <= 20, exact, asymptotic)
 
 
 def _crmiten_variance_factor(
@@ -310,108 +253,70 @@ def _crmiten_variance_factor(
     fallback_hdr0: fits.Header | None = None,
     fallback_hdr1: fits.Header | None = None,
 ) -> float:
-    """Return order-statistic variance factor for onboard ``CRMITEN`` cosmic-ray trimming.
-
-    When ``CRMITEN=True`` and ``int(CRBLKSZ) == 10``, TESS discards the minimum and
-    maximum of each 10-frame block and sums the middle 8 frames, scaling Gaussian /
-    high-count frame-mean variance by ``8 * 0.105356 = 0.84285`` relative to ``1 / N_eff``
-    (`truncated mean <https://en.wikipedia.org/wiki/Truncated_mean#Statistical_issues>`_,
-    Sarhan & Greenberg 1956). Returns ``1.0`` otherwise.
-    """
-
-    def _lookup(key: str) -> Any:
-        for hdr in (hdr0, hdr1, fallback_hdr0, fallback_hdr1):
-            if hdr is not None and key in hdr:
-                return hdr[key]
-        return None
-
-    crmiten_raw = _lookup("CRMITEN")
-    crmiten = bool(crmiten_raw) if crmiten_raw is not None else False
-    if not crmiten:
+    hdrs = (hdr0, hdr1, fallback_hdr0, fallback_hdr1)
+    if not bool(_hdr_lookup("CRMITEN", *hdrs) or False):
         return 1.0
-    crblksz_raw = _lookup("CRBLKSZ")
+    crblksz_raw = _hdr_lookup("CRBLKSZ", *hdrs)
     crblksz = int(round(float(crblksz_raw))) if crblksz_raw is not None else 10
-    if crblksz == 10:
-        return CRMITEN_BLOCK10_VAR_FACTOR
-    return 1.0
-
-
-TESS_PARALLEL_SHIFTS: int = 2058  # 2048 imaging rows + 10 lower buffer rows into frame-store
-DEFAULT_2MIN_EXPOSURE_SECONDS: float = 95.04  # 60 frames * 0.8 CRMITEN * 1.98 s
+    return CRMITEN_BLOCK10_VAR_FACTOR if crblksz == 10 else 1.0
 
 
 def _frame_transfer_row_weight(
     hdr0: fits.Header | None = None,
     hdr1: fits.Header | None = None,
 ) -> float:
-    """Return dimensionless shutterless row-smear ratio ``t_row / int_time``.
-
-    Uses ``READTIME / (INT_TIME * TESS_PARALLEL_SHIFTS)`` directly whenever both
-    positive cards exist in ``hdr1``/``hdr0``. Only falls back to ``DEADC`` when
-    ``READTIME`` or ``INT_TIME`` is absent, removing the digital ``CRMITEN`` duty-cycle
-    factor ``(CRBLKSZ - 2) / CRBLKSZ`` so SPOC's ``DEADC = 0.792`` is not treated as
-    parallel frame-transfer readout time.
-    """
-    readtime: float | None = None
-    int_time: float | None = None
+    """Return dimensionless shutterless row-smear ratio ``t_row / int_time``."""
+    readtime, int_time = None, None
     for hdr in (hdr1, hdr0):
-        if hdr is not None and readtime is None and "READTIME" in hdr:
+        if hdr is None:
+            continue
+        if readtime is None and "READTIME" in hdr:
             with contextlib.suppress(TypeError, ValueError):
-                val = float(hdr["READTIME"])
-                if np.isfinite(val) and val > 0.0:
-                    readtime = val
-        if hdr is not None and int_time is None and "INT_TIME" in hdr:
+                v = float(hdr["READTIME"])
+                if np.isfinite(v) and v > 0.0:
+                    readtime = v
+        if int_time is None and "INT_TIME" in hdr:
             with contextlib.suppress(TypeError, ValueError):
-                val = float(hdr["INT_TIME"])
-                if np.isfinite(val) and val > 0.0:
-                    int_time = val
+                v = float(hdr["INT_TIME"])
+                if np.isfinite(v) and v > 0.0:
+                    int_time = v
     if readtime is not None and int_time is not None:
         return float(readtime / (int_time * float(TESS_PARALLEL_SHIFTS)))
 
-    crmiten = False
-    for hdr in (hdr0, hdr1):
-        if hdr is not None and "CRMITEN" in hdr:
-            crmiten = bool(hdr["CRMITEN"])
-            break
     cr_factor = 1.0
-    if crmiten:
+    if bool(_hdr_lookup("CRMITEN", hdr0, hdr1) or False):
+        raw_blk = _hdr_lookup("CRBLKSZ", hdr0, hdr1)
         crblksz = 10.0
-        for hdr in (hdr0, hdr1):
-            if hdr is not None and "CRBLKSZ" in hdr:
-                with contextlib.suppress(TypeError, ValueError):
-                    val = float(hdr["CRBLKSZ"])
-                    if np.isfinite(val) and val > 2.0:
-                        crblksz = val
-                        break
+        if raw_blk is not None:
+            with contextlib.suppress(TypeError, ValueError):
+                v = float(raw_blk)
+                if np.isfinite(v) and v > 2.0:
+                    crblksz = v
         cr_factor = (crblksz - 2.0) / crblksz
 
     deadc = 0.99
     for hdr in (hdr1, hdr0):
         if hdr is not None and "DEADC" in hdr:
             with contextlib.suppress(TypeError, ValueError):
-                val = float(hdr["DEADC"])
-                if np.isfinite(val) and 0.0 < val < 1.0:
-                    adj = val / cr_factor
+                v = float(hdr["DEADC"])
+                if np.isfinite(v) and 0.0 < v < 1.0:
+                    adj = v / cr_factor
                     if 0.5 < adj < 1.0:
                         deadc = adj
                         break
-                    if 0.5 < val < 1.0:
-                        deadc = val
+                    if 0.5 < v < 1.0:
+                        deadc = v
                         break
     return float((1.0 - deadc) / (deadc * float(TESS_PARALLEL_SHIFTS)))
 
 
 def _extract_positive_int_card(hdr: fits.Header | None, keys: tuple[str, ...]) -> int | None:
-    """Return the first positive finite integer card from ``keys`` in ``hdr``."""
     if hdr is None:
         return None
     for key in keys:
-        if key in hdr:
-            raw = hdr[key]
-            if isinstance(raw, bool | np.bool_):
-                continue
+        if key in hdr and not isinstance(hdr[key], bool | np.bool_):
             with contextlib.suppress(TypeError, ValueError):
-                val = float(raw)
+                val = float(hdr[key])
                 if np.isfinite(val) and val > 0.0:
                     return int(round(val))
     return None
@@ -423,41 +328,28 @@ def _stamp_ccd_origin_1based(
     *,
     default: tuple[int, int] | None = None,
 ) -> tuple[int, int]:
-    """Resolve 1-based CCD ``(col0, row0)``, preferring ``HDU[1]`` ``1CRV5P``/``2CRV5P``.
-
-    ``Lightkurve.cutout()`` updates table WCS keywords ``1CRV*P``/``2CRV*P`` in
-    ``HDU[1]`` without updating ``CRVAL1P``/``CRVAL2P`` in ``HDU[2]`` (``APERTURE``).
-    Preferring ``1CRV5P``/``2CRV5P`` (then ``1CRV4P``/``2CRV4P``) before
-    ``CRVAL1P``/``CRVAL2P`` ensures accurate CCD slicing on cutout TPFs.
-    """
-    col0 = _extract_positive_int_card(hdr1, ("1CRV5P", "1CRV4P"))
+    """Resolve 1-based CCD ``(col0, row0)``, preferring ``HDU[1]`` ``1CRV5P``/``2CRV5P``."""
+    col0 = _extract_positive_int_card(hdr1, ("1CRV5P", "1CRV4P")) or _extract_positive_int_card(
+        hdr2, ("CRVAL1P",)
+    )
+    row0 = _extract_positive_int_card(hdr1, ("2CRV5P", "2CRV4P")) or _extract_positive_int_card(
+        hdr2, ("CRVAL2P",)
+    )
     if col0 is None:
-        col0 = _extract_positive_int_card(hdr2, ("CRVAL1P",))
-    row0 = _extract_positive_int_card(hdr1, ("2CRV5P", "2CRV4P"))
-    if row0 is None:
-        row0 = _extract_positive_int_card(hdr2, ("CRVAL2P",))
-    if col0 is None:
-        if default is not None:
-            col0 = int(default[0])
-        else:
+        if default is None:
             raise KeyError("Missing CCD column origin ('1CRV5P', '1CRV4P', or 'CRVAL1P').")
+        col0 = int(default[0])
     if row0 is None:
-        if default is not None:
-            row0 = int(default[1])
-        else:
+        if default is None:
             raise KeyError("Missing CCD row origin ('2CRV5P', '2CRV4P', or 'CRVAL2P').")
+        row0 = int(default[1])
     return col0, row0
 
 
 def _sync_stamp_ccd_origin(
-    hdr1: fits.Header | None,
-    hdr2: fits.Header | None,
-    col0_1based: int,
-    row0_1based: int,
+    hdr1: fits.Header | None, hdr2: fits.Header | None, col0_1based: int, row0_1based: int
 ) -> None:
-    """Synchronize all ``1CRV{k}P``/``2CRV{k}P`` cards in ``hdr1`` and ``CRVAL1P``/``2P``."""
-    col_i = int(col0_1based)
-    row_i = int(row0_1based)
+    col_i, row_i = int(col0_1based), int(row0_1based)
     if hdr1 is not None:
         for key in list(hdr1.keys()):
             if len(key) >= 6 and key.endswith("P") and key[1:4] == "CRV" and key[4:-1].isdigit():
@@ -484,40 +376,27 @@ def _source_mask_digest(source_mask_2d: np.ndarray | None) -> str:
 
 
 def _effective_exposure_seconds(
-    hdr0: fits.Header | None,
-    hdr1: fits.Header | None,
+    hdr0: fits.Header | None, hdr1: fits.Header | None
 ) -> float:
-    """Derive effective per-cadence integration time (seconds) from TESS FITS headers."""
-    int_time: float | None = None
-    for hdr in (hdr1, hdr0):
-        if hdr is not None and "INT_TIME" in hdr:
-            with contextlib.suppress(TypeError, ValueError):
-                val = float(hdr["INT_TIME"])
-                if val > 0.0:
-                    int_time = val
-                    break
-
-    has_num_frm = any(hdr is not None and "NUM_FRM" in hdr for hdr in (hdr1, hdr0))
-    if int_time is not None and has_num_frm:
+    int_time = _hdr_lookup("INT_TIME", hdr1, hdr0)
+    if int_time is not None and _hdr_lookup("NUM_FRM", hdr1, hdr0) is not None:
         with contextlib.suppress(KeyError, TypeError, ValueError):
-            return float(effective_frame_count(hdr0, hdr1) * int_time)
-
+            val = float(int_time)
+            if val > 0.0:
+                return float(effective_frame_count(hdr0, hdr1) * val)
     deadc = 0.99
-    for hdr in (hdr1, hdr0):
-        if hdr is not None and "DEADC" in hdr:
-            with contextlib.suppress(TypeError, ValueError):
-                val = float(hdr["DEADC"])
-                if 0.0 < val <= 1.0:
-                    deadc = val
-                    break
-
-    for hdr in (hdr1, hdr0):
-        if hdr is not None and "TIMEDEL" in hdr:
-            with contextlib.suppress(TypeError, ValueError):
-                dt_days = float(hdr["TIMEDEL"])
-                if dt_days > 0.0:
-                    return float(dt_days * 86400.0 * deadc)
-
+    deadc_raw = _hdr_lookup("DEADC", hdr1, hdr0)
+    if deadc_raw is not None:
+        with contextlib.suppress(TypeError, ValueError):
+            v = float(deadc_raw)
+            if 0.0 < v <= 1.0:
+                deadc = v
+    timedel_raw = _hdr_lookup("TIMEDEL", hdr1, hdr0)
+    if timedel_raw is not None:
+        with contextlib.suppress(TypeError, ValueError):
+            dt_days = float(timedel_raw)
+            if dt_days > 0.0:
+                return float(dt_days * 86400.0 * deadc)
     return DEFAULT_2MIN_EXPOSURE_SECONDS
 
 
@@ -536,6 +415,34 @@ def output_for_rawx_col(col_1based: int) -> str:
     )
 
 
+def _compute_quality_mask(
+    hdu1: fits.BinTableHDU,
+    *,
+    quality_bitmask: Any = "default",
+    target_obj: Any = None,
+) -> np.ndarray:
+    """Return boolean ``(N_raw,)`` mask of cadences passing ``QUALITY`` bitmask checks."""
+    n_raw = len(hdu1.data)
+    if target_obj is not None:
+        qmask_attr = getattr(target_obj, "quality_mask", None)
+        if qmask_attr is not None:
+            arr = np.asarray(qmask_attr, dtype=bool)
+            if arr.shape == (n_raw,):
+                return arr
+
+    if "QUALITY" not in (hdu1.data.names or ()) or quality_bitmask in (None, 0, "none"):
+        return np.ones(n_raw, dtype=bool)
+
+    qual = np.asarray(hdu1.data["QUALITY"], dtype=np.int64)
+    try:
+        return np.asarray(
+            lk.utils.TessQualityFlags.create_quality_mask(qual, bitmask=quality_bitmask),
+            dtype=bool,
+        )
+    except Exception:
+        return qual == 0
+
+
 def match_cadenceno(
     tpf_cadenceno: np.ndarray,
     col_cadenceno: np.ndarray,
@@ -543,32 +450,10 @@ def match_cadenceno(
     cadence_match: CadenceMatchMode = "cadenceno",
     label: str = "collateral",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Align TPF cadences to a collateral or ``-blf.fits`` table.
-
-    Parameters
-    ----------
-    tpf_cadenceno : np.ndarray
-        1D integer ``CADENCENO`` array from ``tpf.hdu[1].data["CADENCENO"]``.
-    col_cadenceno : np.ndarray
-        1D integer ``CADENCENO`` array from collateral or ``-blf.fits`` table.
-    cadence_match : {"cadenceno", "positional"}, default "cadenceno"
-        Exact integer ``CADENCENO`` lookup (``"cadenceno"``) or legacy row-index
-        pairing (``"positional"``).
-    label : str
-        Human-readable table description for error messages.
-
-    Returns
-    -------
-    matched : np.ndarray
-        Boolean mask ``(N_tpf,)`` of matched TPF rows.
-    col_idx : np.ndarray
-        ``int64`` index ``(N_tpf,)`` into ``col_cadenceno`` (``-1`` where unmatched).
-    """
+    """Align TPF cadences to a collateral or ``-blf.fits`` table."""
     tpf_cad = np.asarray(tpf_cadenceno, dtype=np.int64)
     col_cad = np.asarray(col_cadenceno, dtype=np.int64)
-    n_tpf = len(tpf_cad)
-    n_col = len(col_cad)
-
+    n_tpf, n_col = len(tpf_cad), len(col_cad)
     if n_tpf == 0:
         raise ValueError("TPF contains zero cadences.")
     if n_col == 0:
@@ -593,16 +478,13 @@ def match_cadenceno(
     in_bounds = (pos >= 0) & (pos < n_col)
     safe_pos = np.where(in_bounds, pos, 0)
     matched = in_bounds & (sorted_col[safe_pos] == tpf_cad)
-
     if not np.any(matched):
         t_rng = f"{int(tpf_cad.min())}..{int(tpf_cad.max())}"
         c_rng = f"{int(col_cad.min())}..{int(col_cad.max())}"
         raise ValueError(
             f"Zero matching CADENCENO rows between TPF ({t_rng}) and {label} ({c_rng})."
         )
-
-    col_idx = np.where(matched, order[safe_pos], -1).astype(np.int64)
-    return matched, col_idx
+    return matched, np.where(matched, order[safe_pos], -1).astype(np.int64)
 
 
 def _enforce_missing_cadence_policy(
@@ -611,108 +493,90 @@ def _enforce_missing_cadence_policy(
     *,
     missing_cadence: MissingCadenceMode,
 ) -> int:
-    """Validate or warn on unmatched TPF cadences and return ``n_missing``."""
     if missing_cadence not in ("nan", "error"):
         raise ValueError(
             f"Invalid missing_cadence={missing_cadence!r}; expected 'nan' or 'error'."
         )
-
-    n_tpf = len(tpf_cadenceno)
-    n_matched = int(np.sum(combined_matched))
+    n_tpf, n_matched = len(tpf_cadenceno), int(np.sum(combined_matched))
     if n_matched == 0:
         raise ValueError(
             "Zero TPF cadences have complete collateral CADENCENO coverage across outputs."
         )
-
     n_missing = n_tpf - n_matched
     if n_missing == 0:
         return 0
-
     missing_cads = np.asarray(tpf_cadenceno, dtype=np.int64)[~combined_matched]
-    c_min = int(missing_cads.min())
-    c_max = int(missing_cads.max())
     msg = (
         f"{n_missing} / {n_tpf} TPF cadences lack matching collateral CADENCENO "
-        f"(missing CADENCENO range {c_min}..{c_max})"
+        f"(missing CADENCENO range {int(missing_cads.min())}..{int(missing_cads.max())})"
     )
     if missing_cadence == "error":
         raise ValueError(f"{msg}.")
-
-    warnings.warn(
-        f"{msg}; masking unmatched cadences to NaN.",
-        UserWarning,
-        stacklevel=3,
-    )
+    warnings.warn(f"{msg}; masking unmatched cadences to NaN.", UserWarning, stacklevel=3)
     return n_missing
 
 
-def _repair_partial_onedblack_cadence(
-    y_cad: np.ndarray,
-    q_sci_np: np.ndarray,
-    q_ov_np: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Exact masked Cholesky-Legendre least-squares fit for a cadence with ``NaN`` row gaps.
+# ---------------------------------------------------------------------------
+# 1D-black Legendre fitting & fused causal LDE undershoot + linearity
+# ---------------------------------------------------------------------------
 
-    Orthonormalizes the Legendre basis over observed finite rows via lower-triangular
-    Cholesky factorization ``G = Q_m^T Q_m = L L^T`` so ``Phi = Q L^{-T}`` preserves
-    nested polynomial subspaces ``P_0 subset ... subset P_49`` without Gibbs ringing,
-    uses true finite-row counts in AIC and residual ``dof``, and propagates exact
-    row leverage ``sum_{j<=k} (L^{-1} Q^T)_{j,r}^2`` across observed and gap rows.
-    """
+
+def _repair_partial_onedblack_cadence(
+    y_cad: np.ndarray, q_sci_np: np.ndarray, q_ov_np: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Exact masked Cholesky-Legendre least-squares fit for a cadence with ``NaN`` row gaps."""
     y_sci = y_cad[:2048]
     m_sci = np.isfinite(y_sci)
     n_fin = int(np.sum(m_sci))
     if n_fin < 64:
         return np.full(2078, np.nan, dtype=np.float64), np.full(2078, np.nan, dtype=np.float64)
 
-    q_m = q_sci_np[m_sci]  # (n_fin, 50)
-    y_m = y_sci[m_sci]  # (n_fin,)
-    gram = q_m.T @ q_m + 1e-14 * np.eye(50, dtype=np.float64)
-    chol_l = sp_linalg.cholesky(gram, lower=True, check_finite=False)
+    q_m, y_m = q_sci_np[m_sci], y_sci[m_sci]
+    chol_l = sp_linalg.cholesky(
+        q_m.T @ q_m + 1e-14 * np.eye(50, dtype=np.float64), lower=True, check_finite=False
+    )
     z_orth = sp_linalg.solve_triangular(chol_l, q_m.T @ y_m, lower=True, check_finite=False)
     c_full = sp_linalg.solve_triangular(chol_l.T, z_orth, lower=False, check_finite=False)
-
     res_full = y_m - q_m @ c_full
     norm_perp_sq = float(np.dot(res_full, res_full))
 
-    z_sq = z_orth * z_orth
-    suffix_excl = np.cumsum(z_sq[::-1])[::-1]
+    suffix_excl = np.cumsum((z_orth * z_orth)[::-1])[::-1]
     tail_all = np.concatenate([suffix_excl[1:], np.zeros(1, dtype=np.float64)])
     rss_20_49 = norm_perp_sq + tail_all[20:50]
 
     n_f = float(n_fin)
     max_deg = min(49, max(20, (n_fin // 2) - 1))
     ks = np.arange(20, 50, dtype=np.float64)
-    aics = 2.0 * (ks + 1.0) + n_f * np.log(np.maximum(rss_20_49 / n_f, 1e-30))
-    aics = np.where(ks <= float(max_deg), aics, np.inf)
-
+    aics = np.where(
+        ks <= float(max_deg),
+        2.0 * (ks + 1.0) + n_f * np.log(np.maximum(rss_20_49 / n_f, 1e-30)),
+        np.inf,
+    )
     best_rel = int(np.argmin(aics))
     best_k = best_rel + 20
-    z_sel = np.where(np.arange(50) <= best_k, z_orth, 0.0)
-    c_sel = sp_linalg.solve_triangular(chol_l.T, z_sel, lower=False, check_finite=False)
+    c_sel = sp_linalg.solve_triangular(
+        chol_l.T, np.where(np.arange(50) <= best_k, z_orth, 0.0), lower=False, check_finite=False
+    )
     b1d_sci = q_sci_np @ c_sel
-
-    best_rss = float(rss_20_49[best_rel])
-    dof_sci = max(n_f - float(best_k + 1), 1.0)
-    sigma2_sci = best_rss / dof_sci
+    sigma2_sci = float(rss_20_49[best_rel]) / max(n_f - float(best_k + 1), 1.0)
     v_t = sp_linalg.solve_triangular(
         chol_l[: best_k + 1, : best_k + 1],
         q_sci_np[:, : best_k + 1].T,
         lower=True,
         check_finite=False,
     )
-    lev_sci = np.sum(v_t * v_t, axis=0)
-    err_sci = np.sqrt(np.maximum(sigma2_sci * lev_sci, 0.0))
+    err_sci = np.sqrt(np.maximum(sigma2_sci * np.sum(v_t * v_t, axis=0), 0.0))
 
-    # Collateral rows 2048..2077 (masked degree-2 Legendre fit)
     y_ov = y_cad[2048:2078]
     m_ov = np.isfinite(y_ov)
     n_ov = int(np.sum(m_ov))
     if n_ov >= 6:
-        q_ov_m = q_ov_np[m_ov]
-        y_ov_m = y_ov[m_ov]
-        gram_ov = q_ov_m.T @ q_ov_m + 1e-14 * np.eye(3, dtype=np.float64)
-        chol_ov = sp_linalg.cholesky(gram_ov, lower=True, check_finite=False)
+        q_ov_m, y_ov_m = q_ov_np[m_ov], y_ov[m_ov]
+        chol_ov = sp_linalg.cholesky(
+            q_ov_m.T @ q_ov_m + 1e-14 * np.eye(3, dtype=np.float64),
+            lower=True,
+            check_finite=False,
+        )
         z_ov = sp_linalg.solve_triangular(
             chol_ov, q_ov_m.T @ y_ov_m, lower=True, check_finite=False
         )
@@ -725,61 +589,45 @@ def _repair_partial_onedblack_cadence(
     else:
         b1d_ov = np.full(30, b1d_sci[-1], dtype=np.float64)
         err_ov = np.full(30, err_sci[-1], dtype=np.float64)
-
     return np.concatenate([b1d_sci, b1d_ov]), np.concatenate([err_sci, err_ov])
 
 
 @jax.jit
 def _fit_onedblack_legendre_jit(
-    tv_debiased_adu: jax.Array,
-    q_sci: jax.Array,
-    q_ov: jax.Array,
+    tv_debiased_adu: jax.Array, q_sci: jax.Array, q_ov: jax.Array
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """JIT-compiled 64-bit orthonormal Legendre 1D-black solver for ``(N_c, 2078, 11)``."""
-    # Exclude leading settling virtual columns 0..2 and trailing column 10 -> keep 3..9
-    v_clean = tv_debiased_adu[:, :, 3:10]  # (N_c, 2078, 7)
-
-    # Row-wise 5-sigma cosmic-ray rejection across the 7 clean virtual columns
-    row_med = jnp.nanmedian(v_clean, axis=2, keepdims=True)
-    abs_dev = jnp.abs(v_clean - row_med)
+    v_clean = tv_debiased_adu[:, :, 3:10]
+    abs_dev = jnp.abs(v_clean - jnp.nanmedian(v_clean, axis=2, keepdims=True))
     row_mad = 1.4826 * jnp.nanmedian(abs_dev, axis=2, keepdims=True)
     global_mad = 1.4826 * jnp.nanmedian(abs_dev, axis=(1, 2), keepdims=True)
-    sigma_floor = jnp.maximum(global_mad, 1e-6)
-    sigma_row = jnp.maximum(row_mad, sigma_floor)
+    sigma_row = jnp.maximum(row_mad, jnp.maximum(global_mad, 1e-6))
 
     valid_pix = jnp.isfinite(v_clean) & (abs_dev <= 5.0 * sigma_row)
-    # Fallback to all finite pixels in a row if every column was rejected
-    any_valid = jnp.any(valid_pix, axis=2, keepdims=True)
-    use_pix = jnp.where(any_valid, valid_pix, jnp.isfinite(v_clean))
+    use_pix = jnp.where(jnp.any(valid_pix, axis=2, keepdims=True), valid_pix, jnp.isfinite(v_clean))
     count_pix = jnp.sum(use_pix, axis=2)
-    y_all = jnp.sum(jnp.where(use_pix, v_clean, 0.0), axis=2) / jnp.maximum(count_pix, 1)
-    y_all = jnp.where(count_pix > 0, y_all, jnp.nan)  # (N_c, 2078)
+    y_all = jnp.where(
+        count_pix > 0,
+        jnp.sum(jnp.where(use_pix, v_clean, 0.0), axis=2) / jnp.maximum(count_pix, 1),
+        jnp.nan,
+    )
 
-    y_sci_raw = y_all[:, :2048]
-    m_sci = jnp.isfinite(y_sci_raw)
+    y_sci_raw, y_ov_raw = y_all[:, :2048], y_all[:, 2048:2078]
+    m_sci, m_ov = jnp.isfinite(y_sci_raw), jnp.isfinite(y_ov_raw)
     n_fin_sci = jnp.sum(m_sci, axis=1)
     cad_valid = n_fin_sci >= 64
+    needs_repair = cad_valid & ((n_fin_sci < 2048) | (jnp.sum(m_ov, axis=1) < 30))
 
-    y_ov_raw = y_all[:, 2048:2078]
-    m_ov = jnp.isfinite(y_ov_raw)
-    n_fin_ov = jnp.sum(m_ov, axis=1)
-
-    # Flag cadences that are valid (>= 64 rows) yet have missing interior rows (< 2048 or < 30)
-    needs_masked_repair = cad_valid & ((n_fin_sci < 2048) | (n_fin_ov < 30))
-
-    # Fast exact orthonormal projection for complete cadences (zero Cholesky XLA trace!)
     y_sci = jnp.where(m_sci, y_sci_raw, 0.0)
-    coeffs = y_sci @ q_sci  # (N_c, 50)
+    coeffs = y_sci @ q_sci
     y_perp = y_sci - coeffs @ q_sci.T
-    norm_perp_sq = jnp.sum(y_perp * y_perp, axis=1)  # (N_c,)
+    norm_perp_sq = jnp.sum(y_perp * y_perp, axis=1)
 
-    c_sq = coeffs * coeffs
-    suffix_excl = jnp.cumsum(c_sq[:, ::-1], axis=1)[:, ::-1]
+    suffix_excl = jnp.cumsum((coeffs * coeffs)[:, ::-1], axis=1)[:, ::-1]
     tail_all = jnp.concatenate(
-        [suffix_excl[:, 1:], jnp.zeros((coeffs.shape[0], 1), dtype=coeffs.dtype)],
-        axis=1,
+        [suffix_excl[:, 1:], jnp.zeros((coeffs.shape[0], 1), dtype=coeffs.dtype)], axis=1
     )
-    rss_20_49 = norm_perp_sq[:, None] + tail_all[:, 20:50]  # (N_c, 30)
+    rss_20_49 = norm_perp_sq[:, None] + tail_all[:, 20:50]
 
     ks = jnp.arange(20, 50, dtype=coeffs.dtype)[None, :]
     n_rows_f = jnp.asarray(2048.0, dtype=coeffs.dtype)
@@ -787,63 +635,43 @@ def _fit_onedblack_legendre_jit(
     best_rel = jnp.argmin(aics, axis=1)
     best_k = best_rel + 20
 
-    deg_idx = jnp.arange(50)[None, :]
-    coeffs_sel = jnp.where(deg_idx <= best_k[:, None], coeffs, 0.0)
-    b1d_sci = coeffs_sel @ q_sci.T
-
+    b1d_sci = jnp.where(jnp.arange(50)[None, :] <= best_k[:, None], coeffs, 0.0) @ q_sci.T
     best_rss = jnp.take_along_axis(rss_20_49, best_rel[:, None], axis=1)[:, 0]
-    dof_sci = jnp.maximum(n_rows_f - (best_k.astype(coeffs.dtype) + 1.0), 1.0)
-    sigma2_sci = best_rss / dof_sci
-    q_sci_sq_cum = jnp.cumsum(q_sci * q_sci, axis=1)
-    lev_sci = jnp.take(q_sci_sq_cum, best_k, axis=1).T
+    sigma2_sci = best_rss / jnp.maximum(n_rows_f - (best_k.astype(coeffs.dtype) + 1.0), 1.0)
+    lev_sci = jnp.take(jnp.cumsum(q_sci * q_sci, axis=1), best_k, axis=1).T
     err_sci = jnp.sqrt(jnp.maximum(sigma2_sci[:, None] * lev_sci, 0.0))
 
     y_ov = jnp.where(m_ov, y_ov_raw, 0.0)
-    c_ov = y_ov @ q_ov  # (N_c, 3)
-    b1d_ov = c_ov @ q_ov.T
+    b1d_ov = (y_ov @ q_ov) @ q_ov.T
     res_ov = y_ov - b1d_ov
-    rss_ov = jnp.sum(res_ov * res_ov, axis=1)
-    sigma2_ov = rss_ov / 27.0
-    lev_ov = jnp.sum(q_ov * q_ov, axis=1)[None, :]
-    err_ov = jnp.sqrt(jnp.maximum(sigma2_ov[:, None] * lev_ov, 0.0))
+    sigma2_ov = jnp.sum(res_ov * res_ov, axis=1) / 27.0
+    err_ov = jnp.sqrt(jnp.maximum(sigma2_ov[:, None] * jnp.sum(q_ov * q_ov, axis=1)[None, :], 0.0))
 
-    b1d_full = jnp.concatenate([b1d_sci, b1d_ov], axis=1)
-    err_full = jnp.concatenate([err_sci, err_ov], axis=1)
-    b1d_out = jnp.where(cad_valid[:, None], b1d_full, jnp.nan)
-    err_out = jnp.where(cad_valid[:, None], err_full, jnp.nan)
-    return b1d_out, err_out, y_all, needs_masked_repair
-
-
-_ONEDBLACK_CAD_BUCKETS: tuple[int, ...] = (32, 256, 4096)
-_PRESMEAR_WIDTH_BUCKETS: tuple[int, ...] = (16, 64, 512, 1056, 2048)
-_HUBER_ROW_BUCKETS: tuple[int, ...] = (64, 256, 2048)
-
-
-def _select_bucket(size: int, buckets: tuple[int, ...]) -> int:
-    for b in buckets:
-        if size <= b:
-            return b
-    return size
+    return (
+        jnp.where(cad_valid[:, None], jnp.concatenate([b1d_sci, b1d_ov], axis=1), jnp.nan),
+        jnp.where(cad_valid[:, None], jnp.concatenate([err_sci, err_ov], axis=1), jnp.nan),
+        y_all,
+        needs_repair,
+    )
 
 
 @in_float64
 def _fit_onedblack_static_chunk(tv_padded_adu: Any) -> tuple[np.ndarray, np.ndarray]:
-    q_sci = jnp.asarray(_LEGENDRE_Q_SCI_NP, dtype=jnp.float64)
-    q_ov = jnp.asarray(_LEGENDRE_Q_OV_NP, dtype=jnp.float64)
-    b1d, err, y_all, needs_repair = _fit_onedblack_legendre_jit(tv_padded_adu, q_sci, q_ov)
+    b1d, err, y_all, needs_repair = _fit_onedblack_legendre_jit(
+        tv_padded_adu,
+        jnp.asarray(_LEGENDRE_Q_SCI_NP, dtype=jnp.float64),
+        jnp.asarray(_LEGENDRE_Q_OV_NP, dtype=jnp.float64),
+    )
     b1d_np = np.asarray(b1d, dtype=np.float64)
     err_np = np.asarray(err, dtype=np.float64)
     repair_mask = np.asarray(needs_repair, dtype=bool)
     if np.any(repair_mask):
-        b1d_np = b1d_np.copy()
-        err_np = err_np.copy()
+        b1d_np, err_np = b1d_np.copy(), err_np.copy()
         y_all_np = np.asarray(y_all, dtype=np.float64)
         for idx in np.flatnonzero(repair_mask):
-            b_rep, e_rep = _repair_partial_onedblack_cadence(
+            b1d_np[int(idx)], err_np[int(idx)] = _repair_partial_onedblack_cadence(
                 y_all_np[int(idx)], _LEGENDRE_Q_SCI_NP, _LEGENDRE_Q_OV_NP
             )
-            b1d_np[int(idx)] = b_rep
-            err_np[int(idx)] = e_rep
     return b1d_np, err_np
 
 
@@ -853,7 +681,6 @@ def fit_onedblack_legendre(tv_debiased_adu: Any) -> tuple[np.ndarray, np.ndarray
     n_c = arr.shape[0]
     if n_c == 0:
         return np.empty((0, 2078), dtype=np.float64), np.empty((0, 2078), dtype=np.float64)
-
     if n_c <= _ONEDBLACK_CAD_BUCKETS[-1]:
         bucket_n = _select_bucket(n_c, _ONEDBLACK_CAD_BUCKETS)
         if bucket_n == n_c:
@@ -873,119 +700,37 @@ def fit_onedblack_legendre(tv_debiased_adu: Any) -> tuple[np.ndarray, np.ndarray
         if m == step:
             b_c, e_c = _fit_onedblack_static_chunk(arr[t0:t1])
         else:
-            buf[:m] = arr[t0:t1]
-            buf[m:] = np.nan
+            buf[:m], buf[m:] = arr[t0:t1], np.nan
             b_c, e_c = _fit_onedblack_static_chunk(buf)
-        b1d_out[t0:t1] = b_c[:m]
-        err_out[t0:t1] = e_c[:m]
+        b1d_out[t0:t1], err_out[t0:t1] = b_c[:m], e_c[:m]
     return b1d_out, err_out
 
 
 def _undershoot_combine(
-    prev: tuple[jax.Array, jax.Array],
-    curr: tuple[jax.Array, jax.Array],
+    prev: tuple[jax.Array, jax.Array], curr: tuple[jax.Array, jax.Array]
 ) -> tuple[jax.Array, jax.Array]:
-    """Associative affine composition ``q(p(x)) = (q_a * p_a) x + (q_a * p_b + q_b)``."""
-    p_a, p_b = prev
-    q_a, q_b = curr
-    return q_a * p_a, q_a * p_b + q_b
+    return curr[0] * prev[0], curr[0] * prev[1] + curr[1]
 
 
-def _invert_lde_undershoot_forward_impl(
-    w_adu: jax.Array,
-    u_coeff: jax.Array,
-) -> jax.Array:
-    """Invert causal serial LDE undershoot ``w_m = x_m - u * x_{m-1}`` along ``axis=-1``."""
+def _invert_lde_undershoot_forward_impl(w_adu: jax.Array, u_coeff: jax.Array) -> jax.Array:
+    """Invert causal serial LDE undershoot with steady-state restart after any ``NaN`` pixel."""
     if w_adu.shape[-1] == 0:
         return w_adu
-
     finite = jnp.isfinite(w_adu)
     w_clean = jnp.where(finite, w_adu, 0.0)
-
-    # Steady-state boundary x_0 = w_0 / (1 - u); causal recursion x_m = w_m + u * x_{m-1}
-    b0 = jnp.where(finite[..., :1], w_clean[..., :1] / (1.0 - u_coeff), 0.0)
-    a0 = jnp.zeros_like(b0)
-
-    if w_adu.shape[-1] > 1:
-        # Non-finite interior/padded pixels pass previous state through cleanly
-        a_rest = jnp.where(finite[..., 1:], u_coeff, 1.0)
-        b_rest = jnp.where(finite[..., 1:], w_clean[..., 1:], 0.0)
-        a = jnp.concatenate([a0, a_rest], axis=-1)
-        b = jnp.concatenate([b0, b_rest], axis=-1)
-        _, x_scan = jax.lax.associative_scan(_undershoot_combine, (a, b), axis=-1)
-    else:
-        x_scan = b0
-
+    prev_finite = jnp.concatenate([jnp.zeros_like(finite[..., :1]), finite[..., :-1]], axis=-1)
+    is_restart = finite & (~prev_finite)
+    is_continue = finite & prev_finite
+    a = jnp.where(is_continue, u_coeff, 0.0)
+    b = jnp.where(
+        is_restart, w_clean / (1.0 - u_coeff), jnp.where(is_continue, w_clean, 0.0)
+    )
+    x_scan = (
+        jax.lax.associative_scan(_undershoot_combine, (a, b), axis=-1)[1]
+        if w_adu.shape[-1] > 1
+        else b
+    )
     return jnp.where(finite, x_scan, jnp.nan)
-
-
-_invert_lde_undershoot_forward_jit = jax.jit(_invert_lde_undershoot_forward_impl)
-
-
-@in_float64
-def _invert_lde_undershoot_static(w_2d: Any, u_coeff: float) -> np.ndarray:
-    res = _invert_lde_undershoot_forward_jit(w_2d, jnp.asarray(u_coeff, dtype=jnp.float64))
-    return np.asarray(res, dtype=np.float64)
-
-
-def invert_lde_undershoot_adu(
-    y_adu: Any,
-    u_coeff: float,
-    *,
-    reverse_readout: bool = False,
-) -> np.ndarray:
-    """Invert causal LDE undershoot in ADU along physical readout direction."""
-    arr = np.asarray(y_adu, dtype=np.float64)
-    nx = arr.shape[-1]
-    if nx == 0 or arr.size == 0:
-        return arr.copy()
-    w = arr[..., ::-1] if reverse_readout else arr
-    w_2d = w.reshape(-1, nx)
-    b_tot = w_2d.shape[0]
-    w_bucket = _select_bucket(nx, _PRESMEAR_WIDTH_BUCKETS)
-    b_step = 512 if b_tot <= 512 else 8192
-
-    out_2d = np.empty((b_tot, nx), dtype=np.float64)
-    buf = np.full((b_step, w_bucket), np.nan, dtype=np.float64)
-    for b0 in range(0, b_tot, b_step):
-        b1 = min(b0 + b_step, b_tot)
-        m = b1 - b0
-        buf[:m, :nx] = w_2d[b0:b1]
-        if m < b_step:
-            buf[m:, :nx] = np.nan
-        res_chunk = _invert_lde_undershoot_static(buf, u_coeff)
-        out_2d[b0:b1] = res_chunk[:m, :nx]
-
-    out = out_2d.reshape(arr.shape)
-    return out[..., ::-1].copy() if reverse_readout else out
-
-
-def _apply_clamped_linearity_impl(
-    dn_per_frame: jax.Array,
-    originx: jax.Array,
-    scalex: jax.Array,
-    offsetx: jax.Array,
-    max_domain: jax.Array,
-    coeffs_desc: jax.Array,
-    deriv_coeffs_desc: jax.Array,
-    gain: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Evaluate ``[0, maxDomain]``-clamped nonlinearity polynomial, saturation mask, and slope."""
-    sat_mask = jnp.isfinite(dn_per_frame) & (dn_per_frame > max_domain)
-    d_clamped = jnp.clip(dn_per_frame, 0.0, max_domain)
-    s = offsetx + (d_clamped - originx) * scalex
-    poly_val = jnp.polyval(coeffs_desc, s)
-    e_per_frame = dn_per_frame * poly_val * gain
-
-    in_domain = (dn_per_frame >= 0.0) & (dn_per_frame <= max_domain)
-    dpoly_ds = jnp.polyval(deriv_coeffs_desc, s)
-    local_gain = (
-        poly_val + jnp.where(in_domain, d_clamped * dpoly_ds * scalex, 0.0)
-    ) * gain
-    return e_per_frame, sat_mask, local_gain
-
-
-_apply_clamped_linearity_jit = jax.jit(_apply_clamped_linearity_impl)
 
 
 @jax.jit
@@ -1002,55 +747,26 @@ def _calibrate_pre_smear_2d_jit(
     gain: jax.Array,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Fused 2D ``(B, W)`` 64-bit undershoot -> per-frame DN -> clamped linearity & gain."""
-    x_adu = _invert_lde_undershoot_forward_impl(w_adu_2d, u_coeff)
-    dn_per_frame = x_adu / n_eff
-    return _apply_clamped_linearity_impl(
-        dn_per_frame,
-        originx,
-        scalex,
-        offsetx,
-        max_domain,
-        coeffs_desc,
-        deriv_coeffs_desc,
-        gain,
-    )
+    dn_per_frame = _invert_lde_undershoot_forward_impl(w_adu_2d, u_coeff) / n_eff
+    sat_mask = jnp.isfinite(dn_per_frame) & (dn_per_frame > max_domain)
+    d_clamped = jnp.clip(dn_per_frame, 0.0, max_domain)
+    s = offsetx + (d_clamped - originx) * scalex
+    poly_val = jnp.polyval(coeffs_desc, s)
+    e_per_frame = dn_per_frame * poly_val * gain
+    in_domain = (dn_per_frame >= 0.0) & (dn_per_frame <= max_domain)
+    local_gain = (
+        poly_val + jnp.where(in_domain, d_clamped * jnp.polyval(deriv_coeffs_desc, s) * scalex, 0.0)
+    ) * gain
+    return e_per_frame, sat_mask, local_gain
 
 
 def _prepare_poly_coeffs_desc_np(channel: LinearityChannel) -> tuple[np.ndarray, np.ndarray]:
-    """Return fixed-length descending polynomial & derivative coefficients in ``float64``."""
     raw_asc = np.asarray(channel.coeffs, dtype=np.float64)
     pad_len = max(8, len(raw_asc))
     coeffs_asc = np.zeros(pad_len, dtype=np.float64)
     coeffs_asc[: len(raw_asc)] = raw_asc
-    coeffs_desc = coeffs_asc[::-1].copy()
     deriv_asc = coeffs_asc[1:] * np.arange(1, pad_len, dtype=np.float64)
-    deriv_desc = deriv_asc[::-1].copy()
-    return coeffs_desc, deriv_desc
-
-
-@in_float64
-def apply_clamped_linearity_and_gain(
-    dn_per_frame: Any,
-    channel: LinearityChannel,
-    gain: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Convert per-frame DN to ``e-/frame`` with ``linearity.xml`` clamped to ``[0, maxDomain]``."""
-    coeffs_desc_np, deriv_desc_np = _prepare_poly_coeffs_desc_np(channel)
-    e_out, sat_out, g_out = _apply_clamped_linearity_jit(
-        dn_per_frame,
-        jnp.asarray(channel.originx, dtype=jnp.float64),
-        jnp.asarray(channel.scalex, dtype=jnp.float64),
-        jnp.asarray(channel.offsetx, dtype=jnp.float64),
-        jnp.asarray(channel.max_domain, dtype=jnp.float64),
-        jnp.asarray(coeffs_desc_np, dtype=jnp.float64),
-        jnp.asarray(deriv_desc_np, dtype=jnp.float64),
-        jnp.asarray(gain, dtype=jnp.float64),
-    )
-    return (
-        np.asarray(e_out, dtype=np.float64),
-        np.asarray(sat_out, dtype=bool),
-        np.asarray(g_out, dtype=np.float64),
-    )
+    return coeffs_asc[::-1].copy(), deriv_asc[::-1].copy()
 
 
 @in_float64
@@ -1101,26 +817,20 @@ def calibrate_pre_smear_e_per_frame(
             np.zeros(arr.shape, dtype=bool),
             np.empty_like(arr, dtype=np.float64),
         )
-
-    w = arr[..., ::-1] if reverse_readout else arr
-    w_2d = w.reshape(-1, nx)
+    w_2d = (arr[..., ::-1] if reverse_readout else arr).reshape(-1, nx)
     b_tot = w_2d.shape[0]
     w_bucket = _select_bucket(nx, _PRESMEAR_WIDTH_BUCKETS)
-    if b_tot <= 512:
-        b_step = 512
-    elif b_tot <= 8192:
-        b_step = 8192
-    elif b_tot <= 131072 and w_bucket <= 64:
-        b_step = 131072
-    else:
-        b_step = 8192
+    b_step = (
+        512
+        if b_tot <= 512
+        else (131072 if (8192 < b_tot <= 131072 and w_bucket <= 64) else 8192)
+    )
     coeffs_desc_np, deriv_desc_np = _prepare_poly_coeffs_desc_np(channel)
 
     e_2d = np.empty((b_tot, nx), dtype=np.float64)
     sat_2d = np.empty((b_tot, nx), dtype=bool)
     g_2d = np.empty((b_tot, nx), dtype=np.float64)
     buf = np.full((b_step, w_bucket), np.nan, dtype=np.float64)
-
     for b0 in range(0, b_tot, b_step):
         b1 = min(b0 + b_step, b_tot)
         m = b1 - b0
@@ -1136,177 +846,24 @@ def calibrate_pre_smear_e_per_frame(
             deriv_desc_np=deriv_desc_np,
             gain=gain,
         )
-        e_2d[b0:b1] = ec[:m, :nx]
-        sat_2d[b0:b1] = sc[:m, :nx]
-        g_2d[b0:b1] = gc[:m, :nx]
+        e_2d[b0:b1], sat_2d[b0:b1], g_2d[b0:b1] = ec[:m, :nx], sc[:m, :nx], gc[:m, :nx]
 
-    e_full = e_2d.reshape(arr.shape)
-    sat_full = sat_2d.reshape(arr.shape)
-    g_full = g_2d.reshape(arr.shape)
+    e_full, sat_full, g_full = (
+        e_2d.reshape(arr.shape),
+        sat_2d.reshape(arr.shape),
+        g_2d.reshape(arr.shape),
+    )
     if reverse_readout:
-        return (
-            e_full[..., ::-1].copy(),
-            sat_full[..., ::-1].copy(),
-            g_full[..., ::-1].copy(),
-        )
+        return e_full[..., ::-1].copy(), sat_full[..., ::-1].copy(), g_full[..., ::-1].copy()
     return e_full, sat_full, g_full
 
 
-@jax.jit
-def _huber_weighted_smear_location_2d_jit(
-    residuals: jax.Array,
-    inv_wing_weights: jax.Array,
-    sigma_pix: jax.Array,
-    clean_mask: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
-    """2D shape-bucketed MAD-scaled Huber IRLS row-location solver ``(M, H) -> (M,)``."""
-    valid = clean_mask & jnp.isfinite(residuals) & jnp.isfinite(inv_wing_weights)
-    w_base = jnp.where(valid, jnp.maximum(inv_wing_weights, 0.0), 0.0)
-
-    # Identify far-wing rows (top >= 5% of inverse-wing weight) for initial median & scale
-    w_max = jnp.max(w_base, axis=1, keepdims=True)
-    far_mask = valid & (w_base >= 0.05 * w_max)
-    far_count = jnp.sum(far_mask, axis=1, keepdims=True)
-    scale_mask = jnp.where(far_count >= 5, far_mask, valid)
-
-    # Initial weighted location over far clean rows
-    w_init = jnp.where(scale_mask, w_base, 0.0)
-    w_init_sum = jnp.sum(w_init, axis=1)
-    loc = jnp.sum(w_init * jnp.where(valid, residuals, 0.0), axis=1) / jnp.maximum(
-        w_init_sum, 1e-30
-    )
-
-    sigma_eff = jnp.where(w_base > 0.0, jax.lax.rsqrt(jnp.maximum(w_base, 1e-30)), 1.0)
-    c_huber = jnp.asarray(1.345, dtype=residuals.dtype)
-
-    # Fixed preliminary MAD scale tau_0 (canonical Huber 1981 IRLS without inner sorts)
-    r0 = jnp.where(valid, residuals - loc[:, None], 0.0)
-    std_r0 = jnp.where(scale_mask, jnp.abs(r0) / jnp.maximum(sigma_eff, 1e-12), jnp.nan)
-    tau0 = jnp.maximum(1.0, 1.4826 * jnp.nanmedian(std_r0, axis=1))
-    inv_denom_scale = 1.0 / jnp.maximum(tau0[:, None] * sigma_eff, 1e-12)
-    res_valid = jnp.where(valid, residuals, 0.0)
-
-    def _irls_step(_idx: int, m_curr: jax.Array) -> jax.Array:
-        r = jnp.where(valid, residuals - m_curr[:, None], 0.0)
-        u = jnp.abs(r) * inv_denom_scale
-        w_rob = jnp.where(u <= c_huber, 1.0, c_huber / jnp.maximum(u, 1e-12))
-        w_tot = w_base * w_rob
-        denom = jnp.sum(w_tot, axis=1)
-        m_next = jnp.sum(w_tot * res_valid, axis=1) / jnp.maximum(denom, 1e-30)
-        return jnp.where(denom > 0.0, m_next, m_curr)
-
-    loc_final = jax.lax.fori_loop(0, 6, _irls_step, loc)
-
-    # Sandwich variance of Huber location
-    r_fin = jnp.where(valid, residuals - loc_final[:, None], 0.0)
-    u_fin = jnp.abs(r_fin) * inv_denom_scale
-    w_rob_fin = jnp.where(u_fin <= c_huber, 1.0, c_huber / jnp.maximum(u_fin, 1e-12))
-    w_tot_fin = w_base * w_rob_fin
-    denom_fin = jnp.sum(w_tot_fin, axis=1)
-
-    pix_var = jnp.maximum(r_fin * r_fin, sigma_pix * sigma_pix)
-    num_var = jnp.sum((w_tot_fin * w_tot_fin) * jnp.where(valid, pix_var, 0.0), axis=1)
-    loc_err = jnp.sqrt(jnp.maximum(num_var, 0.0)) / jnp.maximum(denom_fin, 1e-30)
-
-    has_any = jnp.any(valid, axis=1)
-    return (
-        jnp.where(has_any, loc_final, jnp.nan),
-        jnp.where(has_any, loc_err, jnp.nan),
-    )
-
-
-@in_float64
-def _solve_huber_static_chunk(
-    res_buf: Any,
-    w_buf: Any,
-    sig_buf: Any,
-    mask_buf: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    loc, err = _huber_weighted_smear_location_2d_jit(
-        res_buf,
-        w_buf,
-        sig_buf,
-        jnp.asarray(mask_buf, dtype=bool),
-    )
-    return np.asarray(loc, dtype=np.float64), np.asarray(err, dtype=np.float64)
-
-
-def _solve_huber_smear_location(
-    residuals: Any,
-    inv_wing_weights: Any,
-    sigma_pix: Any,
-    clean_row_mask: Any,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Run shape-bucketed ``@in_float64`` MAD-scaled Huber smear solver."""
-    res_np = np.asarray(residuals, dtype=np.float64)  # (N_t, ny, n_bleed)
-    w_np = np.asarray(inv_wing_weights, dtype=np.float64)
-    sig_np = np.asarray(sigma_pix, dtype=np.float64)
-    mask_np = np.asarray(clean_row_mask, dtype=bool)  # (ny, n_bleed)
-
-    n_t, ny, n_bleed = res_np.shape
-    m_tot = n_t * n_bleed
-    if m_tot == 0 or ny == 0:
-        return (
-            np.full((n_t, n_bleed), np.nan, dtype=np.float64),
-            np.full((n_t, n_bleed), np.nan, dtype=np.float64),
-        )
-
-    res_2d = np.transpose(res_np, (0, 2, 1)).reshape(m_tot, ny)
-    w_2d = np.transpose(w_np, (0, 2, 1)).reshape(m_tot, ny)
-    sig_2d = np.transpose(sig_np, (0, 2, 1)).reshape(m_tot, ny)
-    mask_2d = np.broadcast_to(mask_np.T[None, :, :], (n_t, n_bleed, ny)).reshape(m_tot, ny)
-
-    h_bucket = _select_bucket(ny, _HUBER_ROW_BUCKETS)
-    m_step = 64 if m_tot <= 64 else 1024
-
-    loc_1d = np.empty(m_tot, dtype=np.float64)
-    err_1d = np.empty(m_tot, dtype=np.float64)
-    res_buf = np.zeros((m_step, h_bucket), dtype=np.float64)
-    w_buf = np.zeros((m_step, h_bucket), dtype=np.float64)
-    sig_buf = np.ones((m_step, h_bucket), dtype=np.float64)
-    mask_buf = np.zeros((m_step, h_bucket), dtype=bool)
-
-    for m0 in range(0, m_tot, m_step):
-        m1 = min(m0 + m_step, m_tot)
-        k = m1 - m0
-        res_buf[:k, :ny] = res_2d[m0:m1]
-        w_buf[:k, :ny] = w_2d[m0:m1]
-        sig_buf[:k, :ny] = sig_2d[m0:m1]
-        mask_buf[:k, :ny] = mask_2d[m0:m1]
-        if k < m_step:
-            mask_buf[k:, :] = False
-        lc, ec = _solve_huber_static_chunk(res_buf, w_buf, sig_buf, mask_buf)
-        loc_1d[m0:m1] = lc[:k]
-        err_1d[m0:m1] = ec[:k]
-
-    return loc_1d.reshape(n_t, n_bleed), err_1d.reshape(n_t, n_bleed)
-
-
-def _dilate_vertical_bool(mask_2d: np.ndarray, radius: int) -> np.ndarray:
-    """Dilate a 2D boolean mask ``(ny, nx)`` along rows (``axis=0``) by ``±radius``."""
-    ny, nx = mask_2d.shape
-    out = np.array(mask_2d, dtype=bool, copy=True)
-    for shift in range(1, radius + 1):
-        if shift < ny:
-            out[shift:, :] |= mask_2d[:-shift, :]
-            out[:-shift, :] |= mask_2d[shift:, :]
-        else:
-            has_col = np.any(mask_2d, axis=0, keepdims=True)
-            out |= np.broadcast_to(has_col, (ny, nx))
-            break
-    return out
-
-
-def _build_sat_bleed_mask_2d(
-    sci_sat_3d: np.ndarray,
-    col_outputs: tuple[str, ...],
+def _build_sat_bleed_mask_from_raw_sat(
+    raw_sat_2d: np.ndarray, col_outputs: tuple[str, ...]
 ) -> np.ndarray:
     """Build 2D ``PixelQuality.SAT_BLEED`` mask including downstream undershoot neighbours."""
-    raw_sat_2d = np.any(sci_sat_3d, axis=0)  # (ny, nx)
     ny, nx = raw_sat_2d.shape
     dilated = _dilate_vertical_bool(raw_sat_2d, radius=1)
-
-    # Flag 1-pixel downstream serial-readout neighbour within the same CCD output
     downstream = np.zeros((ny, nx), dtype=bool)
     for c in range(nx):
         if not np.any(raw_sat_2d[:, c]):
@@ -1315,772 +872,12 @@ def _build_sat_bleed_mask_2d(
         c_down = (c - 1) if OUTPUT_REVERSE_READOUT[out] else (c + 1)
         if 0 <= c_down < nx and col_outputs[c_down] == out:
             downstream[:, c_down] |= raw_sat_2d[:, c]
-
     return dilated | downstream
 
 
-def _detect_bloom_columns(
-    sub_cube: np.ndarray,
-    sigma_cube: np.ndarray,
-    clean_rows_2d: np.ndarray,
-    *,
-    fwer_alpha: float = 1.0e-4,
-    coherent_spatial_err: float = 0.0,
-) -> np.ndarray:
-    """Detect columns whose clean rows are driven negative by upper-register smear bloom.
-
-    Uses Gaussian Bonferroni union-bound critical values ``-ndtri(...)`` scaled by
-    the actual number of clean rows ``n_r`` (for inverse-variance time-integrated
-    row z-scores) and finite ``(t, r)`` pixels (for transient single-cadence bloom),
-    avoiding Gaussian minimum order-statistic false positives on tall cutouts.
-    Any ``coherent_spatial_err`` (time-persistent spatial sky-model residual scale)
-    is added in quadrature after temporal averaging so systematic spatial misfit
-    never inflates as ``sqrt(N_t)``.
-    """
-    _, _, nx = sub_cube.shape
-    col_has_bloom = np.zeros(nx, dtype=bool)
-    coh_err = max(float(coherent_spatial_err), 0.0)
-    coh_var = coh_err * coh_err
-
-    for c in range(nx):
-        r_mask = clean_rows_2d[:, c]
-        if not np.any(r_mask):
-            col_has_bloom[c] = True
-            continue
-        sub = sub_cube[:, r_mask, c]
-        sig_sub = sigma_cube[:, r_mask, c]
-        valid = np.isfinite(sub) & np.isfinite(sig_sub)
-        if not np.any(valid):
-            continue
-
-        sig_safe = np.maximum(np.where(valid, sig_sub, 1.0), 1e-6)
-
-        # 1. Persistent bloom test: inverse-variance time-weighted row z-scores
-        w = np.where(valid, 1.0 / (sig_safe * sig_safe), 0.0)
-        w_sum = np.sum(w, axis=0)
-        valid_r = w_sum > 0.0
-        n_r_tests = int(np.sum(valid_r))
-        if n_r_tests > 0:
-            num = np.sum(
-                np.where(valid[:, valid_r], w[:, valid_r] * sub[:, valid_r], 0.0),
-                axis=0,
-            )
-            mean_r = num / w_sum[valid_r]
-            se_r = np.sqrt(1.0 / w_sum[valid_r] + coh_var)
-            z_row = mean_r / se_r
-            p_row = min(max(0.5 * fwer_alpha / float(n_r_tests), 1.0e-300), 0.49)
-            crit_row = -float(ndtri(p_row))
-            if float(np.min(z_row)) < -crit_row:
-                col_has_bloom[c] = True
-                continue
-
-        # 2. Transient single-cadence bloom test across finite (t, r) samples
-        n_pix_tests = int(np.sum(valid))
-        p_pix = min(max(0.5 * fwer_alpha / float(max(n_pix_tests, 1)), 1.0e-300), 0.49)
-        crit_pix = -float(ndtri(p_pix))
-        sig_pix = np.hypot(sig_safe[valid], coh_err) if coh_err > 0.0 else sig_safe[valid]
-        z_pix = sub[valid] / sig_pix
-        if float(np.min(z_pix)) < -crit_pix:
-            col_has_bloom[c] = True
-
-    return col_has_bloom
-
-
-def _fit_upper_column_floor_line(
-    x_1d: np.ndarray,
-    col_floors: np.ndarray,
-) -> np.ndarray:
-    """Fit a robust linear trend across the upper-envelope column floors ``(m, nx)``."""
-    m, nx = col_floors.shape
-    pred_x = np.zeros((m, nx), dtype=np.float64)
-    for t in range(m):
-        cf = col_floors[t]
-        fin = np.isfinite(cf)
-        n_fin = int(np.sum(fin))
-        if n_fin == 0:
-            continue
-        idx_fin = np.flatnonzero(fin)
-        vals_fin = cf[idx_fin]
-        if n_fin == 1:
-            pred_x[t] = max(float(vals_fin[0]), 0.0)
-            continue
-        # Select top ~45% of columns by floor so even >50% positive-sky bloom trenches
-        # are excluded while tilted clean skies extrapolate linearly across all columns.
-        k = min(n_fin, max(3, int(np.ceil(0.45 * n_fin))))
-        top_order = np.argsort(vals_fin)[-k:]
-        xs = x_1d[idx_fin[top_order]]
-        ys = vals_fin[top_order]
-        # Pairwise Theil-Sen median slope resists a single star-filled column in the top set
-        slopes = []
-        for i in range(k):
-            for j in range(i + 1, k):
-                dx = float(xs[j] - xs[i])
-                if abs(dx) > 1e-12:
-                    slopes.append(float(ys[j] - ys[i]) / dx)
-        slope = float(np.median(slopes)) if slopes else 0.0
-        intercept = float(np.median(ys - slope * xs))
-        pred_x[t] = np.maximum(intercept + slope * x_1d, 0.0)
-    return pred_x
-
-
-def _estimate_cutout_sky_plane(
-    u_in: np.ndarray,
-    sigma_in: np.ndarray,
-    clean_rows_2d: np.ndarray,
-) -> tuple[np.ndarray, float]:
-    """Estimate a non-negative 2D sky baseline ``(N_t, ny, nx)`` and coherent spatial error.
-
-    Initializes from the upper envelope of per-column clean-row floors (so ``>= 50%``
-    multi-column positive-sky bloom trenches never capture the initial median), fits
-    a 2nd-order 2D polynomial ``[1, x, y, x^2, xy, y^2]`` (falling back to 1st-order
-    when spatial support is narrow), and returns the empirical coherent spatial
-    residual scale across time-averaged sky inliers.
-    """
-    n_t, ny, nx = u_in.shape
-    npix = ny * nx
-    if npix == 0 or n_t == 0 or not np.any(clean_rows_2d):
-        return np.zeros_like(u_in, dtype=np.float64), 0.0
-
-    x_1d = np.linspace(-1.0, 1.0, nx, dtype=np.float64) if nx > 1 else np.zeros(1, dtype=np.float64)
-    y_1d = np.linspace(-1.0, 1.0, ny, dtype=np.float64) if ny > 1 else np.zeros(1, dtype=np.float64)
-    yy, xx = np.meshgrid(y_1d, x_1d, indexing="ij")
-    xr, yr = xx.ravel(), yy.ravel()
-
-    use_quad = (nx >= 4) and (ny >= 4)
-    design_lin = np.column_stack([np.ones(npix, dtype=np.float64), xr, yr])
-    design_quad = np.column_stack(
-        [np.ones(npix, dtype=np.float64), xr, yr, xr * xr, xr * yr, yr * yr]
-    )
-    ridge_lin = np.diag([1e-12, 1e-6, 1e-6])
-    ridge_quad = np.diag([1e-12, 1e-6, 1e-6, 1e-5, 1e-5, 1e-5])
-    clean_flat = clean_rows_2d.ravel()
-
-    out = np.zeros((n_t, npix), dtype=np.float64)
-    inlier_count = np.zeros(npix, dtype=np.int64)
-    step = 256
-    for t0 in range(0, n_t, step):
-        t1 = min(t0 + step, n_t)
-        m = t1 - t0
-        u_chunk = u_in[t0:t1]
-        u_flat = u_chunk.reshape(m, npix)
-        sig_c = sigma_in[t0:t1]
-        sig_flat = np.maximum(np.where(np.isfinite(sig_c), sig_c, 1.0), 1e-6).reshape(m, npix)
-        valid = clean_flat[None, :] & np.isfinite(u_flat)
-        u_safe = np.where(valid, u_flat, 0.0)
-
-        # Compute per-column clean-row 15th-percentile floor & within-column vertical MAD
-        col_floors = np.full((m, nx), np.nan, dtype=np.float64)
-        vert_mads = np.full((m, nx), np.nan, dtype=np.float64)
-        for c in range(nx):
-            r_ok = clean_rows_2d[:, c]
-            if not np.any(r_ok):
-                continue
-            uc = u_chunk[:, r_ok, c]
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                p15 = np.nanpercentile(uc, 15.0, axis=1)
-                p30 = np.nanpercentile(uc, 30.0, axis=1)
-                low_m = np.isfinite(uc) & (uc <= p30[:, None])
-                low_med = np.nanmedian(np.where(low_m, uc, np.nan), axis=1)
-                vmad = 1.4826 * np.nanmedian(
-                    np.where(low_m, np.abs(uc - low_med[:, None]), np.nan), axis=1
-                )
-            col_floors[:, c] = p15
-            vert_mads[:, c] = vmad
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            cad_vert_mad = np.nanmedian(vert_mads, axis=1)
-        cad_vert_mad = np.where(np.isfinite(cad_vert_mad), cad_vert_mad, 0.0)
-
-        pred_x = _fit_upper_column_floor_line(x_1d, col_floors)  # (m, nx)
-        has_valid = np.any(valid, axis=1) & np.any(np.isfinite(col_floors), axis=1)
-        pred = np.broadcast_to(pred_x[:, None, :], (m, ny, nx)).reshape(m, npix).copy()
-
-        final_w_rob = np.zeros((m, npix), dtype=np.float64)
-        for it in range(5):
-            res = u_safe - pred
-            if it == 0:
-                scale = np.maximum(np.maximum(sig_flat, cad_vert_mad[:, None]), 1e-6)
-            else:
-                # Robust residual scale on non-bloomed pixels (res >= -3 * sig)
-                sky_cand = valid & (res >= -4.0 * sig_flat)
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", RuntimeWarning)
-                    mad = 1.4826 * np.nanmedian(np.where(sky_cand, np.abs(res), np.nan), axis=1)
-                mad = np.where(np.isfinite(mad), mad, 0.0)
-                mad_cap = np.minimum(mad[:, None], 3.0 * sig_flat)
-                scale = np.maximum(np.maximum(sig_flat, mad_cap), 1e-6)
-
-            z = res / scale
-            # Soft Huber on positive side initially so curved sky stays weighted, then reject PSF
-            if it < 2:
-                w_pos = np.where(z <= 2.5, 1.0, 2.5 / np.maximum(z, 1e-6))
-            else:
-                w_pos = np.where(
-                    z <= 2.0, 1.0, np.where(z <= 3.5, 2.0 / np.maximum(z, 1e-6), 0.0)
-                )
-            w_neg = np.where(
-                z >= -2.0, 1.0, np.where(z >= -4.0, 2.0 / np.maximum(-z, 1e-6), 0.0)
-            )
-            w_rob = np.where(z >= 0.0, w_pos, w_neg)
-            final_w_rob = w_rob
-            w = np.where(valid, w_rob / (sig_flat * sig_flat), 0.0)
-
-            too_few = has_valid & (np.sum(w, axis=1) <= 0.0)
-            if np.any(too_few):
-                w[too_few] = np.where(
-                    valid[too_few],
-                    1.0 / (np.maximum(np.abs(z[too_few]), 1.0) * (sig_flat[too_few] ** 2)),
-                    0.0,
-                )
-
-            # Use 2nd-order polynomial only when >= 4 distinct columns carry inlier weight
-            inlier_cols = np.any((w > 0.0).reshape(m, ny, nx), axis=1)  # (m, nx)
-            n_inlier_cols = (
-                int(np.min(np.sum(inlier_cols[has_valid], axis=1)))
-                if np.any(has_valid)
-                else 0
-            )
-            if use_quad and n_inlier_cols >= 4:
-                des = design_quad
-                rdg = ridge_quad
-            else:
-                des = design_lin
-                rdg = ridge_lin
-
-            atw = des.T[None, :, :] * w[:, None, :]
-            ata = np.einsum("tip,pj->tij", atw, des) + rdg[None, :, :]
-            atu = np.einsum("tip,tp->ti", atw, u_safe)
-            beta = np.linalg.solve(ata, atu[..., None])[..., 0]
-            pred = np.where(has_valid[:, None], beta @ des.T, 0.0)
-
-        out[t0:t1] = np.maximum(pred, 0.0)
-        inlier_count += np.sum(valid & (final_w_rob > 0.5), axis=0)
-
-    sky_cube = out.reshape(n_t, ny, nx)
-
-    # Empirical coherent spatial residual scale across time-averaged sky inliers
-    inlier_2d = (inlier_count.reshape(ny, nx) >= max(1, n_t // 2)) & clean_rows_2d
-    coherent_spatial_err = 0.0
-    if int(np.sum(inlier_2d)) >= 6:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            res_mean_2d = np.nanmean(u_in - sky_cube, axis=0)
-            vals = res_mean_2d[inlier_2d]
-            vals = vals[np.isfinite(vals)]
-            if vals.size >= 6:
-                med_v = float(np.median(vals))
-                coherent_spatial_err = float(1.4826 * np.median(np.abs(vals - med_v)))
-
-    return sky_cube, coherent_spatial_err
-
-
-def _estimate_alternate_smear_stamp(
-    *,
-    sci_pre_smear: np.ndarray,
-    sci_sigma_pre: np.ndarray,
-    flat_2d: np.ndarray,
-    collat_smear_stamp: np.ndarray | None,
-    collat_smear_err_stamp: np.ndarray | None,
-    collat_sm_sat_cols: np.ndarray | None,
-    off_target_smear: np.ndarray | None,
-    off_target_smear_err: np.ndarray | None,
-    raw_sat_2d: np.ndarray,
-    sat_bleed_2d: np.ndarray,
-    strap_col_mask: np.ndarray,
-    source_mask_2d: np.ndarray,
-    row0_1based: int = 1,
-    row_smear_weight: float = 0.02 / (1.98 * float(TESS_PARALLEL_SHIFTS)),
-    saturation_limit: float | None = None,
-    bleed_dilation_rows: int = 4,
-    min_clean_rows: int = 5,
-    flank_width: int = 3,
-    bloom_detect_cube: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Estimate concavity-guarded collateral-anchored smear ``M_hat`` across ``(N_t, nx)``.
-
-    Works identically in ``e-/frame`` (for :func:`recalibrate_tpf`) and in
-    calibrated ``e-/s`` with ``flat_2d = 1`` and ``collat_smear_stamp = 0`` (for
-    :func:`desmear_calibrated_cutout`).
-
-    Returns
-    -------
-    m_hat : np.ndarray
-        Estimated per-cadence, per-column smear ``(N_t, nx)`` in same units as ``sci_pre_smear``.
-    m_err : np.ndarray
-        Column-coherent smear uncertainty ``(N_t, nx)`` in same units as ``sci_pre_smear``.
-    unresolved_col_mask : np.ndarray
-        Boolean ``(nx,)`` mask of bleed columns with ``< min_clean_rows`` clean rows.
-    """
-    n_t, ny, nx = sci_pre_smear.shape
-    safe_flat = np.where(np.isfinite(flat_2d) & (flat_2d > 0.0), flat_2d, 1.0)
-
-    if saturation_limit is not None and np.isfinite(saturation_limit) and saturation_limit > 0.0:
-        sat_scale = float(saturation_limit)
-    else:
-        finite_sci = sci_pre_smear[np.isfinite(sci_pre_smear)]
-        sat_scale = float(np.max(np.abs(finite_sci))) if finite_sci.size > 0 else 1.0
-        sat_scale = max(sat_scale, 1.0)
-    unres_smear_scale = float(TESS_PARALLEL_SHIFTS) * float(row_smear_weight) * sat_scale
-
-    # Clean unsaturated rows after >= 4-row vertical bleed-tip dilation + SOURCE_MASK
-    dilated_bleed = _dilate_vertical_bool(raw_sat_2d, radius=bleed_dilation_rows)
-    clean_rows_2d = (~dilated_bleed) & (~source_mask_2d)  # (ny, nx)
-
-    col_has_sci_sat = np.any(raw_sat_2d, axis=0)
-    col_has_sm_sat = (
-        np.asarray(collat_sm_sat_cols, dtype=bool)
-        if collat_sm_sat_cols is not None
-        else np.zeros(nx, dtype=bool)
-    )
-
-    # Detect columns where collateral smrow bloomed (drives clean science rows negative)
-    if collat_smear_stamp is not None:
-        sub_for_bloom = sci_pre_smear - collat_smear_stamp[:, None, :]
-        col_has_bloom = _detect_bloom_columns(sub_for_bloom, sci_sigma_pre, clean_rows_2d)
-    else:
-        bloom_src = bloom_detect_cube if bloom_detect_cube is not None else sci_pre_smear
-        col_has_bloom = _detect_bloom_columns(bloom_src, sci_sigma_pre, clean_rows_2d)
-        if nx >= 3 and not np.all(col_has_bloom):
-            sky_clean_2d = clean_rows_2d & (~col_has_bloom)[None, :]
-            if np.any(sky_clean_2d):
-                sky_base, coh_spatial_err = _estimate_cutout_sky_plane(
-                    sci_pre_smear, sci_sigma_pre, sky_clean_2d
-                )
-                if np.any(sky_base > 0.0):
-                    col_has_bloom |= _detect_bloom_columns(
-                        sci_pre_smear - sky_base,
-                        sci_sigma_pre,
-                        clean_rows_2d,
-                        coherent_spatial_err=coh_spatial_err,
-                    )
-
-    c_bleed_mask = col_has_sci_sat | col_has_sm_sat | col_has_bloom  # (nx,)
-
-    # Initialize m_hat / m_err with collateral smear (or 0.0 in FFI desmear mode)
-    if collat_smear_stamp is not None:
-        m_hat = np.array(collat_smear_stamp, dtype=np.float64, copy=True)
-        m_err = (
-            np.array(collat_smear_err_stamp, dtype=np.float64, copy=True)
-            if collat_smear_err_stamp is not None
-            else np.sqrt(
-                float(_unit_normal_median_variance(10)) * np.maximum(np.abs(m_hat), 1.0)
-            )
-        )
-    else:
-        m_hat = np.zeros((n_t, nx), dtype=np.float64)
-        m_err = np.zeros((n_t, nx), dtype=np.float64)
-
-    if not np.any(c_bleed_mask):
-        return m_hat, m_err, np.zeros(nx, dtype=bool)
-
-    # Check if ANY non-bleeding anchor column exists in the stamp (excluding STRAP_COL)
-    non_bleed_non_strap = (~c_bleed_mask) & (~strap_col_mask)
-
-    # Upper-register bloom anchor (when collateral smrow bloomed across the stamp while
-    # outer science columns remain unsaturated): total shutterless column smear equals
-    # off-target background smear PLUS row_smear_weight * sum_r (stellar excess in col c),
-    # with an explicit out-of-cutout stellar PSF smear uncertainty propagated into m_err.
-    if (
-        not np.any(non_bleed_non_strap)
-        and off_target_smear is not None
-        and np.any(~col_has_sci_sat)
-    ):
-        edge_candidates = (~col_has_sci_sat) & (~strap_col_mask)
-        if not np.any(edge_candidates):
-            edge_candidates = ~col_has_sci_sat
-        edge_cols = np.flatnonzero(edge_candidates)
-
-        u0_edge = (
-            sci_pre_smear[:, :, edge_cols] - off_target_smear[:, None, None]
-        ) / safe_flat[None, :, edge_cols]
-        clean_edge_pix = (~sat_bleed_2d[:, edge_cols]) & (~source_mask_2d[:, edge_cols])
-        if not np.any(clean_edge_pix):
-            clean_edge_pix = ~raw_sat_2d[:, edge_cols]
-
-        u0_sky_pool = np.where(clean_edge_pix[None, :, :], u0_edge, np.nan).reshape(n_t, -1)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            sky_floor = np.nanpercentile(u0_sky_pool, 10.0, axis=1)
-        sky_floor = np.where(np.isfinite(sky_floor), np.maximum(sky_floor, 0.0), 0.0)
-
-        n_below = max(int(row0_1based) - 1, 0)
-        n_above = max(2048 - (int(row0_1based) - 1 + ny), 0)
-        n_edge_r = min(3, ny)
-        var_off = (
-            off_target_smear_err * off_target_smear_err
-            if off_target_smear_err is not None
-            else np.zeros(n_t, dtype=np.float64)
-        )
-
-        for idx_e, c in enumerate(edge_cols):
-            u0_c = u0_edge[:, :, idx_e]
-            star_ex = np.where(
-                np.isfinite(u0_c),
-                np.maximum(u0_c - sky_floor[:, None], 0.0),
-                0.0,
-            )
-            delta_m_in = float(row_smear_weight) * np.sum(star_ex, axis=1)
-            sig_u_c = np.where(
-                np.isfinite(sci_sigma_pre[:, :, c]),
-                sci_sigma_pre[:, :, c] / safe_flat[None, :, c],
-                0.0,
-            )
-            var_in = (float(row_smear_weight) ** 2) * np.sum(sig_u_c * sig_u_c, axis=1)
-
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                edge_below = np.nanmedian(star_ex[:, :n_edge_r], axis=1)
-                edge_above = np.nanmedian(star_ex[:, ny - n_edge_r :], axis=1)
-            edge_below = np.where(np.isfinite(edge_below), edge_below, 0.0)
-            edge_above = np.where(np.isfinite(edge_above), edge_above, 0.0)
-            sigma_out = float(row_smear_weight) * (
-                float(n_below) * edge_below + float(n_above) * edge_above
-            )
-
-            m_hat[:, c] = off_target_smear + delta_m_in
-            m_err[:, c] = np.sqrt(
-                np.maximum(var_off + var_in + sigma_out * sigma_out, 1e-12)
-            )
-            c_bleed_mask[c] = False
-    elif not np.any(non_bleed_non_strap) and off_target_smear is None:
-        # Collateral-free cutout where every column bloomed: anchor unsaturated edge columns
-        # (or outermost resolvable columns on narrow saturated cutouts) to their clean-row
-        # lower envelope so negative streaks are repaired rather than leaving 100% unresolved.
-        n_clean_per_col = np.sum(clean_rows_2d, axis=0)
-        resolvable_any = n_clean_per_col >= min_clean_rows
-        edge_candidates = (~col_has_sci_sat) & (~strap_col_mask) & resolvable_any
-        if not np.any(edge_candidates):
-            edge_candidates = (~col_has_sci_sat) & resolvable_any
-        if not np.any(edge_candidates) and np.any(resolvable_any):
-            cand_idx = np.flatnonzero((~strap_col_mask) & resolvable_any)
-            if cand_idx.size == 0:
-                cand_idx = np.flatnonzero(resolvable_any)
-            edge_candidates = np.zeros(nx, dtype=bool)
-            edge_candidates[cand_idx[0]] = True
-            edge_candidates[cand_idx[-1]] = True
-
-        edge_cols = np.flatnonzero(edge_candidates)
-        if edge_cols.size > 0:
-            # Measure floor on bloom_detect_cube (pre-restore flux_in) when FLUX_BKG was
-            # restored so Delta_M_bloom is estimated invariantly of positive sky B_bkg.
-            floor_src = bloom_detect_cube if bloom_detect_cube is not None else sci_pre_smear
-            z_q10 = -float(ndtri(0.10))  # 1.28155 Gaussian 10th-percentile offset
-            for c in edge_cols:
-                r_ok = clean_rows_2d[:, c]
-                u_c_all = floor_src[:, :, c] / safe_flat[None, :, c]
-                u_c_clean = u_c_all[:, r_ok]
-                sig_u_c = np.where(
-                    np.isfinite(sci_sigma_pre[:, :, c]),
-                    sci_sigma_pre[:, :, c] / safe_flat[None, :, c],
-                    0.0,
-                )
-                sig_dim = sig_u_c[:, r_ok]
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", RuntimeWarning)
-                    p20 = np.nanpercentile(u_c_clean, 20.0, axis=1)
-                    p25 = np.nanpercentile(u_c_clean, 25.0, axis=1)
-                    p10 = np.nanpercentile(u_c_clean, 10.0, axis=1)
-                    dim_mask = np.isfinite(u_c_clean) & (u_c_clean <= p20[:, None])
-                    col_floor = np.nanmedian(np.where(dim_mask, u_c_clean, np.nan), axis=1)
-                    sig_dim_med = np.nanmedian(np.where(dim_mask, sig_dim, np.nan), axis=1)
-                sig_dim_med = np.where(np.isfinite(sig_dim_med), sig_dim_med, 0.0)
-                n_dim = np.maximum(np.sum(dim_mask, axis=1), 1)
-
-                # Debias pure-noise 10th-percentile downward shift while preserving bloom <= 0
-                col_floor_debiased = col_floor + z_q10 * sig_dim_med
-                floor_est = np.where(
-                    np.isfinite(col_floor_debiased),
-                    np.minimum(col_floor_debiased, 0.0),
-                    0.0,
-                )
-
-                med_var_dim = float(_unit_normal_median_variance(int(np.median(n_dim))))
-                theo_floor_var = (
-                    med_var_dim
-                    * np.sum(np.where(dim_mask, sig_dim * sig_dim, 0.0), axis=1)
-                    / n_dim
-                )
-                # Unit-sensitivity edge-halo pedestal uncertainty: local vertical rise across
-                # the dimmest quartile (p25 - p10) plus order-statistic zero-point uncertainty.
-                sigma_ped = np.where(
-                    np.isfinite(p25) & np.isfinite(p10),
-                    np.maximum(p25 - p10, 0.0),
-                    0.0,
-                )
-                m_hat[:, c] = floor_est
-                m_err[:, c] = np.sqrt(
-                    np.maximum(
-                        theo_floor_var + sig_dim_med * sig_dim_med + sigma_ped * sigma_ped,
-                        1e-12,
-                    )
-                )
-                c_bleed_mask[c] = False
-
-    if not np.any(c_bleed_mask):
-        return m_hat, m_err, np.zeros(nx, dtype=bool)
-
-    # Precompute flat-corrected anchor signal U_{t,r,c'} = (I_{t,r,c'} - M_{t,c'}) / F_{r,c'}
-    u_anchor_all = (sci_pre_smear - m_hat[:, None, :]) / safe_flat[None, :, :]
-    anchor_pixel_ok = (
-        (~c_bleed_mask)[None, :]
-        & (~strap_col_mask)[None, :]
-        & (~sat_bleed_2d)
-        & (~source_mask_2d)
-    )
-    # If every non-bleed column happened to fall on a strap, relax strap exclusion rather than fail
-    if not np.any(anchor_pixel_ok) and np.any(~c_bleed_mask):
-        anchor_pixel_ok = (~c_bleed_mask)[None, :] & (~sat_bleed_2d) & (~source_mask_2d)
-
-    bleed_cols = np.flatnonzero(c_bleed_mask)
-    unresolved_col_mask = np.zeros(nx, dtype=bool)
-    resolvable_cols: list[int] = []
-
-    for c in bleed_cols:
-        n_clean = int(np.sum(clean_rows_2d[:, c]))
-        if n_clean < min_clean_rows:
-            unresolved_col_mask[int(c)] = True
-        else:
-            resolvable_cols.append(int(c))
-
-    if resolvable_cols:
-        n_res = len(resolvable_cols)
-        j_hat = np.zeros((n_t, ny, n_res), dtype=np.float64)
-        flank_smear_var = np.zeros((n_t, n_res), dtype=np.float64)
-        clamp_grad_var = np.zeros((n_t, n_res), dtype=np.float64)
-        clean_sub = clean_rows_2d[:, resolvable_cols]  # (ny, n_res)
-
-        for idx_b, c in enumerate(resolvable_cols):
-            # Vectorized nearest-flank_width anchor selection across all ny rows:
-            # Left flank: columns c-1, c-2, ..., 0 (nearest first)
-            if c > 0:
-                ok_l_rev = anchor_pixel_ok[:, c - 1 :: -1]  # (ny, c)
-                sel_l = ok_l_rev & (np.cumsum(ok_l_rev, axis=1) <= flank_width)
-                n_l = np.sum(sel_l, axis=1)  # (ny,)
-                has_l = n_l > 0
-                xs_l_rev = np.arange(c - 1, -1, -1, dtype=np.float64)
-                c_l = np.sum(np.where(sel_l, xs_l_rev[None, :], 0.0), axis=1) / np.maximum(
-                    n_l, 1
-                )
-                u_l_rev = u_anchor_all[:, :, c - 1 :: -1]  # (n_t, ny, c)
-                u_l = np.sum(
-                    np.where(sel_l[None, :, :], u_l_rev, 0.0), axis=2
-                ) / np.maximum(n_l[None, :], 1)
-                m_var_l_rev = m_err[:, c - 1 :: -1] ** 2  # (n_t, c)
-                v_l = np.sum(
-                    np.where(sel_l[None, :, :], m_var_l_rev[:, None, :], 0.0), axis=2
-                ) / np.maximum(n_l[None, :] * n_l[None, :], 1)
-            else:
-                ok_l_rev = np.zeros((ny, 0), dtype=bool)
-                xs_l_rev = np.zeros(0, dtype=np.float64)
-                u_l_rev = np.zeros((n_t, ny, 0), dtype=np.float64)
-                has_l = np.zeros(ny, dtype=bool)
-                c_l = np.zeros(ny, dtype=np.float64)
-                u_l = np.zeros((n_t, ny), dtype=np.float64)
-                v_l = np.zeros((n_t, ny), dtype=np.float64)
-
-            # Right flank: columns c+1, c+2, ..., nx-1 (nearest first)
-            if c + 1 < nx:
-                ok_r = anchor_pixel_ok[:, c + 1 :]  # (ny, nx - c - 1)
-                sel_r = ok_r & (np.cumsum(ok_r, axis=1) <= flank_width)
-                n_r = np.sum(sel_r, axis=1)  # (ny,)
-                has_r = n_r > 0
-                xs_r = np.arange(c + 1, nx, dtype=np.float64)
-                c_r = np.sum(np.where(sel_r, xs_r[None, :], 0.0), axis=1) / np.maximum(
-                    n_r, 1
-                )
-                u_r_sub = u_anchor_all[:, :, c + 1 :]
-                u_r = np.sum(
-                    np.where(sel_r[None, :, :], u_r_sub, 0.0), axis=2
-                ) / np.maximum(n_r[None, :], 1)
-                m_var_r = m_err[:, c + 1 :] ** 2
-                v_r = np.sum(
-                    np.where(sel_r[None, :, :], m_var_r[:, None, :], 0.0), axis=2
-                ) / np.maximum(n_r[None, :] * n_r[None, :], 1)
-            else:
-                ok_r = np.zeros((ny, 0), dtype=bool)
-                xs_r = np.zeros(0, dtype=np.float64)
-                u_r_sub = np.zeros((n_t, ny, 0), dtype=np.float64)
-                has_r = np.zeros(ny, dtype=bool)
-                c_r = np.zeros(ny, dtype=np.float64)
-                u_r = np.zeros((n_t, ny), dtype=np.float64)
-                v_r = np.zeros((n_t, ny), dtype=np.float64)
-
-            both = has_l & has_r
-            only_l = has_l & (~has_r)
-            only_r = has_r & (~has_l)
-            row_has_anchor = clean_sub[:, idx_b] & (has_l | has_r)
-
-            if not np.any(row_has_anchor):
-                # No anchor columns available anywhere in stamp: fallback to off-target smear
-                clean_sub[:, idx_b] = False
-                if off_target_smear is not None:
-                    m_hat[:, c] = off_target_smear
-                    base_off_err = (
-                        np.where(np.isfinite(off_target_smear_err), off_target_smear_err, 0.0)
-                        if off_target_smear_err is not None
-                        else np.zeros(n_t, dtype=np.float64)
-                    )
-                    m_err[:, c] = np.hypot(base_off_err, unres_smear_scale)
-                else:
-                    unresolved_col_mask[c] = True
-                continue
-
-            clean_sub[:, idx_b] &= row_has_anchor
-            if int(np.sum(clean_sub[:, idx_b])) < min_clean_rows:
-                clean_sub[:, idx_b] = False
-                unresolved_col_mask[c] = True
-                continue
-
-            denom_lr = np.where(both, c_r - c_l, 1.0)
-            alpha = (float(c) - c_l) / denom_lr
-            u_both = (1.0 - alpha[None, :]) * u_l + alpha[None, :] * u_r
-            v_both = ((1.0 - alpha[None, :]) ** 2) * v_l + (alpha[None, :] ** 2) * v_r
-
-            u_comb = np.where(
-                both[None, :],
-                u_both,
-                np.where(only_l[None, :], u_l, np.where(only_r[None, :], u_r, 0.0)),
-            )
-            j_hat[:, :, idx_b] = safe_flat[:, c][None, :] * u_comb
-            row_flank_var = np.where(
-                both[None, :],
-                v_both,
-                np.where(only_l[None, :], v_l, np.where(only_r[None, :], v_r, 0.0)),
-            )
-            row_clamp_dist = np.where(
-                only_l,
-                np.abs(float(c) - c_l),
-                np.where(only_r, np.abs(float(c) - c_r), 0.0),
-            )
-
-            # Vectorized 4-column horizontal gradient on one-sidedly clamped rows
-            row_grad = np.zeros((n_t, ny), dtype=np.float64)
-            r_ok = clean_sub[:, idx_b]
-            clamped_l_rows = np.flatnonzero(r_ok & only_l)
-            if clamped_l_rows.size > 0 and c > 0:
-                ok4 = ok_l_rev[clamped_l_rows]
-                sel4 = ok4 & (np.cumsum(ok4, axis=1) <= 4)
-                cnt4 = np.sum(sel4, axis=1)
-                xm = np.sum(np.where(sel4, xs_l_rev[None, :], 0.0), axis=1) / np.maximum(
-                    cnt4, 1
-                )
-                dx = np.where(sel4, xs_l_rev[None, :] - xm[:, None], 0.0)
-                den = np.sum(dx * dx, axis=1)
-                slp = np.sum(
-                    np.where(sel4[None, :, :], u_l_rev[:, clamped_l_rows, :], 0.0)
-                    * dx[None, :, :],
-                    axis=2,
-                ) / np.where(den[None, :] > 0.0, den[None, :], 1.0)
-                has2 = (cnt4 >= 2) & (den > 0.0)
-                row_grad[:, clamped_l_rows] = np.where(
-                    has2[None, :],
-                    np.abs(slp) * safe_flat[clamped_l_rows, c][None, :],
-                    0.05 * np.abs(j_hat[:, clamped_l_rows, idx_b]),
-                )
-
-            clamped_r_rows = np.flatnonzero(r_ok & only_r)
-            if clamped_r_rows.size > 0 and (c + 1 < nx):
-                ok4 = ok_r[clamped_r_rows]
-                sel4 = ok4 & (np.cumsum(ok4, axis=1) <= 4)
-                cnt4 = np.sum(sel4, axis=1)
-                xm = np.sum(np.where(sel4, xs_r[None, :], 0.0), axis=1) / np.maximum(
-                    cnt4, 1
-                )
-                dx = np.where(sel4, xs_r[None, :] - xm[:, None], 0.0)
-                den = np.sum(dx * dx, axis=1)
-                slp = np.sum(
-                    np.where(sel4[None, :, :], u_r_sub[:, clamped_r_rows, :], 0.0)
-                    * dx[None, :, :],
-                    axis=2,
-                ) / np.where(den[None, :] > 0.0, den[None, :], 1.0)
-                has2 = (cnt4 >= 2) & (den > 0.0)
-                row_grad[:, clamped_r_rows] = np.where(
-                    has2[None, :],
-                    np.abs(slp) * safe_flat[clamped_r_rows, c][None, :],
-                    0.05 * np.abs(j_hat[:, clamped_r_rows, idx_b]),
-                )
-
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                flank_smear_var[:, idx_b] = np.nanmedian(row_flank_var[:, r_ok], axis=1)
-                clamped_rows = r_ok & (row_clamp_dist > 0.0)
-                if np.any(clamped_rows):
-                    # Evaluate gradient inflation over the furthest low-flux clamped rows
-                    j_med_r = np.nanmedian(j_hat[:, clamped_rows, idx_b], axis=0)
-                    if np.any(np.isfinite(j_med_r)):
-                        q_thresh = float(np.nanpercentile(j_med_r, 35.0))
-                        far_clamped = np.flatnonzero(clamped_rows)[j_med_r <= q_thresh]
-                    else:
-                        far_clamped = np.flatnonzero(clamped_rows)
-                    if far_clamped.size == 0:
-                        far_clamped = np.flatnonzero(clamped_rows)
-                    grad_term = (
-                        row_clamp_dist[None, far_clamped] * row_grad[:, far_clamped]
-                    ) ** 2
-                    clamp_grad_var[:, idx_b] = np.nanmedian(grad_term, axis=1)
-
-        active_rel = [i for i in range(n_res) if np.any(clean_sub[:, i])]
-        if active_rel:
-            act_cols = [resolvable_cols[i] for i in active_rel]
-            j_act = j_hat[:, :, active_rel]
-            clean_act = clean_sub[:, active_rel]
-            i_act = sci_pre_smear[:, :, act_cols]
-            sig_act = np.maximum(sci_sigma_pre[:, :, act_cols], 1e-6)
-
-            # Inverse-wing weights: omega_{t,r,c} = 1 / ((J_hat - min_{r'} J_hat)^2 + sigma_I^2)
-            j_masked = np.where(clean_act[None, :, :], j_act, np.inf)
-            j_min = np.min(j_masked, axis=1, keepdims=True)
-            j_min = np.where(np.isfinite(j_min), j_min, 0.0)
-            wing_excess = np.where(clean_act[None, :, :], j_act - j_min, 0.0)
-            inv_wing_w = np.where(
-                clean_act[None, :, :],
-                1.0 / (wing_excess * wing_excess + sig_act * sig_act),
-                0.0,
-            )
-
-            residuals = i_act - j_act
-            loc_est, loc_err = _solve_huber_smear_location(
-                residuals,
-                inv_wing_w,
-                sig_act,
-                clean_act,
-            )
-
-            for k_idx, col_idx in enumerate(act_cols):
-                rel_i = active_rel[k_idx]
-                m_hat[:, col_idx] = loc_est[:, k_idx]
-                tot_var = (
-                    loc_err[:, k_idx] ** 2
-                    + flank_smear_var[:, rel_i]
-                    + clamp_grad_var[:, rel_i]
-                )
-                m_err[:, col_idx] = np.sqrt(np.maximum(tot_var, 1e-12))
-
-    # Fill any SMEAR_UNRESOLVED columns conservatively so FLUX/SMEAR_ERR remain finite
-    if np.any(unresolved_col_mask):
-        resolved_cols = np.flatnonzero(~unresolved_col_mask)
-        for c_unres in np.flatnonzero(unresolved_col_mask):
-            if off_target_smear is not None:
-                m_hat[:, c_unres] = off_target_smear
-                base_err = (
-                    np.asarray(off_target_smear_err, dtype=np.float64)
-                    if off_target_smear_err is not None
-                    else np.zeros(n_t, dtype=np.float64)
-                )
-            elif resolved_cols.size > 0:
-                nearest = int(resolved_cols[np.argmin(np.abs(resolved_cols - c_unres))])
-                m_hat[:, c_unres] = m_hat[:, nearest]
-                base_err = m_err[:, nearest].copy()
-            else:
-                base_err = np.zeros(n_t, dtype=np.float64)
-            finite_cad = np.any(np.isfinite(sci_pre_smear[:, :, c_unres]), axis=1)
-            safe_base = np.where(np.isfinite(base_err), base_err, 0.0)
-            fallback_err = np.hypot(safe_base, unres_smear_scale)
-            m_err[:, c_unres] = np.where(finite_cad, fallback_err, np.nan)
-
-    return m_hat, m_err, unresolved_col_mask
+# ---------------------------------------------------------------------------
+# Collateral streaming calibration & -blf.fits cache helpers
+# ---------------------------------------------------------------------------
 
 
 def _calibrate_tvcol_raw_to_blf(
@@ -2094,42 +891,28 @@ def _calibrate_tvcol_raw_to_blf(
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
     stage_dir: Path | None = None,
 ) -> Path:
-    """Stream ``tvcol`` in ``chunk_rows`` slices and publish ``tvcol-...-blf.fits``."""
     tv_hdr0, tv_hdr1, tv_time, tv_cad = read_collateral_headers_and_index(tv_col_path)
     n_total = len(tv_cad)
     n_eff_tv = effective_frame_count(
         tv_hdr0, tv_hdr1, fallback_hdr0=sci_hdr0, fallback_hdr1=sci_hdr1
     )
-
-    fxdoff = float(
-        tv_hdr1["FXDOFF"]
-        if "FXDOFF" in tv_hdr1
-        else (sci_hdr1["FXDOFF"] if sci_hdr1 is not None and "FXDOFF" in sci_hdr1 else 209700.0)
-    )
-    meanblc_key = f"MEANBLC{output}"
-    if meanblc_key in tv_hdr1:
-        meanblc = float(tv_hdr1[meanblc_key])
-    elif sci_hdr1 is not None and meanblc_key in sci_hdr1:
-        meanblc = float(sci_hdr1[meanblc_key])
-    else:
-        raise KeyError(f"Missing {meanblc_key} in collateral and science FITS headers.")
+    fxdoff = float(_hdr_lookup("FXDOFF", tv_hdr1, sci_hdr1) or 209700.0)
+    meanblc_val = _hdr_lookup(f"MEANBLC{output}", tv_hdr1, sci_hdr1)
+    if meanblc_val is None:
+        raise KeyError(f"Missing MEANBLC{output} in collateral and science FITS headers.")
 
     _, _, tx1, tx2 = OUTPUT_BOUNDS_0BASED[output]
-    b2d_tv = np.asarray(black2d_img[:, tx1:tx2], dtype=np.float64)  # (2078, 11)
-    bias_shift = -fxdoff + n_eff_tv * (meanblc - b2d_tv)[np.newaxis, :, :]
-
+    b2d_tv = np.asarray(black2d_img[:, tx1:tx2], dtype=np.float64)
+    bias_shift = -fxdoff + n_eff_tv * (float(meanblc_val) - b2d_tv)[np.newaxis, :, :]
     b1d_all = np.full((n_total, 2078), np.nan, dtype=np.float64)
     b1d_err_all = np.full((n_total, 2078), np.nan, dtype=np.float32)
 
-    for t0, t1, _t_chunk, _c_chunk, raw_chunk in iter_collateral_chunks(
+    for t0, t1, _tc, _cc, raw_chunk in iter_collateral_chunks(
         tv_col_path, "TVCOL_RAW", chunk_rows=chunk_rows
     ):
-        debiased = raw_chunk + bias_shift
-        b1d_chunk, err_chunk = fit_onedblack_legendre(debiased)
-        b1d_all[t0:t1] = np.asarray(b1d_chunk, dtype=np.float64)
-        b1d_err_all[t0:t1] = np.asarray(err_chunk, dtype=np.float32)
+        b1d_c, err_c = fit_onedblack_legendre(raw_chunk + bias_shift)
+        b1d_all[t0:t1], b1d_err_all[t0:t1] = b1d_c, err_c.astype(np.float32)
 
-    time_unit = str(tv_hdr1.get("TUNIT1", "BJD - 2457000, days"))
     return write_onedblack_blf(
         blf_dst,
         time=tv_time,
@@ -2137,7 +920,7 @@ def _calibrate_tvcol_raw_to_blf(
         black1d=b1d_all,
         black1d_err=b1d_err_all,
         n_eff=n_eff_tv,
-        time_unit=time_unit,
+        time_unit=str(tv_hdr1.get("TUNIT1", "BJD - 2457000, days")),
         stage_dir=stage_dir,
     )
 
@@ -2158,14 +941,12 @@ def _calibrate_smrow_chunk_e_per_frame(
     u_coeff: float,
     lin_channel: LinearityChannel,
     crmiten_var_factor: float = 1.0,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Calibrate a ``(N_c, 10, 512)`` ``SMROW_RAW`` chunk to electrons per frame."""
-    scale_1d = n_eff_sm / n_eff_tv
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     debiased = (
         sm_raw_chunk
         - fxdoff
         + n_eff_sm * (meanblc - b2d_sm)[np.newaxis, :, :]
-        - scale_1d * b1d_sm[:, :, np.newaxis]
+        - (n_eff_sm / n_eff_tv) * b1d_sm[:, :, np.newaxis]
     )
     sm_e_np, sm_sat_np, sm_gain_np = calibrate_pre_smear_e_per_frame(
         debiased,
@@ -2175,42 +956,107 @@ def _calibrate_smrow_chunk_e_per_frame(
         gain=gain,
         reverse_readout=OUTPUT_REVERSE_READOUT[output],
     )
-
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        smear_med = np.nanmedian(sm_e_np, axis=1)  # (N_c, 512)
-        mad_rows = 1.4826 * np.nanmedian(
-            np.abs(sm_e_np - smear_med[:, np.newaxis, :]), axis=1
-        )
+        smear_med = np.nanmedian(sm_e_np, axis=1)
+        mad_rows = 1.4826 * np.nanmedian(np.abs(sm_e_np - smear_med[:, np.newaxis, :]), axis=1)
 
-    n_valid = np.sum(np.isfinite(sm_e_np), axis=1)  # (N_c, 512)
+    n_valid = np.sum(np.isfinite(sm_e_np), axis=1)
     med_var = _unit_normal_median_variance(n_valid)
     emp_var = med_var * (mad_rows * mad_rows)
-    row_shot_read = (
+    theo_var = med_var * (
         float(crmiten_var_factor)
         * (np.maximum(smear_med, 0.0) + read_noise_e * read_noise_e)
         / n_eff_sm
     )
-    theo_var = med_var * row_shot_read
     if b1d_err_sm is not None:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
             mean_g = np.nanmedian(sm_gain_np, axis=1)
             b1d_sm_med = np.nanmean(b1d_err_sm, axis=1)[:, np.newaxis]
         mean_g = np.where(np.isfinite(mean_g), mean_g, gain)
-        b1d_var = ((mean_g * b1d_sm_med) / n_eff_tv) ** 2
-        b1d_var = np.where(np.isfinite(b1d_var), b1d_var, 0.0)
+        b1d_var = np.where(np.isfinite(b1d_sm_med), ((mean_g * b1d_sm_med) / n_eff_tv) ** 2, 0.0)
     else:
         b1d_var = 0.0
 
-    # Gate 10-row MAD variance so pure Gaussian fluctuations are not rectified upward,
-    # while genuine unmodelled row scatter (e.g. bleed/strap structure > 2.5 * theo_var) overrides.
     gated_var = np.where(emp_var > 2.5 * theo_var, emp_var, theo_var)
-    smear_err = np.sqrt(gated_var + b1d_var)
-    smear_err = np.where(n_valid > 0, smear_err, np.nan)
-    sm_sat_2d = np.any(sm_sat_np, axis=1)  # (N_c, 512)
-    sm_sat_cols = np.any(sm_sat_2d, axis=0)  # (512,)
-    return smear_med, smear_err, sm_sat_cols, sm_sat_2d
+    smear_err = np.where(n_valid > 0, np.sqrt(gated_var + b1d_var), np.nan)
+    return smear_med, smear_err, np.any(sm_sat_np, axis=1)
+
+
+def _stream_calibrate_smrow_rows(
+    sm_col_path: Path,
+    *,
+    output: str,
+    black2d_img: np.ndarray,
+    lin_channel: LinearityChannel,
+    u_coeff: float,
+    b1d_sm_rows: np.ndarray,
+    b1d_err_sm_rows: np.ndarray | None,
+    n_eff_tv: float,
+    target_matched: np.ndarray,
+    target_to_sm_idx: np.ndarray,
+    sci_hdr0: fits.Header | None = None,
+    sci_hdr1: fits.Header | None = None,
+    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    sm_hdr0, sm_hdr1, _, _ = read_collateral_headers_and_index(sm_col_path)
+    n_eff_sm = effective_frame_count(
+        sm_hdr0, sm_hdr1, fallback_hdr0=sci_hdr0, fallback_hdr1=sci_hdr1
+    )
+    crmiten_var_sm = _crmiten_variance_factor(
+        sm_hdr0, sm_hdr1, fallback_hdr0=sci_hdr0, fallback_hdr1=sci_hdr1
+    )
+
+    def _hf(key: str, default: float | None = None) -> float:
+        val = _hdr_lookup(key, sm_hdr1, sci_hdr1)
+        if val is not None:
+            return float(val)
+        if default is not None:
+            return default
+        raise KeyError(f"Missing {key} in collateral and science FITS headers.")
+
+    fxdoff, meanblc = _hf("FXDOFF", 209700.0), _hf(f"MEANBLC{output}")
+    gain, read_noise_e = _hf(f"GAIN{output}"), _hf(f"READNOI{output}", 8.5)
+    sx1, sx2, _, _ = OUTPUT_BOUNDS_0BASED[output]
+    b2d_sm = np.asarray(black2d_img[2058:2068, sx1:sx2], dtype=np.float64)
+
+    n_target = len(target_matched)
+    smear_out = np.full((n_target, 512), np.nan, dtype=np.float64)
+    smear_err_out = np.full((n_target, 512), np.nan, dtype=np.float64)
+    smear_sat_out = np.zeros((n_target, 512), dtype=bool)
+    for t0, t1, _tc, _cc, raw_chunk in iter_collateral_chunks(
+        sm_col_path,
+        "SMROW_RAW",
+        chunk_rows=chunk_rows,
+        row_indices=target_to_sm_idx[target_matched],
+    ):
+        in_chunk = (target_to_sm_idx >= t0) & (target_to_sm_idx < t1) & target_matched
+        if not np.any(in_chunk):
+            continue
+        dst_sel = np.flatnonzero(in_chunk)
+        sm_med, sm_err, sm_sat_2d = _calibrate_smrow_chunk_e_per_frame(
+            raw_chunk[target_to_sm_idx[dst_sel] - t0],
+            output=output,
+            fxdoff=fxdoff,
+            meanblc=meanblc,
+            gain=gain,
+            read_noise_e=read_noise_e,
+            n_eff_sm=n_eff_sm,
+            n_eff_tv=n_eff_tv,
+            b2d_sm=b2d_sm,
+            b1d_sm=b1d_sm_rows[dst_sel],
+            b1d_err_sm=b1d_err_sm_rows[dst_sel] if b1d_err_sm_rows is not None else None,
+            u_coeff=u_coeff,
+            lin_channel=lin_channel,
+            crmiten_var_factor=crmiten_var_sm,
+        )
+        smear_out[dst_sel], smear_err_out[dst_sel], smear_sat_out[dst_sel] = (
+            sm_med,
+            sm_err,
+            sm_sat_2d,
+        )
+    return smear_out, smear_err_out, smear_sat_out
 
 
 def _calibrate_smrow_raw_to_standard_blf(
@@ -2228,24 +1074,17 @@ def _calibrate_smrow_raw_to_standard_blf(
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
     stage_dir: Path | None = None,
 ) -> Path:
-    """Stream ``smrow`` in ``chunk_rows`` slices and publish standard ``smrow-...-blf.fits``."""
     sm_hdr0, sm_hdr1, sm_time, sm_cad = read_collateral_headers_and_index(sm_col_path)
-    n_total = len(sm_cad)
     n_eff_sm = effective_frame_count(
         sm_hdr0, sm_hdr1, fallback_hdr0=sci_hdr0, fallback_hdr1=sci_hdr1
     )
-    crmiten_var_sm = _crmiten_variance_factor(
-        sm_hdr0, sm_hdr1, fallback_hdr0=sci_hdr0, fallback_hdr1=sci_hdr1
-    )
-
     with fits.open(tv_blf_path, memmap=True) as tv_hdul:
         tv_hdu1 = tv_hdul[1]
         tv_cad = np.asarray(tv_hdu1.data["CADENCENO"], dtype=np.int64)
         tv_b1d_sm = np.asarray(tv_hdu1.data["1DBLACK"][:, 2058:2068], dtype=np.float64)
-        has_err = "1DBLACK_ERR" in (tv_hdu1.data.names or ())
         tv_err_sm = (
             np.asarray(tv_hdu1.data["1DBLACK_ERR"][:, 2058:2068], dtype=np.float64)
-            if has_err
+            if "1DBLACK_ERR" in (tv_hdu1.data.names or ())
             else None
         )
         n_eff_tv = float(tv_hdu1.header.get("NEFF", n_eff_sm))
@@ -2253,64 +1092,26 @@ def _calibrate_smrow_raw_to_standard_blf(
     matched_tv, tv_idx = match_cadenceno(
         sm_cad, tv_cad, cadence_match=cadence_match, label=f"tvcol-blf ({output})"
     )
-
-    def _hdr_float(key: str, default: float | None = None) -> float:
-        for hdr in (sm_hdr1, sci_hdr1):
-            if hdr is not None and key in hdr:
-                return float(hdr[key])
-        if default is not None:
-            return default
-        raise KeyError(f"Missing {key} in collateral and science FITS headers.")
-
-    fxdoff = _hdr_float("FXDOFF", 209700.0)
-    meanblc = _hdr_float(f"MEANBLC{output}")
-    gain = _hdr_float(f"GAIN{output}")
-    read_noise_e = _hdr_float(f"READNOI{output}", 8.5)
-    int_time = _hdr_float("INT_TIME", 1.98)
-
-    sx1, sx2, _, _ = OUTPUT_BOUNDS_0BASED[output]
-    b2d_sm = np.asarray(black2d_img[2058:2068, sx1:sx2], dtype=np.float64)
-
-    smear_all = np.full((n_total, 512), np.nan, dtype=np.float64)
-    smear_err_all = np.full((n_total, 512), np.nan, dtype=np.float32)
-    smear_sat_all = np.zeros((n_total, 512), dtype=bool)
-
-    for t0, t1, _t_chunk, _c_chunk, raw_chunk in iter_collateral_chunks(
-        sm_col_path, "SMROW_RAW", chunk_rows=chunk_rows
-    ):
-        chunk_matched = matched_tv[t0:t1]
-        if not np.any(chunk_matched):
-            continue
-        safe_tv_idx = np.where(chunk_matched, tv_idx[t0:t1], 0)
-        b1d_chunk = np.where(chunk_matched[:, None], tv_b1d_sm[safe_tv_idx], np.nan)
-        err_chunk = (
-            np.where(chunk_matched[:, None], tv_err_sm[safe_tv_idx], np.nan)
-            if tv_err_sm is not None
-            else None
-        )
-        sm_med, sm_err, _, sm_sat_2d = _calibrate_smrow_chunk_e_per_frame(
-            raw_chunk,
-            output=output,
-            fxdoff=fxdoff,
-            meanblc=meanblc,
-            gain=gain,
-            read_noise_e=read_noise_e,
-            n_eff_sm=n_eff_sm,
-            n_eff_tv=n_eff_tv,
-            b2d_sm=b2d_sm,
-            b1d_sm=b1d_chunk,
-            b1d_err_sm=err_chunk,
-            u_coeff=u_coeff,
-            lin_channel=lin_channel,
-            crmiten_var_factor=crmiten_var_sm,
-        )
-        smear_all[t0:t1] = np.where(chunk_matched[:, None], sm_med, np.nan)
-        smear_err_all[t0:t1] = np.where(
-            chunk_matched[:, None], sm_err.astype(np.float32), np.float32(np.nan)
-        )
-        smear_sat_all[t0:t1] = np.where(chunk_matched[:, None], sm_sat_2d, False)
-
-    time_unit = str(sm_hdr1.get("TUNIT1", "BJD - 2457000, days"))
+    safe_tv = np.where(matched_tv, tv_idx, 0)
+    b1d_al = np.where(matched_tv[:, None], tv_b1d_sm[safe_tv], np.nan)
+    err_al = (
+        np.where(matched_tv[:, None], tv_err_sm[safe_tv], np.nan) if tv_err_sm is not None else None
+    )
+    smear_all, smear_err_all, smear_sat_all = _stream_calibrate_smrow_rows(
+        sm_col_path,
+        output=output,
+        black2d_img=black2d_img,
+        lin_channel=lin_channel,
+        u_coeff=u_coeff,
+        b1d_sm_rows=b1d_al,
+        b1d_err_sm_rows=err_al,
+        n_eff_tv=n_eff_tv,
+        target_matched=matched_tv,
+        target_to_sm_idx=np.arange(len(sm_cad), dtype=np.int64),
+        sci_hdr0=sci_hdr0,
+        sci_hdr1=sci_hdr1,
+        chunk_rows=chunk_rows,
+    )
     tv_all_matched = bool(
         np.all(matched_tv) and np.array_equal(tv_idx, np.arange(len(sm_cad), dtype=np.int64))
     )
@@ -2319,41 +1120,49 @@ def _calibrate_smrow_raw_to_standard_blf(
         time=sm_time,
         cadenceno=sm_cad,
         smear=smear_all,
-        smear_err=smear_err_all,
+        smear_err=smear_err_all.astype(np.float32),
         smear_sat=smear_sat_all,
         smear_mode="standard",
         cadence_match=cadence_match,
         source_mask_digest="NONE",
         tv_all_matched=tv_all_matched,
-        int_time=int_time,
-        time_unit=time_unit,
+        int_time=float(_hdr_lookup("INT_TIME", sm_hdr1, sci_hdr1) or 1.98),
+        time_unit=str(sm_hdr1.get("TUNIT1", "BJD - 2457000, days")),
         stage_dir=stage_dir,
     )
 
 
-def _find_valid_tvcol_blf(
+def _smear_cache_matches_cutout(
+    hdr: fits.Header,
+    smear_mode: str,
+    cutout_bounds: tuple[int, int, int, int] | None = None,
     *,
-    sector: int,
-    camera: int,
-    ccd: int,
-    output: str,
-    cadence: CadenceKind,
-    ddir: str | os.PathLike[str] | None,
-    cache_dir: Path | None,
-    tpf_parts: list[str] | None = None,
+    cadence_match: str = "cadenceno",
+    source_mask_digest: str = "NONE",
+) -> bool:
+    if "SMEARMOD" in hdr and str(hdr["SMEARMOD"]).strip() != smear_mode:
+        return False
+    if str(hdr.get("CADMATCH", "")).strip() != str(cadence_match):
+        if not (smear_mode == "standard" and hdr.get("TVMATCH") is True):
+            return False
+    if str(hdr.get("SRCMASK", "")).strip() != str(source_mask_digest):
+        return False
+    if smear_mode == "standard":
+        return "CRVAL1P" not in hdr and "CUTNX" not in hdr
+    if smear_mode == "alternate":
+        if str(hdr.get("SMEARMOD", "")).strip() != "alternate" or cutout_bounds is None:
+            return False
+        for key, val in zip(("CRVAL1P", "CUTNX", "CRVAL2P", "CUTNY"), cutout_bounds, strict=True):
+            if key not in hdr or int(hdr[key]) != int(val):
+                return False
+    return True
+
+
+def _find_valid_tvcol_blf(
+    spec: CollateralSpec, *, ddir: str | os.PathLike[str] | None, cache_dir: Path | None
 ) -> Path | None:
-    """Return the first cached ``tvcol-...-blf.fits`` with a valid ``1DBLACK`` column."""
     for cand in find_all_cached_blf(
-        sector=sector,
-        camera=camera,
-        ccd=ccd,
-        output=output,
-        kind="tvcol",
-        cadence=cadence,
-        smear_mode="standard",
-        ddir=ddir,
-        cache_dir=cache_dir,
-        tpf_parts=tpf_parts,
+        spec, kind="tvcol", smear_mode="standard", ddir=ddir, cache_dir=cache_dir
     ):
         with contextlib.suppress(OSError), fits.open(cand, memmap=True) as hdul:
             if len(hdul) >= 2 and "1DBLACK" in (hdul[1].columns.names or ()):
@@ -2362,41 +1171,22 @@ def _find_valid_tvcol_blf(
 
 
 def _find_valid_smrow_blf(
+    spec: CollateralSpec,
     *,
-    sector: int,
-    camera: int,
-    ccd: int,
-    output: str,
-    cadence: CadenceKind,
     smear_mode: str,
     ddir: str | os.PathLike[str] | None,
     cache_dir: Path | None,
-    tpf_parts: list[str] | None = None,
-    ticid: int | None = None,
     cutout_bounds: tuple[int, int, int, int] | None = None,
     require_alt_unres: bool = False,
     required_cadenceno: np.ndarray | None = None,
     cadence_match: CadenceMatchMode = "cadenceno",
     source_mask_digest: str = "NONE",
 ) -> Path | None:
-    """Return the first cached ``smrow-...-blf.fits`` matching mode, bounds, and provenance."""
     req_cad = (
-        np.asarray(required_cadenceno, dtype=np.int64)
-        if required_cadenceno is not None
-        else None
+        np.asarray(required_cadenceno, dtype=np.int64) if required_cadenceno is not None else None
     )
     for cand in find_all_cached_blf(
-        sector=sector,
-        camera=camera,
-        ccd=ccd,
-        output=output,
-        kind="smrow",
-        cadence=cadence,
-        smear_mode=smear_mode,
-        ddir=ddir,
-        cache_dir=cache_dir,
-        tpf_parts=tpf_parts,
-        ticid=ticid,
+        spec, kind="smrow", smear_mode=smear_mode, ddir=ddir, cache_dir=cache_dir
     ):
         with contextlib.suppress(OSError), fits.open(cand, memmap=True) as hdul:
             if len(hdul) < 2 or "SMEAR" not in (hdul[1].columns.names or ()):
@@ -2434,7 +1224,6 @@ def _alt_blf_has_more_cadences(
     cadence_match: CadenceMatchMode = "cadenceno",
     source_mask_digest: str = "NONE",
 ) -> bool:
-    """Return True if ``path`` holds a matching alternate cache with > ``n_new`` rows."""
     if not path.is_file():
         return False
     with contextlib.suppress(OSError), fits.open(path, memmap=True) as hdul:
@@ -2468,7 +1257,7 @@ def build_sector_output_blf_caches(
     stage_dir: Path | None = None,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
     offline: bool = False,
-    strict_hpc: bool = True,
+    strict_hpc: bool = False,
     cleanup_staged_raw: bool = True,
     s3_fs: Any = None,
     verbose: bool = False,
@@ -2478,27 +1267,15 @@ def build_sector_output_blf_caches(
     if out_upper not in OUTPUT_ORDER:
         raise ValueError(f"Invalid CCD output {output!r}; expected one of {OUTPUT_ORDER}.")
 
-    resolved_cache = resolve_cache_dir(cache_dir, strict_hpc=strict_hpc, create=True)
-    sec_dir = resolved_cache / f"s{sector:04d}"
-
-    tv_cached = _find_valid_tvcol_blf(
-        sector=sector,
-        camera=camera,
-        ccd=ccd,
-        output=out_upper,
-        cadence=cadence,
-        ddir=ddir,
-        cache_dir=resolved_cache,
+    resolved_cache = resolve_cache_dir(
+        cache_dir, env_var="MUNDEY_CACHE_DIR", strict_hpc=strict_hpc, create=True
     )
+    spec = CollateralSpec(sector, camera, ccd, out_upper, cadence=cadence)
+    sec_dir = resolved_cache / spec.sector_subdir
+
+    tv_cached = _find_valid_tvcol_blf(spec, ddir=ddir, cache_dir=resolved_cache)
     sm_cached = _find_valid_smrow_blf(
-        sector=sector,
-        camera=camera,
-        ccd=ccd,
-        output=out_upper,
-        cadence=cadence,
-        smear_mode="standard",
-        ddir=ddir,
-        cache_dir=resolved_cache,
+        spec, smear_mode="standard", ddir=ddir, cache_dir=resolved_cache
     )
     if tv_cached is not None and sm_cached is not None:
         return tv_cached, sm_cached
@@ -2514,23 +1291,16 @@ def build_sector_output_blf_caches(
             s3_fs=s3_fs,
             verbose=verbose,
         )
-
     with fits.open(models.black2d_path, memmap=True) as b2d_hdul:
         black2d_img = np.asarray(b2d_hdul[1].data, dtype=np.float64)
-
     lin_channel = load_linearity_channel(models.linearity_path, camera, ccd, out_upper)
     u_coeff = load_undershoot_coeff(camera, ccd, out_upper)
-
     stage_root = stage_dir.resolve(strict=False) if stage_dir is not None else None
 
     if tv_cached is None:
-        tv_raw_path = resolve_collateral_file(
-            sector=sector,
-            camera=camera,
-            ccd=ccd,
-            output=out_upper,
+        tv_raw = resolve_collateral_file(
+            spec,
             kind="tvcol",
-            cadence=cadence,
             ddir=ddir,
             cache_dir=resolved_cache,
             offline=offline,
@@ -2539,18 +1309,9 @@ def build_sector_output_blf_caches(
             s3_fs=s3_fs,
             verbose=verbose,
         )
-        tv_dst = collateral_blf_cache_path(
-            sec_dir,
-            sector=sector,
-            camera=camera,
-            ccd=ccd,
-            output=out_upper,
-            kind="tvcol",
-            cadence=cadence,
-            col_stem=tv_raw_path.stem,
-        )
+        tv_dst = collateral_blf_cache_path(sec_dir, spec, kind="tvcol", col_stem=tv_raw.stem)
         tv_cached = _calibrate_tvcol_raw_to_blf(
-            tv_raw_path,
+            tv_raw,
             tv_dst,
             output=out_upper,
             black2d_img=black2d_img,
@@ -2560,19 +1321,15 @@ def build_sector_output_blf_caches(
         if (
             cleanup_staged_raw
             and stage_root is not None
-            and tv_raw_path.resolve(strict=False).parent == stage_root
+            and tv_raw.resolve(strict=False).parent == stage_root
         ):
             with contextlib.suppress(OSError):
-                tv_raw_path.unlink()
+                tv_raw.unlink()
 
     if sm_cached is None:
-        sm_raw_path = resolve_collateral_file(
-            sector=sector,
-            camera=camera,
-            ccd=ccd,
-            output=out_upper,
+        sm_raw = resolve_collateral_file(
+            spec,
             kind="smrow",
-            cadence=cadence,
             ddir=ddir,
             cache_dir=resolved_cache,
             offline=offline,
@@ -2582,18 +1339,10 @@ def build_sector_output_blf_caches(
             verbose=verbose,
         )
         sm_dst = collateral_blf_cache_path(
-            sec_dir,
-            sector=sector,
-            camera=camera,
-            ccd=ccd,
-            output=out_upper,
-            kind="smrow",
-            cadence=cadence,
-            smear_mode="standard",
-            col_stem=sm_raw_path.stem,
+            sec_dir, spec, kind="smrow", smear_mode="standard", col_stem=sm_raw.stem
         )
         sm_cached = _calibrate_smrow_raw_to_standard_blf(
-            sm_raw_path,
+            sm_raw,
             tv_cached,
             sm_dst,
             output=out_upper,
@@ -2606,78 +1355,1075 @@ def build_sector_output_blf_caches(
         if (
             cleanup_staged_raw
             and stage_root is not None
-            and sm_raw_path.resolve(strict=False).parent == stage_root
+            and sm_raw.resolve(strict=False).parent == stage_root
         ):
             with contextlib.suppress(OSError):
-                sm_raw_path.unlink()
+                sm_raw.unlink()
 
     return tv_cached, sm_cached
 
 
-def _smear_cache_matches_cutout(
-    hdr: fits.Header,
-    smear_mode: str,
-    cutout_bounds: tuple[int, int, int, int] | None = None,
+def prefetch_collateral(
     *,
-    cadence_match: str = "cadenceno",
-    source_mask_digest: str = "NONE",
-) -> bool:
-    """Verify a cached smear ``-blf.fits`` matches mode, cutout bounds, and provenance."""
-    if "SMEARMOD" in hdr and str(hdr["SMEARMOD"]).strip() != smear_mode:
-        return False
-    cad_matches = str(hdr.get("CADMATCH", "")).strip() == str(cadence_match)
-    if not cad_matches:
-        if not (smear_mode == "standard" and hdr.get("TVMATCH") is True):
-            return False
-    if str(hdr.get("SRCMASK", "")).strip() != str(source_mask_digest):
-        return False
-    if smear_mode == "standard":
-        return "CRVAL1P" not in hdr and "CUTNX" not in hdr
-    if smear_mode == "alternate":
-        if str(hdr.get("SMEARMOD", "")).strip() != "alternate":
-            return False
-        if cutout_bounds is None:
-            return False
-        crval1p, cutnx, crval2p, cutny = cutout_bounds
-        expected = (
-            ("CRVAL1P", crval1p),
-            ("CUTNX", cutnx),
-            ("CRVAL2P", crval2p),
-            ("CUTNY", cutny),
-        )
-        for key, val in expected:
-            if key not in hdr or int(hdr[key]) != int(val):
-                return False
-    return True
+    sector: int,
+    camera: int,
+    ccd: int,
+    outputs: tuple[str, ...] = ("A", "B", "C", "D"),
+    cadences: tuple[CadenceKind, ...] = ("2min",),
+    cache_dir: str | os.PathLike[str] | None = None,
+    ddir: str | os.PathLike[str] | None = None,
+    stage_dir: str | os.PathLike[str] | None = None,
+    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    offline: bool = False,
+    strict_hpc: bool = False,
+    cleanup_staged_raw: bool = True,
+    s3_fs: Any = None,
+    verbose: bool = False,
+) -> list[Path]:
+    """Prefetch static models and build ``-blf.fits`` caches in ``chunk_rows`` slices."""
+    resolved_cache = resolve_cache_dir(
+        cache_dir, env_var="MUNDEY_CACHE_DIR", strict_hpc=strict_hpc, create=True
+    )
+    if stage_dir is not None:
+        resolved_stage: Path | None = Path(stage_dir).expanduser()
+    elif os.environ.get("JOBFS", "").strip():
+        resolved_stage = Path(os.environ["JOBFS"].strip()).expanduser()
+    else:
+        resolved_stage = None
+
+    models = resolve_static_models(
+        camera,
+        ccd,
+        ddir=ddir,
+        cache_dir=resolved_cache,
+        offline=offline,
+        stage_dir=resolved_stage,
+        s3_fs=s3_fs,
+        verbose=verbose,
+    )
+    published: list[Path] = [models.black2d_path, models.flat_path, models.linearity_path]
+    normalized_outputs = tuple(o.upper() for o in outputs)
+    for out in normalized_outputs:
+        if out not in OUTPUT_ORDER:
+            raise ValueError(f"Invalid CCD output {out!r}; expected 'A', 'B', 'C', or 'D'.")
+
+    for cad in cadences:
+        for out in normalized_outputs:
+            tv_blf, sm_blf = build_sector_output_blf_caches(
+                sector=sector,
+                camera=camera,
+                ccd=ccd,
+                output=out,
+                cadence=cad,
+                models=models,
+                cache_dir=resolved_cache,
+                ddir=ddir,
+                stage_dir=resolved_stage,
+                chunk_rows=chunk_rows,
+                offline=offline,
+                strict_hpc=strict_hpc,
+                cleanup_staged_raw=cleanup_staged_raw,
+                s3_fs=s3_fs,
+                verbose=verbose,
+            )
+            published.extend([tv_blf, sm_blf])
+    return published
 
 
-def _extract_raw_cnts_float64(hdu1: fits.BinTableHDU) -> np.ndarray:
-    """Extract ``RAW_CNTS`` as ``float64`` with ``-1`` / ``TNULL`` sentinels masked to ``NaN``."""
-    names = hdu1.data.names or ()
-    if "RAW_CNTS" not in names:
-        raise ValueError(
-            "TPF HDU[1] lacks a 'RAW_CNTS' column; use mundey.desmear_calibrated_cutout(tpf) "
-            "for TessCut / FFI cutouts without collateral data."
-        )
-    raw_arr = hdu1.data["RAW_CNTS"]
-    raw_f64 = np.asarray(raw_arr, dtype=np.float64)
+# ---------------------------------------------------------------------------
+# Decomposed chunked TPF recalibration pipeline
+# ---------------------------------------------------------------------------
 
-    null_val: int = -1
+
+@dataclass
+class _OutputSliceParams:
+    output: str
+    c0: int
+    c1: int
+    sm_c0: int
+    sm_c1: int
+    lin_channel: LinearityChannel
+    u_coeff: float
+    gain_sci: float
+    meanblc_sci: float
+    readnoi_sci: float
+    b2d_sci: np.ndarray
+    b1d_sci_rows: np.ndarray
+    b1d_err_sci_rows: np.ndarray
+    n_eff_tv: float
+
+
+@dataclass
+class _CalibrationContext:
+    hdul: fits.HDUList
+    sector: int
+    camera: int
+    ccd: int
+    ticid: int | None
+    n_tpf: int
+    ny: int
+    nx: int
+    col0_1based: int
+    row0_1based: int
+    x1_ccd0: int
+    y1_ccd0: int
+    cutout_bounds: tuple[int, int, int, int]
+    cols_1based: np.ndarray
+    col_outputs: tuple[str, ...]
+    unique_outputs: tuple[str, ...]
+    cadence_kind: CadenceKind
+    tpf_parts: tuple[str, ...] | None
+    resolved_cache: Path | None
+    blf_write_base: Path
+    warn_fred_on_write: bool
+    black2d_img: np.ndarray
+    flat_cutout: np.ndarray
+    models: StaticModelPaths
+    n_eff_sci: float
+    crmiten_var_sci: float
+    fxdoff_sci: float
+    int_time: float
+    tpf_time: np.ndarray
+    tpf_cad: np.ndarray
+    time_unit: str
+    raw_null_val: int
+    source_mask_2d: np.ndarray
+    srcmask_digest: str
+    strap_col_mask: np.ndarray
+    quality_mask: np.ndarray
+
+
+def _raw_cnts_null_val(hdu1: fits.BinTableHDU) -> int:
     for idx, name in enumerate(hdu1.columns.names or (), start=1):
         if name == "RAW_CNTS":
             tnull_key = f"TNULL{idx}"
             if tnull_key in hdu1.header:
                 with contextlib.suppress(TypeError, ValueError):
-                    null_val = int(hdu1.header[tnull_key])
+                    return int(hdu1.header[tnull_key])
             break
+    return -1
 
+
+def _extract_raw_cnts_chunk_f64(
+    hdu1: fits.BinTableHDU, t0: int, t1: int, null_val: int
+) -> np.ndarray:
+    raw_arr = hdu1.data["RAW_CNTS"][t0:t1]
+    raw_f64 = np.asarray(raw_arr, dtype=np.float64)
     bad = (raw_f64 < 0.0) | (~np.isfinite(raw_f64))
     if np.issubdtype(raw_arr.dtype, np.integer):
-        bad = bad | (raw_arr == null_val) | (raw_arr == -1)
+        bad |= (raw_arr == null_val) | (raw_arr == -1)
     if np.any(bad):
         raw_f64 = raw_f64.copy()
         raw_f64[bad] = np.nan
     return raw_f64
+
+
+def _resolve_cache_paths(
+    *,
+    sector: int,
+    cache_dir: str | os.PathLike[str] | None,
+    ddir: str | os.PathLike[str] | None,
+    strict_hpc: bool,
+) -> tuple[Path | None, Path, bool]:
+    warn_fred = False
+    if cache_dir is not None:
+        resolved = resolve_cache_dir(
+            cache_dir, env_var="MUNDEY_CACHE_DIR", strict_hpc=strict_hpc, create=True
+        )
+    elif ddir is not None:
+        ddir_path = Path(ddir).expanduser()
+        if _is_fred_path(ddir_path):
+            env_vars = ("MUNDEY_CACHE_DIR", "TESS_BRIGHT_CACHE_DIR", "SCRATCH", "XDG_CACHE_HOME")
+            if any(os.environ.get(v, "").strip() for v in env_vars):
+                resolved = resolve_cache_dir(
+                    None, env_var="MUNDEY_CACHE_DIR", strict_hpc=strict_hpc, create=True
+                )
+            elif strict_hpc:
+                resolve_cache_dir(
+                    ddir_path, env_var="MUNDEY_CACHE_DIR", strict_hpc=True, create=False
+                )
+                resolved = None
+            else:
+                resolved, warn_fred = None, True
+        else:
+            resolved = None
+    else:
+        resolved = resolve_cache_dir(
+            None, env_var="MUNDEY_CACHE_DIR", strict_hpc=strict_hpc, create=True
+        )
+
+    blf_base = (
+        (resolved / f"s{sector:04d}")
+        if resolved is not None
+        else Path(ddir).expanduser()  # type: ignore[arg-type]
+    )
+    return resolved, blf_base, warn_fred
+
+
+def _resolve_calibration_context(
+    hdul: fits.HDUList,
+    *,
+    source_path: Path | None,
+    cache_dir: str | os.PathLike[str] | None,
+    ddir: str | os.PathLike[str] | None,
+    offline: bool,
+    strict_hpc: bool,
+    s3_fs: Any,
+    verbose: bool,
+    quality_bitmask: Any,
+    target_obj: Any,
+) -> _CalibrationContext:
+    hdr0, hdu1, hdr2 = hdul[0].header, hdul[1], hdul[2].header
+    hdr1 = hdu1.header
+    if "RAW_CNTS" not in (hdu1.data.names or ()):
+        raise ValueError(
+            "TPF HDU[1] lacks a 'RAW_CNTS' column; use mundey.desmear_calibrated_cutout(tpf) "
+            "for TessCut / FFI cutouts without collateral data."
+        )
+
+    sector, camera, ccd = int(hdr0["SECTOR"]), int(hdr0["CAMERA"]), int(hdr0["CCD"])
+    ticid = int(hdr0["TICID"]) if "TICID" in hdr0 else None
+    n_tpf, ny, nx = hdu1.data["RAW_CNTS"].shape
+
+    col0_1based, row0_1based = _stamp_ccd_origin_1based(hdr1, hdr2)
+    x1_ccd0, y1_ccd0 = col0_1based - 1, row0_1based - 1
+    if row0_1based < 1 or y1_ccd0 + ny > 2048:
+        raise ValueError(
+            f"TPF rows {row0_1based}..{row0_1based + ny - 1} fall outside "
+            "TESS imaging rows 1..2048."
+        )
+    _sync_stamp_ccd_origin(hdr1, hdr2, col0_1based, row0_1based)
+
+    cols_1based = np.arange(col0_1based, col0_1based + nx, dtype=np.int64)
+    col_outputs = tuple(output_for_rawx_col(int(c)) for c in cols_1based)
+    unique_outputs = tuple(out for out in OUTPUT_ORDER if out in col_outputs)
+    cadence_kind = infer_cadence_kind(tpf_path=source_path, hdu0_header=hdr0, hdu1_header=hdr1)
+    parts_list = source_path.name.split("-") if source_path is not None else None
+    tpf_parts = tuple(parts_list) if (parts_list is not None and len(parts_list) >= 4) else None
+
+    resolved_cache, blf_write_base, warn_fred = _resolve_cache_paths(
+        sector=sector, cache_dir=cache_dir, ddir=ddir, strict_hpc=strict_hpc
+    )
+    models = resolve_static_models(
+        camera,
+        ccd,
+        ddir=ddir,
+        cache_dir=resolved_cache,
+        offline=offline,
+        s3_fs=s3_fs,
+        verbose=verbose,
+    )
+    with fits.open(models.black2d_path, memmap=True) as b2d_hdul:
+        black2d_img = np.asarray(b2d_hdul[1].data, dtype=np.float64)
+    with fits.open(models.flat_path, memmap=True) as flat_hdul:
+        flat_cutout = np.asarray(
+            flat_hdul[1].data[y1_ccd0 : y1_ccd0 + ny, x1_ccd0 : x1_ccd0 + nx], dtype=np.float64
+        )
+
+    existing_pq = (
+        np.asarray(hdul[PIXEL_QUALITY_EXTNAME].data, dtype=np.uint16)
+        if PIXEL_QUALITY_EXTNAME in hdul
+        else np.zeros((ny, nx), dtype=np.uint16)
+    )
+    source_mask_2d = (existing_pq & int(PixelQuality.SOURCE_MASK)) != 0
+    return _CalibrationContext(
+        hdul=hdul,
+        sector=sector,
+        camera=camera,
+        ccd=ccd,
+        ticid=ticid,
+        n_tpf=n_tpf,
+        ny=ny,
+        nx=nx,
+        col0_1based=col0_1based,
+        row0_1based=row0_1based,
+        x1_ccd0=x1_ccd0,
+        y1_ccd0=y1_ccd0,
+        cutout_bounds=(col0_1based, nx, row0_1based, ny),
+        cols_1based=cols_1based,
+        col_outputs=col_outputs,
+        unique_outputs=unique_outputs,
+        cadence_kind=cadence_kind,
+        tpf_parts=tpf_parts,
+        resolved_cache=resolved_cache,
+        blf_write_base=blf_write_base,
+        warn_fred_on_write=warn_fred,
+        black2d_img=black2d_img,
+        flat_cutout=flat_cutout,
+        models=models,
+        n_eff_sci=effective_frame_count(hdr0, hdr1),
+        crmiten_var_sci=_crmiten_variance_factor(hdr0, hdr1),
+        fxdoff_sci=float(hdr1.get("FXDOFF", 209700.0)),
+        int_time=float(hdr1["INT_TIME"]),
+        tpf_time=np.asarray(hdu1.data["TIME"], dtype=np.float64),
+        tpf_cad=np.asarray(hdu1.data["CADENCENO"], dtype=np.int64),
+        time_unit=str(hdr1.get("TUNIT1", "BJD - 2457000, days")),
+        raw_null_val=_raw_cnts_null_val(hdu1),
+        source_mask_2d=source_mask_2d,
+        srcmask_digest=_source_mask_digest(source_mask_2d),
+        strap_col_mask=strap_mask_for_rawx_columns(cols_1based, buffer_px=2),
+        quality_mask=_compute_quality_mask(
+            hdu1, quality_bitmask=quality_bitmask, target_obj=target_obj
+        ),
+    )
+
+
+def _output_slice_bounds(ctx: _CalibrationContext, out: str) -> tuple[int, int, int, int]:
+    local_cols = np.flatnonzero(np.asarray([o == out for o in ctx.col_outputs], dtype=bool))
+    c0_loc, c1_loc = int(local_cols[0]), int(local_cols[-1]) + 1
+    sm_c0 = int(ctx.cols_1based[c0_loc] - 1 - OUTPUT_BOUNDS_0BASED[out][0])
+    return c0_loc, c1_loc, sm_c0, sm_c0 + (c1_loc - c0_loc)
+
+
+def _try_load_alt_caches(
+    ctx: _CalibrationContext,
+    *,
+    ddir: str | os.PathLike[str] | None,
+    cadence_match: CadenceMatchMode,
+) -> tuple[bool, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    alt_paths: dict[str, Path] = {}
+    for out in ctx.unique_outputs:
+        spec = CollateralSpec(
+            ctx.sector, ctx.camera, ctx.ccd, out, ctx.cadence_kind, ctx.tpf_parts, ctx.ticid
+        )
+        found = _find_valid_smrow_blf(
+            spec,
+            smear_mode="alternate",
+            ddir=ddir,
+            cache_dir=ctx.resolved_cache,
+            cutout_bounds=ctx.cutout_bounds,
+            require_alt_unres=True,
+            required_cadenceno=ctx.tpf_cad,
+            cadence_match=cadence_match,
+            source_mask_digest=ctx.srcmask_digest,
+        )
+        if found is None:
+            empty = np.empty((0, 0), dtype=np.float64)
+            return False, empty, empty, np.zeros(ctx.nx, dtype=bool), np.ones(ctx.n_tpf, dtype=bool)
+        alt_paths[out] = found
+
+    hdr1 = ctx.hdul[1].header
+    sm_stamp = np.full((ctx.n_tpf, ctx.nx), np.nan, dtype=np.float64)
+    err_stamp = np.full((ctx.n_tpf, ctx.nx), np.nan, dtype=np.float64)
+    unres_cols = np.zeros(ctx.nx, dtype=bool)
+    alt_all_matched = np.ones(ctx.n_tpf, dtype=bool)
+
+    for out in ctx.unique_outputs:
+        c0, c1, sm_c0, sm_c1 = _output_slice_bounds(ctx, out)
+        readnoi_sci = float(hdr1.get(f"READNOI{out}", 8.5))
+        with fits.open(alt_paths[out], memmap=True) as alt_hdul:
+            alt_hdu1 = alt_hdul[1]
+            alt_cad = np.asarray(alt_hdu1.data["CADENCENO"], dtype=np.int64)
+            alt_matched, alt_idx = match_cadenceno(
+                ctx.tpf_cad, alt_cad, cadence_match=cadence_match, label=f"smrow-alt-blf ({out})"
+            )
+            safe_idx = np.where(alt_matched, alt_idx, 0)
+            if "COLMATCH" in (alt_hdu1.data.names or ()):
+                alt_matched &= np.asarray(alt_hdu1.data["COLMATCH"], dtype=bool)[safe_idx]
+            alt_all_matched &= alt_matched
+
+            alt_sm_512 = np.asarray(alt_hdu1.data["SMEAR"], dtype=np.float64)[safe_idx]
+            if "SMEAR_ERR" in (alt_hdu1.data.names or ()):
+                alt_err_512 = np.asarray(alt_hdu1.data["SMEAR_ERR"], dtype=np.float64)[safe_idx]
+            else:
+                alt_err_512 = np.sqrt(
+                    float(_unit_normal_median_variance(10))
+                    * ctx.crmiten_var_sci
+                    * (np.maximum(alt_sm_512, 0.0) + readnoi_sci**2)
+                    / ctx.n_eff_sci
+                )
+            sm_stamp[:, c0:c1] = np.where(alt_matched[:, None], alt_sm_512[:, sm_c0:sm_c1], np.nan)
+            err_stamp[:, c0:c1] = np.where(
+                alt_matched[:, None], alt_err_512[:, sm_c0:sm_c1], np.nan
+            )
+            unres_cols[c0:c1] = np.asarray(alt_hdul["ALT_UNRES"].data, dtype=bool)[sm_c0:sm_c1]
+
+    return True, sm_stamp, err_stamp, unres_cols, alt_all_matched
+
+
+@dataclass
+class _CollateralData:
+    out_params: list[_OutputSliceParams]
+    combined_matched: np.ndarray
+    collat_smear_stamp: np.ndarray
+    collat_smear_err_stamp: np.ndarray
+    collat_sm_sat_2d: np.ndarray
+    per_out_collat_512: dict[str, np.ndarray]
+    per_out_collat_err_512: dict[str, np.ndarray]
+    off_target_smears: list[np.ndarray]
+    off_target_errs: list[np.ndarray]
+    max_e_per_frame_list: list[float]
+
+
+def _load_output_smrow(
+    ctx: _CalibrationContext,
+    spec: CollateralSpec,
+    *,
+    out: str,
+    eff_smear: Literal["standard", "alternate"],
+    tv_blf: Path,
+    b1d_all: np.ndarray,
+    b1d_err_all: np.ndarray,
+    n_eff_tv: float,
+    lin_ch: LinearityChannel,
+    u_coeff: float,
+    readnoi_sci: float,
+    max_sm_e: float,
+    ddir: str | os.PathLike[str] | None,
+    cadence_match: CadenceMatchMode,
+    offline: bool,
+    chunk_rows: int,
+    s3_fs: Any,
+    verbose: bool,
+    warn_fred_once: Any,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    hdr0, hdr1 = ctx.hdul[0].header, ctx.hdul[1].header
+    std_sm_blf = _find_valid_smrow_blf(
+        spec,
+        smear_mode="standard",
+        ddir=ddir,
+        cache_dir=ctx.resolved_cache,
+        cutout_bounds=ctx.cutout_bounds,
+        cadence_match=cadence_match,
+        source_mask_digest="NONE",
+    )
+    if std_sm_blf is None:
+        if eff_smear == "standard":
+            warn_fred_once()
+        sm_raw = resolve_collateral_file(
+            spec,
+            kind="smrow",
+            ddir=ddir,
+            cache_dir=ctx.resolved_cache,
+            offline=offline,
+            s3_fs=s3_fs,
+            verbose=verbose,
+        )
+        if eff_smear == "standard":
+            sm_dst = collateral_blf_cache_path(
+                ctx.blf_write_base,
+                spec,
+                kind="smrow",
+                smear_mode="standard",
+                col_stem=sm_raw.stem if ctx.tpf_parts is None else None,
+            )
+            std_sm_blf = _calibrate_smrow_raw_to_standard_blf(
+                sm_raw,
+                tv_blf,
+                sm_dst,
+                output=out,
+                black2d_img=ctx.black2d_img,
+                lin_channel=lin_ch,
+                u_coeff=u_coeff,
+                sci_hdr0=hdr0,
+                sci_hdr1=hdr1,
+                cadence_match=cadence_match,
+                chunk_rows=chunk_rows,
+            )
+        else:
+            _, _, _, sm_cad = read_collateral_headers_and_index(sm_raw)
+            sm_matched, sm_idx = match_cadenceno(
+                ctx.tpf_cad, sm_cad, cadence_match=cadence_match, label=f"smrow ({out})"
+            )
+            sm_512, sm_err_512, sm_sat_cad = _stream_calibrate_smrow_rows(
+                sm_raw,
+                output=out,
+                black2d_img=ctx.black2d_img,
+                lin_channel=lin_ch,
+                u_coeff=u_coeff,
+                b1d_sm_rows=b1d_all[:, 2058:2068],
+                b1d_err_sm_rows=b1d_err_all[:, 2058:2068],
+                n_eff_tv=n_eff_tv,
+                target_matched=sm_matched,
+                target_to_sm_idx=sm_idx,
+                sci_hdr0=hdr0,
+                sci_hdr1=hdr1,
+                chunk_rows=chunk_rows,
+            )
+            return sm_matched, sm_512, sm_err_512, sm_sat_cad
+
+    with fits.open(std_sm_blf, memmap=True) as sm_hdul:
+        sm_hdu1 = sm_hdul[1]
+        sm_cad = np.asarray(sm_hdu1.data["CADENCENO"], dtype=np.int64)
+        sm_matched, sm_idx = match_cadenceno(
+            ctx.tpf_cad, sm_cad, cadence_match=cadence_match, label=f"smrow ({out})"
+        )
+        safe_sm = np.where(sm_matched, sm_idx, 0)
+        sm_512 = np.asarray(sm_hdu1.data["SMEAR"], dtype=np.float64)[safe_sm]
+        if "SMEAR_ERR" in (sm_hdu1.data.names or ()):
+            sm_err_512 = np.asarray(sm_hdu1.data["SMEAR_ERR"], dtype=np.float64)[safe_sm]
+        else:
+            sm_err_512 = np.sqrt(
+                float(_unit_normal_median_variance(10))
+                * ctx.crmiten_var_sci
+                * (np.maximum(sm_512, 0.0) + readnoi_sci**2)
+                / ctx.n_eff_sci
+            )
+        sm_512 = np.where(sm_matched[:, None], sm_512, np.nan)
+        sm_err_512 = np.where(sm_matched[:, None], sm_err_512, np.nan)
+        if "SMROW_SAT" in sm_hdul:
+            sm_sat_cad = np.where(
+                sm_matched[:, None],
+                np.asarray(sm_hdul["SMROW_SAT"].data, dtype=bool)[safe_sm],
+                False,
+            )
+        else:
+            sm_sat_cad = np.isfinite(sm_512) & (sm_512 >= max_sm_e * (1.0 - 1e-12))
+    return sm_matched, sm_512, sm_err_512, sm_sat_cad
+
+
+def _load_output_collateral(
+    ctx: _CalibrationContext,
+    *,
+    eff_smear: Literal["standard", "alternate"],
+    all_outputs_have_alt_cache: bool,
+    ddir: str | os.PathLike[str] | None,
+    cadence_match: CadenceMatchMode,
+    offline: bool,
+    chunk_rows: int,
+    s3_fs: Any,
+    verbose: bool,
+) -> _CollateralData:
+    hdr0, hdr1 = ctx.hdul[0].header, ctx.hdul[1].header
+    combined_matched = np.ones(ctx.n_tpf, dtype=bool)
+    collat_smear_stamp = np.full((ctx.n_tpf, ctx.nx), np.nan, dtype=np.float64)
+    collat_smear_err_stamp = np.full((ctx.n_tpf, ctx.nx), np.nan, dtype=np.float64)
+    collat_sm_sat_2d = np.zeros((ctx.n_tpf, ctx.nx), dtype=bool)
+
+    out_params: list[_OutputSliceParams] = []
+    per_out_collat_512: dict[str, np.ndarray] = {}
+    per_out_collat_err_512: dict[str, np.ndarray] = {}
+    off_target_smears: list[np.ndarray] = []
+    off_target_errs: list[np.ndarray] = []
+    max_e_per_frame_list: list[float] = []
+    warned_fred = False
+
+    def _warn_fred_once() -> None:
+        nonlocal warned_fred
+        if ctx.warn_fred_on_write and not warned_fred:
+            resolve_cache_dir(
+                ctx.blf_write_base, env_var="MUNDEY_CACHE_DIR", strict_hpc=False, create=False
+            )
+            warned_fred = True
+
+    for out in ctx.unique_outputs:
+        c0, c1, sm_c0, sm_c1 = _output_slice_bounds(ctx, out)
+        spec = CollateralSpec(
+            ctx.sector, ctx.camera, ctx.ccd, out, ctx.cadence_kind, ctx.tpf_parts, ctx.ticid
+        )
+        lin_ch = load_linearity_channel(ctx.models.linearity_path, ctx.camera, ctx.ccd, out)
+        u_coeff = load_undershoot_coeff(ctx.camera, ctx.ccd, out)
+        gain_sci = float(hdr1[f"GAIN{out}"])
+        meanblc_sci = float(hdr1[f"MEANBLC{out}"])
+        readnoi_sci = float(hdr1.get(f"READNOI{out}", 8.5))
+        max_sm_e = linearity_max_electrons_per_frame(lin_ch, gain_sci)
+        max_e_per_frame_list.append(max_sm_e)
+
+        tv_blf = _find_valid_tvcol_blf(spec, ddir=ddir, cache_dir=ctx.resolved_cache)
+        if tv_blf is None:
+            _warn_fred_once()
+            tv_raw = resolve_collateral_file(
+                spec,
+                kind="tvcol",
+                ddir=ddir,
+                cache_dir=ctx.resolved_cache,
+                offline=offline,
+                s3_fs=s3_fs,
+                verbose=verbose,
+            )
+            tv_dst = collateral_blf_cache_path(
+                ctx.blf_write_base,
+                spec,
+                kind="tvcol",
+                col_stem=tv_raw.stem if ctx.tpf_parts is None else None,
+            )
+            tv_blf = _calibrate_tvcol_raw_to_blf(
+                tv_raw,
+                tv_dst,
+                output=out,
+                black2d_img=ctx.black2d_img,
+                sci_hdr0=hdr0,
+                sci_hdr1=hdr1,
+                chunk_rows=chunk_rows,
+            )
+
+        with fits.open(tv_blf, memmap=True) as tv_hdul:
+            tv_hdu1 = tv_hdul[1]
+            tv_cad = np.asarray(tv_hdu1.data["CADENCENO"], dtype=np.int64)
+            tv_matched, tv_idx = match_cadenceno(
+                ctx.tpf_cad, tv_cad, cadence_match=cadence_match, label=f"tvcol ({out})"
+            )
+            combined_matched &= tv_matched
+            safe_tv = np.where(tv_matched, tv_idx, 0)
+            b1d_all = np.asarray(tv_hdu1.data["1DBLACK"], dtype=np.float64)[safe_tv]
+            b1d_err_all = (
+                np.asarray(tv_hdu1.data["1DBLACK_ERR"], dtype=np.float64)[safe_tv]
+                if "1DBLACK_ERR" in (tv_hdu1.data.names or ())
+                else np.full_like(b1d_all, 0.5)
+            )
+            n_eff_tv = float(tv_hdu1.header.get("NEFF", ctx.n_eff_sci))
+
+        out_params.append(
+            _OutputSliceParams(
+                output=out,
+                c0=c0,
+                c1=c1,
+                sm_c0=sm_c0,
+                sm_c1=sm_c1,
+                lin_channel=lin_ch,
+                u_coeff=u_coeff,
+                gain_sci=gain_sci,
+                meanblc_sci=meanblc_sci,
+                readnoi_sci=readnoi_sci,
+                b2d_sci=ctx.black2d_img[
+                    ctx.y1_ccd0 : ctx.y1_ccd0 + ctx.ny, ctx.x1_ccd0 + c0 : ctx.x1_ccd0 + c1
+                ],
+                b1d_sci_rows=np.where(
+                    tv_matched[:, None], b1d_all[:, ctx.y1_ccd0 : ctx.y1_ccd0 + ctx.ny], np.nan
+                ),
+                b1d_err_sci_rows=np.where(
+                    tv_matched[:, None], b1d_err_all[:, ctx.y1_ccd0 : ctx.y1_ccd0 + ctx.ny], np.nan
+                ),
+                n_eff_tv=n_eff_tv,
+            )
+        )
+        if all_outputs_have_alt_cache:
+            continue
+
+        sm_matched, sm_512, sm_err_512, sm_sat_cad = _load_output_smrow(
+            ctx,
+            spec,
+            out=out,
+            eff_smear=eff_smear,
+            tv_blf=tv_blf,
+            b1d_all=b1d_all,
+            b1d_err_all=b1d_err_all,
+            n_eff_tv=n_eff_tv,
+            lin_ch=lin_ch,
+            u_coeff=u_coeff,
+            readnoi_sci=readnoi_sci,
+            max_sm_e=max_sm_e,
+            ddir=ddir,
+            cadence_match=cadence_match,
+            offline=offline,
+            chunk_rows=chunk_rows,
+            s3_fs=s3_fs,
+            verbose=verbose,
+            warn_fred_once=_warn_fred_once,
+        )
+        combined_matched &= sm_matched
+        per_out_collat_512[out], per_out_collat_err_512[out] = sm_512, sm_err_512
+        collat_smear_stamp[:, c0:c1] = sm_512[:, sm_c0:sm_c1]
+        collat_smear_err_stamp[:, c0:c1] = sm_err_512[:, sm_c0:sm_c1]
+        collat_sm_sat_2d[:, c0:c1] = sm_sat_cad[:, sm_c0:sm_c1]
+
+        good_sm = sm_matched & ctx.quality_mask
+        sm_sat_512 = np.any(sm_sat_cad[good_sm] if np.any(good_sm) else sm_sat_cad, axis=0)
+        cols_512 = np.arange(512)
+        off_mask = ((cols_512 < sm_c0 - 10) | (cols_512 >= sm_c1 + 10)) & (~sm_sat_512)
+        n_off = int(np.sum(off_mask))
+        if n_off >= 8:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                off_med = np.nanmedian(sm_512[:, off_mask], axis=1)
+                off_mad = 1.4826 * np.nanmedian(
+                    np.abs(sm_512[:, off_mask] - off_med[:, None]), axis=1
+                )
+                se_theo = np.sqrt(float(_unit_normal_median_variance(n_off))) * np.nanmedian(
+                    sm_err_512[:, off_mask], axis=1
+                )
+            off_target_smears.append(off_med)
+            safe_se = np.where(np.isfinite(se_theo), se_theo, 0.0)
+            off_target_errs.append(np.maximum(off_mad, safe_se))
+
+    return _CollateralData(
+        out_params=out_params,
+        combined_matched=combined_matched,
+        collat_smear_stamp=collat_smear_stamp,
+        collat_smear_err_stamp=collat_smear_err_stamp,
+        collat_sm_sat_2d=collat_sm_sat_2d,
+        per_out_collat_512=per_out_collat_512,
+        per_out_collat_err_512=per_out_collat_err_512,
+        off_target_smears=off_target_smears,
+        off_target_errs=off_target_errs,
+        max_e_per_frame_list=max_e_per_frame_list,
+    )
+
+
+def _calibrate_presmear_chunk(
+    ctx: _CalibrationContext,
+    out_params: list[_OutputSliceParams],
+    combined_matched: np.ndarray,
+    t0: int,
+    t1: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    m = t1 - t0
+    raw_chunk = _extract_raw_cnts_chunk_f64(ctx.hdul[1], t0, t1, ctx.raw_null_val)
+    e_chunk = np.full((m, ctx.ny, ctx.nx), np.nan, dtype=np.float64)
+    sig_chunk = np.full((m, ctx.ny, ctx.nx), np.nan, dtype=np.float64)
+    sat_chunk = np.zeros((m, ctx.ny, ctx.nx), dtype=bool)
+    matched_c = combined_matched[t0:t1]
+
+    for op in out_params:
+        sci_debiased = (
+            raw_chunk[:, :, op.c0 : op.c1]
+            - ctx.fxdoff_sci
+            + ctx.n_eff_sci * (op.meanblc_sci - op.b2d_sci)[np.newaxis, :, :]
+            - (ctx.n_eff_sci / op.n_eff_tv) * op.b1d_sci_rows[t0:t1, :, np.newaxis]
+        )
+        e_out, sat_out, g_out = calibrate_pre_smear_e_per_frame(
+            sci_debiased,
+            u_coeff=op.u_coeff,
+            n_eff=ctx.n_eff_sci,
+            channel=op.lin_channel,
+            gain=op.gain_sci,
+            reverse_readout=OUTPUT_REVERSE_READOUT[op.output],
+        )
+        n_loc = op.c1 - op.c0
+        u_mult_pix = np.full(n_loc, 1.0 / (1.0 - op.u_coeff * op.u_coeff), dtype=np.float64)
+        u_mult_pix[(n_loc - 1) if OUTPUT_REVERSE_READOUT[op.output] else 0] = 1.0 / (
+            (1.0 - op.u_coeff) ** 2
+        )
+        u_mult_b1d = 1.0 / ((1.0 - op.u_coeff) ** 2)
+        shot_read_var = (
+            ctx.crmiten_var_sci
+            * (np.maximum(e_out, 0.0) + op.readnoi_sci * op.readnoi_sci)
+            / ctx.n_eff_sci
+        )
+        b1d_var = ((g_out * op.b1d_err_sci_rows[t0:t1, :, np.newaxis]) / op.n_eff_tv) ** 2
+        b1d_var = np.where(np.isfinite(b1d_var), b1d_var, 0.0)
+        sig_out = np.sqrt(u_mult_pix[None, None, :] * shot_read_var + u_mult_b1d * b1d_var)
+        e_chunk[:, :, op.c0 : op.c1] = e_out
+        sig_chunk[:, :, op.c0 : op.c1] = sig_out
+        sat_chunk[:, :, op.c0 : op.c1] = sat_out
+
+    if not np.all(matched_c):
+        e_chunk[~matched_c], sig_chunk[~matched_c], sat_chunk[~matched_c] = np.nan, np.nan, False
+    return e_chunk, sig_chunk, sat_chunk
+
+
+def _persist_alt_caches(
+    ctx: _CalibrationContext,
+    *,
+    per_out_collat_512: dict[str, np.ndarray],
+    per_out_collat_err_512: dict[str, np.ndarray],
+    m_hat_stamp: np.ndarray,
+    m_err_stamp: np.ndarray,
+    unresolved_cols: np.ndarray,
+    combined_matched: np.ndarray,
+    cadence_match: CadenceMatchMode,
+) -> None:
+    if ctx.warn_fred_on_write:
+        resolve_cache_dir(
+            ctx.blf_write_base, env_var="MUNDEY_CACHE_DIR", strict_hpc=False, create=False
+        )
+    for out in ctx.unique_outputs:
+        if out not in per_out_collat_512:
+            continue
+        c0, c1, sm_c0, sm_c1 = _output_slice_bounds(ctx, out)
+        alt_sm_512 = per_out_collat_512[out].copy()
+        alt_err_512 = per_out_collat_err_512[out].copy()
+        alt_sm_512[:, sm_c0:sm_c1] = m_hat_stamp[:, c0:c1]
+        alt_err_512[:, sm_c0:sm_c1] = m_err_stamp[:, c0:c1]
+        alt_unres_512 = np.zeros(512, dtype=bool)
+        alt_unres_512[sm_c0:sm_c1] = unresolved_cols[c0:c1]
+
+        spec = CollateralSpec(
+            ctx.sector, ctx.camera, ctx.ccd, out, ctx.cadence_kind, ctx.tpf_parts, ctx.ticid
+        )
+        alt_dst = collateral_blf_cache_path(
+            ctx.blf_write_base,
+            spec,
+            kind="smrow",
+            smear_mode="alternate",
+            col_stem=(
+                f"tess-s{ctx.sector:04d}-smrow-{ctx.camera}-{ctx.ccd}-{out.lower()}-"
+                f"{int(ctx.ticid):016d}-{collateral_suffix(ctx.cadence_kind)}"
+                if ctx.ticid is not None and ctx.tpf_parts is None
+                else None
+            ),
+        )
+        if _alt_blf_has_more_cadences(
+            alt_dst,
+            ctx.cutout_bounds,
+            len(ctx.tpf_cad),
+            cadence_match=cadence_match,
+            source_mask_digest=ctx.srcmask_digest,
+        ):
+            continue
+        try:
+            write_smear_blf(
+                alt_dst,
+                time=ctx.tpf_time,
+                cadenceno=ctx.tpf_cad,
+                smear=alt_sm_512,
+                smear_err=alt_err_512.astype(np.float32),
+                unresolved_cols=alt_unres_512,
+                col_matched=combined_matched,
+                smear_mode="alternate",
+                cutout_bounds=ctx.cutout_bounds,
+                cadence_match=cadence_match,
+                source_mask_digest=ctx.srcmask_digest,
+                int_time=ctx.int_time,
+                time_unit=ctx.time_unit,
+            )
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
+                warnings.warn(
+                    f"Skipping alternate smear cache write to read-only path {alt_dst}: {exc}",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            else:
+                raise
+
+
+def _write_calibrated_chunk(
+    hdu1: fits.BinTableHDU,
+    *,
+    t0: int,
+    t1: int,
+    e_chunk: np.ndarray,
+    sig_chunk: np.ndarray,
+    m_hat_c: np.ndarray,
+    cal_smear_err_c: np.ndarray,
+    denom_rate: np.ndarray,
+    matched_c: np.ndarray,
+) -> None:
+    cal_flux = (e_chunk - m_hat_c[:, np.newaxis, :]) / denom_rate
+    cal_flux_err = np.hypot(sig_chunk / denom_rate, cal_smear_err_c[:, np.newaxis, :])
+    if not np.all(matched_c):
+        cal_flux[~matched_c], cal_flux_err[~matched_c] = np.nan, np.nan
+    hdu1.data["FLUX"][t0:t1] = cal_flux.astype(np.float32)
+    if "FLUX_ERR" in (hdu1.data.names or ()):
+        hdu1.data["FLUX_ERR"][t0:t1] = cal_flux_err.astype(np.float32)
+
+
+def _finalize_calibrated_hdulist(
+    ctx: _CalibrationContext,
+    *,
+    cal_smear_err: np.ndarray,
+    pq_out: np.ndarray,
+    eff_smear: str,
+    cadence_match: CadenceMatchMode,
+    n_missing: int,
+    target_obj: Any,
+) -> None:
+    hdul = ctx.hdul
+    col_names = hdul[1].data.names or ()
+    if "FLUX_BKG" in col_names:
+        hdul[1].data["FLUX_BKG"] = np.float32(0.0)
+    if "FLUX_BKG_ERR" in col_names:
+        hdul[1].data["FLUX_BKG_ERR"] = np.float32(0.0)
+
+    append_smear_err_column(hdul, cal_smear_err.astype(np.float32))
+    write_pixel_quality(hdul, pq_out)
+    write_mundey_provenance(
+        target_obj if target_obj is not None else hdul,
+        bkgsub=False,
+        smear_mode=eff_smear,
+    )
+    hdul[0].header["CADMATCH"] = (cadence_match, "Collateral cadence pairing mode")
+    hdul[0].header["CADMISS"] = (int(n_missing), "Unmatched TPF cadences masked to NaN")
+    if target_obj is not None:
+        meta_dict = getattr(getattr(target_obj, "meta", None), "_dict", None)
+        if isinstance(meta_dict, dict):
+            meta_dict["CADMATCH"] = cadence_match
+            meta_dict["CADMISS"] = int(n_missing)
+
+
+def _scan_pass1_bloom(
+    ctx: _CalibrationContext,
+    out_params: list[_OutputSliceParams],
+    combined_matched: np.ndarray,
+    good_cad: np.ndarray,
+    collat_smear_stamp: np.ndarray,
+    chunk_rows: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[np.ndarray, np.ndarray] | None]:
+    """Stream chunks to accumulate quality-filtered ``raw_sat_2d`` & exact 2D bloom stats."""
+    raw_sat_2d = np.zeros((ctx.ny, ctx.nx), dtype=bool)
+    w_sum = np.zeros((ctx.ny, ctx.nx), dtype=np.float64)
+    w_num = np.zeros((ctx.ny, ctx.nx), dtype=np.float64)
+    n_pix_2d = np.zeros((ctx.ny, ctx.nx), dtype=np.int64)
+    min_z_2d = np.full((ctx.ny, ctx.nx), np.inf, dtype=np.float64)
+    single_chunk_cache: tuple[np.ndarray, np.ndarray] | None = None
+
+    for t0 in range(0, ctx.n_tpf, chunk_rows):
+        t1 = min(t0 + chunk_rows, ctx.n_tpf)
+        e_c, sig_c, sat_c = _calibrate_presmear_chunk(ctx, out_params, combined_matched, t0, t1)
+        if ctx.n_tpf <= chunk_rows:
+            single_chunk_cache = (e_c, sig_c)
+        gc = good_cad[t0:t1]
+        if np.any(gc):
+            raw_sat_2d |= np.any(sat_c[gc], axis=0)
+            sub_g = e_c[gc] - collat_smear_stamp[t0:t1][gc, None, :]
+            sig_g = sig_c[gc]
+            val_g = np.isfinite(sub_g) & np.isfinite(sig_g)
+            sig_safe = np.maximum(np.where(val_g, sig_g, 1.0), 1e-6)
+            wg = np.where(val_g, 1.0 / (sig_safe * sig_safe), 0.0)
+            w_sum += np.sum(wg, axis=0)
+            w_num += np.sum(np.where(val_g, wg * sub_g, 0.0), axis=0)
+            n_pix_2d += np.sum(val_g, axis=0)
+            z_g = np.where(val_g, sub_g / sig_safe, np.inf)
+            min_z_2d = np.minimum(min_z_2d, np.min(z_g, axis=0))
+
+    sat_bleed_2d = _build_sat_bleed_mask_from_raw_sat(raw_sat_2d, ctx.col_outputs)
+    clean_rows_2d = _build_clean_rows_2d(raw_sat_2d, sat_bleed_2d, ctx.source_mask_2d)
+    col_has_bloom = _eval_bloom_from_stats(w_num, w_sum, n_pix_2d, min_z_2d, clean_rows_2d)
+    return raw_sat_2d, sat_bleed_2d, col_has_bloom, single_chunk_cache
+
+
+def _run_cold_alternate_pass(
+    ctx: _CalibrationContext,
+    *,
+    out_params: list[_OutputSliceParams],
+    combined_matched: np.ndarray,
+    good_cad: np.ndarray,
+    collat_smear_stamp: np.ndarray,
+    collat_smear_err_stamp: np.ndarray,
+    collat_sm_sat_cols: np.ndarray,
+    off_target_smears: list[np.ndarray],
+    off_target_errs: list[np.ndarray],
+    max_e_per_frame_list: list[float],
+    raw_sat_2d: np.ndarray,
+    sat_bleed_2d: np.ndarray,
+    col_has_bloom: np.ndarray,
+    single_chunk_cache: tuple[np.ndarray, np.ndarray] | None,
+    denom_rate: np.ndarray,
+    smear_rate_denom: np.ndarray,
+    chunk_rows: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if off_target_smears:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            off_sm_vec: np.ndarray | None = np.nanmean(np.vstack(off_target_smears), axis=0)
+            off_err_vec: np.ndarray | None = np.nanmean(np.vstack(off_target_errs), axis=0)
+    else:
+        off_sm_vec, off_err_vec = None, None
+
+    alt_cfg = AlternateSmearConfig(
+        row0_1based=ctx.row0_1based,
+        row_smear_weight=_frame_transfer_row_weight(ctx.hdul[0].header, ctx.hdul[1].header),
+        saturation_limit=float(np.mean(max_e_per_frame_list)) if max_e_per_frame_list else None,
+    )
+    c_bleed_mask = np.any(raw_sat_2d, axis=0) | collat_sm_sat_cols | col_has_bloom
+
+    if single_chunk_cache is not None:
+        e_all, sig_all = single_chunk_cache
+        m_hat_stamp, m_err_stamp, unresolved_cols, _ = _estimate_alternate_smear_stamp(
+            sci_pre_smear=e_all,
+            sci_sigma_pre=sig_all,
+            flat_2d=ctx.flat_cutout,
+            collat_smear_stamp=collat_smear_stamp,
+            collat_smear_err_stamp=collat_smear_err_stamp,
+            collat_sm_sat_cols=collat_sm_sat_cols,
+            off_target_smear=off_sm_vec,
+            off_target_smear_err=off_err_vec,
+            raw_sat_2d=raw_sat_2d,
+            sat_bleed_2d=sat_bleed_2d,
+            strap_col_mask=ctx.strap_col_mask,
+            source_mask_2d=ctx.source_mask_2d,
+            config=alt_cfg,
+            good_cad_mask=good_cad,
+            precomputed_bleed_mask=c_bleed_mask,
+        )
+        cal_smear_err = m_err_stamp / smear_rate_denom
+        if not np.all(combined_matched):
+            cal_smear_err[~combined_matched] = np.nan
+        _write_calibrated_chunk(
+            ctx.hdul[1],
+            t0=0,
+            t1=ctx.n_tpf,
+            e_chunk=e_all,
+            sig_chunk=sig_all,
+            m_hat_c=m_hat_stamp,
+            cal_smear_err_c=cal_smear_err,
+            denom_rate=denom_rate,
+            matched_c=combined_matched,
+        )
+        return m_hat_stamp, m_err_stamp, cal_smear_err, unresolved_cols
+
+    m_hat_stamp = np.full((ctx.n_tpf, ctx.nx), np.nan, dtype=np.float64)
+    m_err_stamp = np.full((ctx.n_tpf, ctx.nx), np.nan, dtype=np.float64)
+    cal_smear_err = np.full((ctx.n_tpf, ctx.nx), np.nan, dtype=np.float64)
+    unresolved_cols = np.zeros(ctx.nx, dtype=bool)
+    for t0 in range(0, ctx.n_tpf, chunk_rows):
+        t1 = min(t0 + chunk_rows, ctx.n_tpf)
+        e_c, sig_c, _ = _calibrate_presmear_chunk(ctx, out_params, combined_matched, t0, t1)
+        mh_c, me_c, unres_c, _ = _estimate_alternate_smear_stamp(
+            sci_pre_smear=e_c,
+            sci_sigma_pre=sig_c,
+            flat_2d=ctx.flat_cutout,
+            collat_smear_stamp=collat_smear_stamp[t0:t1],
+            collat_smear_err_stamp=collat_smear_err_stamp[t0:t1],
+            collat_sm_sat_cols=collat_sm_sat_cols,
+            off_target_smear=off_sm_vec[t0:t1] if off_sm_vec is not None else None,
+            off_target_smear_err=off_err_vec[t0:t1] if off_err_vec is not None else None,
+            raw_sat_2d=raw_sat_2d,
+            sat_bleed_2d=sat_bleed_2d,
+            strap_col_mask=ctx.strap_col_mask,
+            source_mask_2d=ctx.source_mask_2d,
+            config=alt_cfg,
+            good_cad_mask=good_cad[t0:t1],
+            precomputed_bleed_mask=c_bleed_mask,
+        )
+        m_hat_stamp[t0:t1], m_err_stamp[t0:t1] = mh_c, me_c
+        unresolved_cols |= unres_c
+        cse_c = me_c / smear_rate_denom
+        if not np.all(combined_matched[t0:t1]):
+            cse_c[~combined_matched[t0:t1]] = np.nan
+        cal_smear_err[t0:t1] = cse_c
+        _write_calibrated_chunk(
+            ctx.hdul[1],
+            t0=t0,
+            t1=t1,
+            e_chunk=e_c,
+            sig_chunk=sig_c,
+            m_hat_c=mh_c,
+            cal_smear_err_c=cse_c,
+            denom_rate=denom_rate,
+            matched_c=combined_matched[t0:t1],
+        )
+    return m_hat_stamp, m_err_stamp, cal_smear_err, unresolved_cols
+
+
+def _apply_fixed_smear_chunks(
+    ctx: _CalibrationContext,
+    out_params: list[_OutputSliceParams],
+    combined_matched: np.ndarray,
+    m_hat_stamp: np.ndarray,
+    m_err_stamp: np.ndarray,
+    denom_rate: np.ndarray,
+    smear_rate_denom: np.ndarray,
+    chunk_rows: int,
+    *,
+    good_cad: np.ndarray | None = None,
+    single_chunk_cache: tuple[np.ndarray, np.ndarray] | None = None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    cal_smear_err = m_err_stamp / smear_rate_denom
+    if not np.all(combined_matched):
+        cal_smear_err[~combined_matched] = np.nan
+    raw_sat_2d = np.zeros((ctx.ny, ctx.nx), dtype=bool) if good_cad is not None else None
+    for t0 in range(0, ctx.n_tpf, chunk_rows):
+        t1 = min(t0 + chunk_rows, ctx.n_tpf)
+        if single_chunk_cache is not None:
+            e_c, sig_c = single_chunk_cache
+        else:
+            e_c, sig_c, sat_c = _calibrate_presmear_chunk(ctx, out_params, combined_matched, t0, t1)
+            if raw_sat_2d is not None and good_cad is not None and np.any(good_cad[t0:t1]):
+                raw_sat_2d |= np.any(sat_c[good_cad[t0:t1]], axis=0)
+        _write_calibrated_chunk(
+            ctx.hdul[1],
+            t0=t0,
+            t1=t1,
+            e_chunk=e_c,
+            sig_chunk=sig_c,
+            m_hat_c=m_hat_stamp[t0:t1],
+            cal_smear_err_c=cal_smear_err[t0:t1],
+            denom_rate=denom_rate,
+            matched_c=combined_matched[t0:t1],
+        )
+    return cal_smear_err, raw_sat_2d
 
 
 def _recalibrate_hdulist_inplace(
@@ -2690,13 +2436,14 @@ def _recalibrate_hdulist_inplace(
     cadence_match: CadenceMatchMode = "cadenceno",
     missing_cadence: MissingCadenceMode = "nan",
     offline: bool = False,
-    strict_hpc: bool = True,
+    strict_hpc: bool = False,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
     s3_fs: Any = None,
     verbose: bool = False,
+    quality_bitmask: Any = "default",
     target_obj: Any = None,
 ) -> None:
-    """Execute the v2.0 calibration pipeline on ``hdul`` in place."""
+    """Execute the chunked v2.0 calibration pipeline on ``hdul`` in place."""
     if smear not in ("automatic", "standard", "alternate"):
         raise ValueError(
             f"Invalid smear mode {smear!r}; expected 'automatic', 'standard', or 'alternate'."
@@ -2710,824 +2457,201 @@ def _recalibrate_hdulist_inplace(
             f"Invalid missing_cadence={missing_cadence!r}; expected 'nan' or 'error'."
         )
 
-    hdr0 = hdul[0].header
-    hdu1 = hdul[1]
-    hdr1 = hdu1.header
-    hdr2 = hdul[2].header
-
-    sector = int(hdr0["SECTOR"])
-    camera = int(hdr0["CAMERA"])
-    ccd = int(hdr0["CCD"])
-    ticid = int(hdr0["TICID"]) if "TICID" in hdr0 else None
-
-    raw_f64 = _extract_raw_cnts_float64(hdu1)
-    n_tpf, ny, nx = raw_f64.shape
-
-    col0_1based, row0_1based = _stamp_ccd_origin_1based(hdr1, hdr2)
-    x1_ccd0 = col0_1based - 1
-    y1_ccd0 = row0_1based - 1
-    cutout_bounds = (col0_1based, nx, row0_1based, ny)
-    _sync_stamp_ccd_origin(hdr1, hdr2, col0_1based, row0_1based)
-
-    cols_1based = np.arange(col0_1based, col0_1based + nx, dtype=np.int64)
-    col_outputs = tuple(output_for_rawx_col(int(c)) for c in cols_1based)
-    unique_outputs = tuple(out for out in OUTPUT_ORDER if out in col_outputs)
-
-    if row0_1based < 1 or y1_ccd0 + ny > 2048:
-        raise ValueError(
-            f"TPF rows {row0_1based}..{row0_1based + ny - 1} fall outside "
-            "TESS imaging rows 1..2048."
-        )
-
-    defer_auto_smear = (smear == "automatic") and (y1_ccd0 + ny < 2048)
+    ctx = _resolve_calibration_context(
+        hdul,
+        source_path=source_path,
+        cache_dir=cache_dir,
+        ddir=ddir,
+        offline=offline,
+        strict_hpc=strict_hpc,
+        s3_fs=s3_fs,
+        verbose=verbose,
+        quality_bitmask=quality_bitmask,
+        target_obj=target_obj,
+    )
+    defer_auto_smear = (smear == "automatic") and (ctx.y1_ccd0 + ctx.ny < 2048)
     eff_smear: Literal["standard", "alternate"] = (
-        ("alternate" if (y1_ccd0 + ny >= 2048) else "standard")
+        ("alternate" if (ctx.y1_ccd0 + ctx.ny >= 2048) else "standard")
         if smear == "automatic"
         else smear  # type: ignore[assignment]
     )
-
-    # Resolve cache / write directory: when ddir is explicitly supplied without cache_dir,
-    # write -blf.fits into ddir for seamless drop-in compatibility unless ddir resides on /fred.
-    resolved_cache: Path | None
-    if cache_dir is not None:
-        resolved_cache = resolve_cache_dir(cache_dir, strict_hpc=strict_hpc, create=True)
-    elif ddir is not None:
-        ddir_path = Path(ddir).expanduser()
-        if _is_fred_path(ddir_path):
-            has_env_cache = any(
-                os.environ.get(var, "").strip()
-                for var in (
-                    "MUNDEY_CACHE_DIR",
-                    "TESS_BRIGHT_CACHE_DIR",
-                    "SCRATCH",
-                    "XDG_CACHE_HOME",
-                )
-            )
-            if has_env_cache:
-                resolved_cache = resolve_cache_dir(None, strict_hpc=strict_hpc, create=True)
-            else:
-                resolve_cache_dir(ddir_path, strict_hpc=strict_hpc, create=False)
-                resolved_cache = None
-        else:
-            resolved_cache = None
-    else:
-        resolved_cache = resolve_cache_dir(None, strict_hpc=strict_hpc, create=True)
-
-    blf_write_base = (
-        (resolved_cache / f"s{sector:04d}")
-        if resolved_cache is not None
-        else Path(ddir).expanduser()  # type: ignore[arg-type]
-    )
-
-    cadence_kind = infer_cadence_kind(
-        tpf_path=source_path,
-        hdu0_header=hdr0,
-        hdu1_header=hdr1,
-    )
-    tpf_parts = source_path.name.split("-") if source_path is not None else None
-    if tpf_parts is not None and len(tpf_parts) < 4:
-        tpf_parts = None
-
     if verbose:
-        smear_label = smear if defer_auto_smear else eff_smear
         print(
-            f"Recalibrating Sector {sector} Camera {camera} CCD {ccd} "
-            f"Outputs {list(unique_outputs)} (smear={smear_label!r}, cadence={cadence_kind!r})"
+            f"Recalibrating Sector {ctx.sector} Camera {ctx.camera} CCD {ctx.ccd} "
+            f"Outputs {list(ctx.unique_outputs)} "
+            f"(smear={smear if defer_auto_smear else eff_smear!r}, cadence={ctx.cadence_kind!r})"
         )
 
-    models = resolve_static_models(
-        camera,
-        ccd,
+    all_outputs_have_alt_cache = False
+    alt_sm_stamp = np.empty((0, 0), dtype=np.float64)
+    alt_err_stamp = np.empty((0, 0), dtype=np.float64)
+    alt_unres_cols = np.zeros(ctx.nx, dtype=bool)
+    alt_matched = np.ones(ctx.n_tpf, dtype=bool)
+    if eff_smear == "alternate":
+        all_outputs_have_alt_cache, alt_sm_stamp, alt_err_stamp, alt_unres_cols, alt_matched = (
+            _try_load_alt_caches(ctx, ddir=ddir, cadence_match=cadence_match)
+        )
+
+    collat = _load_output_collateral(
+        ctx,
+        eff_smear=eff_smear,
+        all_outputs_have_alt_cache=all_outputs_have_alt_cache,
         ddir=ddir,
-        cache_dir=resolved_cache,
+        cadence_match=cadence_match,
         offline=offline,
+        chunk_rows=chunk_rows,
         s3_fs=s3_fs,
         verbose=verbose,
     )
-
-    with fits.open(models.black2d_path, memmap=True) as b2d_hdul:
-        black2d_img = np.asarray(b2d_hdul[1].data, dtype=np.float64)
-    with fits.open(models.flat_path, memmap=True) as flat_hdul:
-        flat_cutout = np.asarray(
-            flat_hdul[1].data[y1_ccd0 : y1_ccd0 + ny, x1_ccd0 : x1_ccd0 + nx],
-            dtype=np.float64,
-        )
-
-    n_eff_sci = effective_frame_count(hdr0, hdr1)
-    crmiten_var_sci = _crmiten_variance_factor(hdr0, hdr1)
-    fxdoff_sci = float(hdr1.get("FXDOFF", 209700.0))
-    int_time = float(hdr1["INT_TIME"])
-    tpf_time = np.asarray(hdu1.data["TIME"], dtype=np.float64)
-    tpf_cad = np.asarray(hdu1.data["CADENCENO"], dtype=np.int64)
-    time_unit = str(hdr1.get("TUNIT1", "BJD - 2457000, days"))
-
-    # Preserve incoming SOURCE_MASK if caller pre-populated PIXEL_QUALITY
-    existing_pq = (
-        np.asarray(hdul[PIXEL_QUALITY_EXTNAME].data, dtype=np.uint16)
-        if PIXEL_QUALITY_EXTNAME in hdul
-        else np.zeros((ny, nx), dtype=np.uint16)
-    )
-    source_mask_2d = (existing_pq & int(PixelQuality.SOURCE_MASK)) != 0
-    srcmask_digest = _source_mask_digest(source_mask_2d)
-    strap_col_mask = strap_mask_for_rawx_columns(cols_1based, buffer_px=2)
-
-    # Per-output collateral loading, CADENCENO alignment, and pre-smear science calibration
-    combined_matched = np.ones(n_tpf, dtype=bool)
-    sci_e_frame = np.full((n_tpf, ny, nx), np.nan, dtype=np.float64)
-    sci_sigma_pre = np.full((n_tpf, ny, nx), np.nan, dtype=np.float64)
-    sci_sat_3d = np.zeros((n_tpf, ny, nx), dtype=bool)
-
-    collat_smear_stamp = np.full((n_tpf, nx), np.nan, dtype=np.float64)
-    collat_smear_err_stamp = np.full((n_tpf, nx), np.nan, dtype=np.float64)
-    collat_sm_sat_cols = np.zeros(nx, dtype=bool)
-
-    alt_cached_smear_stamp = np.full((n_tpf, nx), np.nan, dtype=np.float64)
-    alt_cached_smear_err_stamp = np.full((n_tpf, nx), np.nan, dtype=np.float64)
-    alt_cached_unres_cols = np.zeros(nx, dtype=bool)
-
-    alt_blf_by_out: dict[str, Path] = {}
-    if eff_smear == "alternate":
-        for out in unique_outputs:
-            found_alt = _find_valid_smrow_blf(
-                sector=sector,
-                camera=camera,
-                ccd=ccd,
-                output=out,
-                cadence=cadence_kind,
-                smear_mode="alternate",
-                ddir=ddir,
-                cache_dir=resolved_cache,
-                tpf_parts=tpf_parts,
-                ticid=ticid,
-                cutout_bounds=cutout_bounds,
-                require_alt_unres=True,
-                required_cadenceno=tpf_cad,
-                cadence_match=cadence_match,
-                source_mask_digest=srcmask_digest,
-            )
-            if found_alt is not None:
-                alt_blf_by_out[out] = found_alt
-
-    # Only bypass standard smrow loading when ALL outputs in the cutout hit valid -alt- caches
-    all_outputs_have_alt_cache = (
-        eff_smear == "alternate" and len(alt_blf_by_out) == len(unique_outputs)
+    combined_matched = (
+        collat.combined_matched & alt_matched
+        if all_outputs_have_alt_cache
+        else collat.combined_matched
     )
 
-    # Store per-output 512-col collateral smear for alternate-mode cache writing & off-target anchor
-    per_out_collat_512: dict[str, np.ndarray] = {}
-    per_out_collat_err_512: dict[str, np.ndarray] = {}
-    off_target_smears: list[np.ndarray] = []
-    off_target_errs: list[np.ndarray] = []
-    max_e_per_frame_list: list[float] = []
-
-    for out in unique_outputs:
-        local_cols = np.flatnonzero(np.asarray([o == out for o in col_outputs], dtype=bool))
-        c0_loc, c1_loc = int(local_cols[0]), int(local_cols[-1]) + 1
-        sm_col_start = int(cols_1based[c0_loc] - 1 - OUTPUT_BOUNDS_0BASED[out][0])
-        sm_col_end = sm_col_start + (c1_loc - c0_loc)
-
-        lin_channel = load_linearity_channel(models.linearity_path, camera, ccd, out)
-        u_coeff = load_undershoot_coeff(camera, ccd, out)
-        gain_sci = float(hdr1[f"GAIN{out}"])
-        meanblc_sci = float(hdr1[f"MEANBLC{out}"])
-        readnoi_sci = float(hdr1.get(f"READNOI{out}", 8.5))
-        max_sm_e = linearity_max_electrons_per_frame(lin_channel, gain_sci)
-        max_e_per_frame_list.append(max_sm_e)
-
-        # 1. Load or build tvcol 1D-black -blf.fits (always on collateral CADENCENO grid)
-        tv_blf = _find_valid_tvcol_blf(
-            sector=sector,
-            camera=camera,
-            ccd=ccd,
-            output=out,
-            cadence=cadence_kind,
-            ddir=ddir,
-            cache_dir=resolved_cache,
-            tpf_parts=tpf_parts,
-        )
-        if tv_blf is None:
-            tv_raw_path = resolve_collateral_file(
-                sector=sector,
-                camera=camera,
-                ccd=ccd,
-                output=out,
-                kind="tvcol",
-                cadence=cadence_kind,
-                ddir=ddir,
-                cache_dir=resolved_cache,
-                offline=offline,
-                tpf_parts=tpf_parts,
-                s3_fs=s3_fs,
-                verbose=verbose,
-            )
-            tv_dst = collateral_blf_cache_path(
-                blf_write_base,
-                sector=sector,
-                camera=camera,
-                ccd=ccd,
-                output=out,
-                kind="tvcol",
-                cadence=cadence_kind,
-                tpf_parts=tpf_parts,
-                col_stem=tv_raw_path.stem if tpf_parts is None else None,
-            )
-            tv_blf = _calibrate_tvcol_raw_to_blf(
-                tv_raw_path,
-                tv_dst,
-                output=out,
-                black2d_img=black2d_img,
-                sci_hdr0=hdr0,
-                sci_hdr1=hdr1,
-                chunk_rows=chunk_rows,
-            )
-
-        with fits.open(tv_blf, memmap=True) as tv_hdul:
-            tv_hdu1 = tv_hdul[1]
-            tv_cad = np.asarray(tv_hdu1.data["CADENCENO"], dtype=np.int64)
-            tv_matched, tv_idx = match_cadenceno(
-                tpf_cad,
-                tv_cad,
-                cadence_match=cadence_match,
-                label=f"tvcol ({out})",
-            )
-            combined_matched &= tv_matched
-            safe_tv_idx = np.where(tv_matched, tv_idx, 0)
-            b1d_full = np.asarray(tv_hdu1.data["1DBLACK"], dtype=np.float64)[safe_tv_idx]
-            has_tv_err = "1DBLACK_ERR" in (tv_hdu1.data.names or ())
-            if has_tv_err:
-                b1d_err_full = np.asarray(tv_hdu1.data["1DBLACK_ERR"], dtype=np.float64)[
-                    safe_tv_idx
-                ]
-            else:
-                b1d_err_full = np.full_like(b1d_full, 0.5)
-            n_eff_tv = float(tv_hdu1.header.get("NEFF", n_eff_sci))
-
-        b1d_sci_rows = np.where(
-            tv_matched[:, None], b1d_full[:, y1_ccd0 : y1_ccd0 + ny], np.nan
-        )
-        b1d_err_sci_rows = np.where(
-            tv_matched[:, None], b1d_err_full[:, y1_ccd0 : y1_ccd0 + ny], np.nan
-        )
-
-        # 2. Pre-smear science calibration for this output slice:
-        #    de-bias -> causal LDE undershoot in ADU -> per-frame DN -> clamped linearity & gain
-        b2d_sci_slice = black2d_img[
-            y1_ccd0 : y1_ccd0 + ny,
-            x1_ccd0 + c0_loc : x1_ccd0 + c1_loc,
-        ]
-        scale_1d_sci = n_eff_sci / n_eff_tv
-        sci_debiased = (
-            raw_f64[:, :, c0_loc:c1_loc]
-            - fxdoff_sci
-            + n_eff_sci * (meanblc_sci - b2d_sci_slice)[np.newaxis, :, :]
-            - scale_1d_sci * b1d_sci_rows[:, :, np.newaxis]
-        )
-        e_out_np, sat_out_np, g_out_np = calibrate_pre_smear_e_per_frame(
-            sci_debiased,
-            u_coeff=u_coeff,
-            n_eff=n_eff_sci,
-            channel=lin_channel,
-            gain=gain_sci,
-            reverse_readout=OUTPUT_REVERSE_READOUT[out],
-        )
-
-        # Marginal pre-smear pixel variance in (e-/frame)^2
-        n_loc = c1_loc - c0_loc
-        u_mult = np.full(n_loc, 1.0 / (1.0 - u_coeff * u_coeff), dtype=np.float64)
-        first_read_idx = (n_loc - 1) if OUTPUT_REVERSE_READOUT[out] else 0
-        u_mult[first_read_idx] = 1.0 / ((1.0 - u_coeff) ** 2)
-
-        shot_read_var = (
-            crmiten_var_sci
-            * (np.maximum(e_out_np, 0.0) + readnoi_sci * readnoi_sci)
-            / n_eff_sci
-        )
-        b1d_var_sci = ((g_out_np * b1d_err_sci_rows[:, :, np.newaxis]) / n_eff_tv) ** 2
-        b1d_var_sci = np.where(np.isfinite(b1d_var_sci), b1d_var_sci, 0.0)
-        sig_out = np.sqrt(u_mult[None, None, :] * (shot_read_var + b1d_var_sci))
-
-        sci_e_frame[:, :, c0_loc:c1_loc] = e_out_np
-        sci_sigma_pre[:, :, c0_loc:c1_loc] = sig_out
-        sci_sat_3d[:, :, c0_loc:c1_loc] = sat_out_np
-
-        # 3. Smear cache resolution:
-        if all_outputs_have_alt_cache:
-            alt_blf = alt_blf_by_out[out]
-            with fits.open(alt_blf, memmap=True) as alt_hdul:
-                alt_hdu1 = alt_hdul[1]
-                alt_cad = np.asarray(alt_hdu1.data["CADENCENO"], dtype=np.int64)
-                alt_matched, alt_idx = match_cadenceno(
-                    tpf_cad,
-                    alt_cad,
-                    cadence_match=cadence_match,
-                    label=f"smrow-alt-blf ({out})",
-                )
-                safe_alt_idx = np.where(alt_matched, alt_idx, 0)
-                if "COLMATCH" in (alt_hdu1.data.names or ()):
-                    col_ok = np.asarray(alt_hdu1.data["COLMATCH"], dtype=bool)[safe_alt_idx]
-                    alt_matched = alt_matched & col_ok
-                combined_matched &= alt_matched
-                alt_sm_512 = np.asarray(alt_hdu1.data["SMEAR"], dtype=np.float64)[safe_alt_idx]
-                if "SMEAR_ERR" in (alt_hdu1.data.names or ()):
-                    alt_err_512 = np.asarray(alt_hdu1.data["SMEAR_ERR"], dtype=np.float64)[
-                        safe_alt_idx
-                    ]
-                else:
-                    alt_err_512 = np.sqrt(
-                        float(_unit_normal_median_variance(10))
-                        * crmiten_var_sci
-                        * (np.maximum(alt_sm_512, 0.0) + readnoi_sci**2)
-                        / n_eff_sci
-                    )
-                alt_cached_smear_stamp[:, c0_loc:c1_loc] = np.where(
-                    alt_matched[:, None],
-                    alt_sm_512[:, sm_col_start:sm_col_end],
-                    np.nan,
-                )
-                alt_cached_smear_err_stamp[:, c0_loc:c1_loc] = np.where(
-                    alt_matched[:, None],
-                    alt_err_512[:, sm_col_start:sm_col_end],
-                    np.nan,
-                )
-                alt_unres_512 = np.asarray(alt_hdul["ALT_UNRES"].data, dtype=bool)
-                alt_cached_unres_cols[c0_loc:c1_loc] = alt_unres_512[sm_col_start:sm_col_end]
-        else:
-            # Check standard collateral smrow -blf.fits cache across all candidate files
-            std_sm_blf = _find_valid_smrow_blf(
-                sector=sector,
-                camera=camera,
-                ccd=ccd,
-                output=out,
-                cadence=cadence_kind,
-                smear_mode="standard",
-                ddir=ddir,
-                cache_dir=resolved_cache,
-                tpf_parts=tpf_parts,
-                cutout_bounds=cutout_bounds,
-                cadence_match=cadence_match,
-                source_mask_digest="NONE",
-            )
-
-            if std_sm_blf is None and eff_smear == "standard":
-                sm_raw_path = resolve_collateral_file(
-                    sector=sector,
-                    camera=camera,
-                    ccd=ccd,
-                    output=out,
-                    kind="smrow",
-                    cadence=cadence_kind,
-                    ddir=ddir,
-                    cache_dir=resolved_cache,
-                    offline=offline,
-                    tpf_parts=tpf_parts,
-                    s3_fs=s3_fs,
-                    verbose=verbose,
-                )
-                sm_dst = collateral_blf_cache_path(
-                    blf_write_base,
-                    sector=sector,
-                    camera=camera,
-                    ccd=ccd,
-                    output=out,
-                    kind="smrow",
-                    cadence=cadence_kind,
-                    smear_mode="standard",
-                    tpf_parts=tpf_parts,
-                    col_stem=sm_raw_path.stem if tpf_parts is None else None,
-                )
-                std_sm_blf = _calibrate_smrow_raw_to_standard_blf(
-                    sm_raw_path,
-                    tv_blf,
-                    sm_dst,
-                    output=out,
-                    black2d_img=black2d_img,
-                    lin_channel=lin_channel,
-                    u_coeff=u_coeff,
-                    sci_hdr0=hdr0,
-                    sci_hdr1=hdr1,
-                    cadence_match=cadence_match,
-                    chunk_rows=chunk_rows,
-                )
-
-            if std_sm_blf is not None:
-                with fits.open(std_sm_blf, memmap=True) as sm_hdul:
-                    sm_hdu1 = sm_hdul[1]
-                    sm_cad = np.asarray(sm_hdu1.data["CADENCENO"], dtype=np.int64)
-                    sm_matched, sm_idx = match_cadenceno(
-                        tpf_cad,
-                        sm_cad,
-                        cadence_match=cadence_match,
-                        label=f"smrow ({out})",
-                    )
-                    combined_matched &= sm_matched
-                    safe_sm_idx = np.where(sm_matched, sm_idx, 0)
-                    sm_512 = np.asarray(sm_hdu1.data["SMEAR"], dtype=np.float64)[safe_sm_idx]
-                    if "SMEAR_ERR" in (sm_hdu1.data.names or ()):
-                        sm_err_512 = np.asarray(
-                            sm_hdu1.data["SMEAR_ERR"], dtype=np.float64
-                        )[safe_sm_idx]
-                    else:
-                        sm_err_512 = np.sqrt(
-                            float(_unit_normal_median_variance(10))
-                            * crmiten_var_sci
-                            * (np.maximum(sm_512, 0.0) + readnoi_sci**2)
-                            / n_eff_sci
-                        )
-                    sm_512 = np.where(sm_matched[:, None], sm_512, np.nan)
-                    sm_err_512 = np.where(sm_matched[:, None], sm_err_512, np.nan)
-                    if "SMROW_SAT" in sm_hdul:
-                        sm_sat_cad = np.asarray(sm_hdul["SMROW_SAT"].data, dtype=bool)[
-                            safe_sm_idx
-                        ]
-                        sm_sat_cad = np.where(sm_matched[:, None], sm_sat_cad, False)
-                        sm_sat_512 = np.any(sm_sat_cad, axis=0)
-                    else:
-                        sm_sat_512 = np.any(
-                            np.isfinite(sm_512) & (sm_512 >= max_sm_e * (1.0 - 1e-12)),
-                            axis=0,
-                        )
-            else:
-                # Alternate mode without pre-existing standard smrow-blf: stream only matched
-                # chunks from raw smrow without polluting standard smrow-blf path.
-                sm_raw_path = resolve_collateral_file(
-                    sector=sector,
-                    camera=camera,
-                    ccd=ccd,
-                    output=out,
-                    kind="smrow",
-                    cadence=cadence_kind,
-                    ddir=ddir,
-                    cache_dir=resolved_cache,
-                    offline=offline,
-                    tpf_parts=tpf_parts,
-                    s3_fs=s3_fs,
-                    verbose=verbose,
-                )
-                sm_hdr0, sm_hdr1, _sm_time, sm_cad = read_collateral_headers_and_index(
-                    sm_raw_path
-                )
-                sm_matched, sm_idx = match_cadenceno(
-                    tpf_cad,
-                    sm_cad,
-                    cadence_match=cadence_match,
-                    label=f"smrow ({out})",
-                )
-                combined_matched &= sm_matched
-                n_eff_sm = effective_frame_count(
-                    sm_hdr0, sm_hdr1, fallback_hdr0=hdr0, fallback_hdr1=hdr1
-                )
-                crmiten_var_sm = _crmiten_variance_factor(
-                    sm_hdr0, sm_hdr1, fallback_hdr0=hdr0, fallback_hdr1=hdr1
-                )
-                fxdoff_sm = float(sm_hdr1.get("FXDOFF", fxdoff_sci))
-                meanblc_sm = float(sm_hdr1.get(f"MEANBLC{out}", meanblc_sci))
-                gain_sm = float(sm_hdr1.get(f"GAIN{out}", gain_sci))
-                readnoi_sm = float(sm_hdr1.get(f"READNOI{out}", readnoi_sci))
-                sx1, sx2, _, _ = OUTPUT_BOUNDS_0BASED[out]
-                b2d_sm = black2d_img[2058:2068, sx1:sx2]
-
-                sm_512 = np.full((n_tpf, 512), np.nan, dtype=np.float64)
-                sm_err_512 = np.full((n_tpf, 512), np.nan, dtype=np.float64)
-                sm_sat_512 = np.zeros(512, dtype=bool)
-                matched_tpf_rows = np.flatnonzero(sm_matched)
-                needed_col_rows = sm_idx[matched_tpf_rows]
-
-                for t0, t1, _tc, _cc, raw_chunk in iter_collateral_chunks(
-                    sm_raw_path,
-                    "SMROW_RAW",
-                    chunk_rows=chunk_rows,
-                    row_indices=needed_col_rows,
-                ):
-                    in_chunk = (sm_idx >= t0) & (sm_idx < t1) & sm_matched
-                    if not np.any(in_chunk):
-                        continue
-                    tpf_sel = np.flatnonzero(in_chunk)
-                    rel_sel = sm_idx[tpf_sel] - t0
-                    sm_med_c, sm_err_c, sm_sat_c, _ = _calibrate_smrow_chunk_e_per_frame(
-                        raw_chunk[rel_sel],
-                        output=out,
-                        fxdoff=fxdoff_sm,
-                        meanblc=meanblc_sm,
-                        gain=gain_sm,
-                        read_noise_e=readnoi_sm,
-                        n_eff_sm=n_eff_sm,
-                        n_eff_tv=n_eff_tv,
-                        b2d_sm=b2d_sm,
-                        b1d_sm=b1d_full[tpf_sel, 2058:2068],
-                        b1d_err_sm=b1d_err_full[tpf_sel, 2058:2068],
-                        u_coeff=u_coeff,
-                        lin_channel=lin_channel,
-                        crmiten_var_factor=crmiten_var_sm,
-                    )
-                    sm_512[tpf_sel] = sm_med_c
-                    sm_err_512[tpf_sel] = sm_err_c
-                    sm_sat_512 |= sm_sat_c
-
-            per_out_collat_512[out] = sm_512
-            per_out_collat_err_512[out] = sm_err_512
-            collat_smear_stamp[:, c0_loc:c1_loc] = sm_512[:, sm_col_start:sm_col_end]
-            collat_smear_err_stamp[:, c0_loc:c1_loc] = sm_err_512[:, sm_col_start:sm_col_end]
-            collat_sm_sat_cols[c0_loc:c1_loc] = sm_sat_512[sm_col_start:sm_col_end]
-
-            # Off-target clean collateral smear baseline outside [sm_col_start-10, sm_col_end+10]
-            cols_512 = np.arange(512)
-            off_mask = (
-                ((cols_512 < sm_col_start - 10) | (cols_512 >= sm_col_end + 10))
-                & (~sm_sat_512)
-            )
-            n_off = int(np.sum(off_mask))
-            if n_off >= 8:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", RuntimeWarning)
-                    off_med = np.nanmedian(sm_512[:, off_mask], axis=1)
-                    off_mad = 1.4826 * np.nanmedian(
-                        np.abs(sm_512[:, off_mask] - off_med[:, None]), axis=1
-                    )
-                    se_theo = np.sqrt(float(_unit_normal_median_variance(n_off))) * np.nanmedian(
-                        sm_err_512[:, off_mask], axis=1
-                    )
-                se_theo = np.where(np.isfinite(se_theo), se_theo, 0.0)
-                off_target_smears.append(off_med)
-                off_target_errs.append(np.maximum(off_mad, se_theo))
-
-    # Enforce missing_cadence policy ("nan" warning vs "error" ValueError)
     n_missing = _enforce_missing_cadence_policy(
-        tpf_cad,
-        combined_matched,
-        missing_cadence=missing_cadence,
+        ctx.tpf_cad, combined_matched, missing_cadence=missing_cadence
     )
+    good_cad = combined_matched & ctx.quality_mask
+    if not np.any(good_cad):
+        good_cad = combined_matched
+    collat_sm_sat_cols = np.any(collat.collat_sm_sat_2d[good_cad], axis=0)
 
-    if not np.all(combined_matched):
-        sci_e_frame[~combined_matched] = np.nan
-        sci_sigma_pre[~combined_matched] = np.nan
-        sci_sat_3d[~combined_matched] = False
-
-    # Construct spatial PIXEL_QUALITY mask
-    raw_sat_2d = np.any(sci_sat_3d, axis=0)
-    sat_bleed_2d = _build_sat_bleed_mask_2d(sci_sat_3d, col_outputs)
-    pq_out = np.zeros((ny, nx), dtype=np.uint16)
-    pq_out[:, strap_col_mask] |= np.uint16(PixelQuality.STRAP_COL)
-    pq_out[sat_bleed_2d] |= np.uint16(PixelQuality.SAT_BLEED)
-    pq_out[source_mask_2d] |= np.uint16(PixelQuality.SOURCE_MASK)
-
-    # Resolve deferred smear="automatic" after pre-smear calibration and collateral smrow loading
-    if defer_auto_smear:
-        dilated_bleed_auto = _dilate_vertical_bool(raw_sat_2d, radius=4)
-        clean_rows_auto = (~dilated_bleed_auto) & (~source_mask_2d)
-        if (
-            (y1_ccd0 + ny >= 2048)
-            or bool(np.any(collat_sm_sat_cols))
-            or bool(np.any(raw_sat_2d))
-            or bool(
-                np.any(
-                    _detect_bloom_columns(
-                        sci_e_frame - collat_smear_stamp[:, None, :],
-                        sci_sigma_pre,
-                        clean_rows_auto,
-                    )
-                )
-            )
-        ):
-            eff_smear = "alternate"
-            # Check warm -alt-*-blf.fits caches before recomputing on sub-row-2048 cutouts
-            deferred_alt_blf: dict[str, Path] = {}
-            for out in unique_outputs:
-                found_alt = _find_valid_smrow_blf(
-                    sector=sector,
-                    camera=camera,
-                    ccd=ccd,
-                    output=out,
-                    cadence=cadence_kind,
-                    smear_mode="alternate",
-                    ddir=ddir,
-                    cache_dir=resolved_cache,
-                    tpf_parts=tpf_parts,
-                    ticid=ticid,
-                    cutout_bounds=cutout_bounds,
-                    require_alt_unres=True,
-                    required_cadenceno=tpf_cad,
-                    cadence_match=cadence_match,
-                    source_mask_digest=srcmask_digest,
-                )
-                if found_alt is not None:
-                    deferred_alt_blf[out] = found_alt
-            if len(deferred_alt_blf) == len(unique_outputs):
-                for out in unique_outputs:
-                    local_cols = np.flatnonzero(
-                        np.asarray([o == out for o in col_outputs], dtype=bool)
-                    )
-                    c0_loc, c1_loc = int(local_cols[0]), int(local_cols[-1]) + 1
-                    sm_col_start = int(cols_1based[c0_loc] - 1 - OUTPUT_BOUNDS_0BASED[out][0])
-                    sm_col_end = sm_col_start + (c1_loc - c0_loc)
-                    readnoi_sci = float(hdr1.get(f"READNOI{out}", 8.5))
-                    with fits.open(deferred_alt_blf[out], memmap=True) as alt_hdul:
-                        alt_hdu1 = alt_hdul[1]
-                        alt_cad = np.asarray(alt_hdu1.data["CADENCENO"], dtype=np.int64)
-                        alt_matched, alt_idx = match_cadenceno(
-                            tpf_cad,
-                            alt_cad,
-                            cadence_match=cadence_match,
-                            label=f"smrow-alt-blf ({out})",
-                        )
-                        safe_alt_idx = np.where(alt_matched, alt_idx, 0)
-                        if "COLMATCH" in (alt_hdu1.data.names or ()):
-                            col_ok = np.asarray(alt_hdu1.data["COLMATCH"], dtype=bool)[
-                                safe_alt_idx
-                            ]
-                            alt_matched = alt_matched & col_ok
-                        alt_sm_512 = np.asarray(alt_hdu1.data["SMEAR"], dtype=np.float64)[
-                            safe_alt_idx
-                        ]
-                        if "SMEAR_ERR" in (alt_hdu1.data.names or ()):
-                            alt_err_512 = np.asarray(
-                                alt_hdu1.data["SMEAR_ERR"], dtype=np.float64
-                            )[safe_alt_idx]
-                        else:
-                            alt_err_512 = np.sqrt(
-                                float(_unit_normal_median_variance(10))
-                                * crmiten_var_sci
-                                * (np.maximum(alt_sm_512, 0.0) + readnoi_sci**2)
-                                / n_eff_sci
-                            )
-                        alt_cached_smear_stamp[:, c0_loc:c1_loc] = np.where(
-                            alt_matched[:, None],
-                            alt_sm_512[:, sm_col_start:sm_col_end],
-                            np.nan,
-                        )
-                        alt_cached_smear_err_stamp[:, c0_loc:c1_loc] = np.where(
-                            alt_matched[:, None],
-                            alt_err_512[:, sm_col_start:sm_col_end],
-                            np.nan,
-                        )
-                        alt_unres_512 = np.asarray(alt_hdul["ALT_UNRES"].data, dtype=bool)
-                        alt_cached_unres_cols[c0_loc:c1_loc] = alt_unres_512[
-                            sm_col_start:sm_col_end
-                        ]
-                all_outputs_have_alt_cache = True
-
-    # Compute final smear M_hat (e-/frame) and M_err (e-/frame) across the stamp
-    if eff_smear == "standard":
-        m_hat_stamp = collat_smear_stamp
-        m_err_stamp = collat_smear_err_stamp
-    elif all_outputs_have_alt_cache:
-        m_hat_stamp = alt_cached_smear_stamp
-        m_err_stamp = alt_cached_smear_err_stamp
-        pq_out[:, alt_cached_unres_cols] |= np.uint16(PixelQuality.SMEAR_UNRESOLVED)
-    else:
-        if off_target_smears:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                off_sm_vec = np.nanmean(np.vstack(off_target_smears), axis=0)
-                off_err_vec = np.nanmean(np.vstack(off_target_errs), axis=0)
-        else:
-            off_sm_vec = None
-            off_err_vec = None
-
-        sat_limit_e_frame = (
-            float(np.mean(max_e_per_frame_list)) if max_e_per_frame_list else None
-        )
-        m_hat_stamp, m_err_stamp, unresolved_cols = _estimate_alternate_smear_stamp(
-            sci_pre_smear=sci_e_frame,
-            sci_sigma_pre=sci_sigma_pre,
-            flat_2d=flat_cutout,
-            collat_smear_stamp=collat_smear_stamp,
-            collat_smear_err_stamp=collat_smear_err_stamp,
-            collat_sm_sat_cols=collat_sm_sat_cols,
-            off_target_smear=off_sm_vec,
-            off_target_smear_err=off_err_vec,
-            raw_sat_2d=raw_sat_2d,
-            sat_bleed_2d=sat_bleed_2d,
-            strap_col_mask=strap_col_mask,
-            source_mask_2d=source_mask_2d,
-            row0_1based=row0_1based,
-            row_smear_weight=_frame_transfer_row_weight(hdr0, hdr1),
-            saturation_limit=sat_limit_e_frame,
-        )
-        pq_out[:, unresolved_cols] |= np.uint16(PixelQuality.SMEAR_UNRESOLVED)
-
-        # Persist target-scoped -alt-*-blf.fits caches for each output
-        for out in unique_outputs:
-            if out not in per_out_collat_512:
-                continue
-            local_cols = np.flatnonzero(np.asarray([o == out for o in col_outputs], dtype=bool))
-            c0_loc, c1_loc = int(local_cols[0]), int(local_cols[-1]) + 1
-            sm_col_start = int(cols_1based[c0_loc] - 1 - OUTPUT_BOUNDS_0BASED[out][0])
-            sm_col_end = sm_col_start + (c1_loc - c0_loc)
-
-            alt_sm_512 = per_out_collat_512[out].copy()
-            alt_err_512 = per_out_collat_err_512[out].copy()
-            alt_sm_512[:, sm_col_start:sm_col_end] = m_hat_stamp[:, c0_loc:c1_loc]
-            alt_err_512[:, sm_col_start:sm_col_end] = m_err_stamp[:, c0_loc:c1_loc]
-            alt_unres_512 = np.zeros(512, dtype=bool)
-            alt_unres_512[sm_col_start:sm_col_end] = unresolved_cols[c0_loc:c1_loc]
-
-            alt_dst = collateral_blf_cache_path(
-                blf_write_base,
-                sector=sector,
-                camera=camera,
-                ccd=ccd,
-                output=out,
-                kind="smrow",
-                cadence=cadence_kind,
-                smear_mode="alternate",
-                tpf_parts=tpf_parts,
-                col_stem=(
-                    f"tess-s{sector:04d}-smrow-{camera}-{ccd}-{out.lower()}-"
-                    f"{int(ticid):016d}-{collateral_suffix(cadence_kind)}"
-                    if ticid is not None and tpf_parts is None
-                    else None
-                ),
-            )
-            if not _alt_blf_has_more_cadences(
-                alt_dst,
-                cutout_bounds,
-                len(tpf_cad),
-                cadence_match=cadence_match,
-                source_mask_digest=srcmask_digest,
-            ):
-                try:
-                    write_smear_blf(
-                        alt_dst,
-                        time=tpf_time,
-                        cadenceno=tpf_cad,
-                        smear=alt_sm_512,
-                        smear_err=alt_err_512.astype(np.float32),
-                        unresolved_cols=alt_unres_512,
-                        col_matched=combined_matched,
-                        smear_mode="alternate",
-                        cutout_bounds=cutout_bounds,
-                        cadence_match=cadence_match,
-                        source_mask_digest=srcmask_digest,
-                        int_time=int_time,
-                        time_unit=time_unit,
-                    )
-                except OSError as exc:
-                    if exc.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
-                        warnings.warn(
-                            f"Skipping alternate smear cache write to read-only path "
-                            f"{alt_dst}: {exc}",
-                            UserWarning,
-                            stacklevel=2,
-                        )
-                    else:
-                        raise
-
-    # Subtract smear, divide by flat field and single-frame exposure time INT_TIME -> e-/s
-    safe_flat = np.where(np.isfinite(flat_cutout) & (flat_cutout > 0.0), flat_cutout, np.nan)
-    denom_rate = safe_flat[np.newaxis, :, :] * int_time
-
-    cal_flux = (sci_e_frame - m_hat_stamp[:, np.newaxis, :]) / denom_rate
+    safe_flat = np.where(
+        np.isfinite(ctx.flat_cutout) & (ctx.flat_cutout > 0.0), ctx.flat_cutout, np.nan
+    )
+    denom_rate = safe_flat[np.newaxis, :, :] * ctx.int_time
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         col_mean_flat = np.nanmean(safe_flat, axis=0)
     col_mean_flat = np.where(np.isfinite(col_mean_flat) & (col_mean_flat > 0.0), col_mean_flat, 1.0)
-    cal_smear_err = m_err_stamp / (col_mean_flat[np.newaxis, :] * int_time)
-    cal_pix_err = sci_sigma_pre / denom_rate
-    cal_flux_err = np.hypot(cal_pix_err, cal_smear_err[:, np.newaxis, :])
+    smear_rate_denom = col_mean_flat[np.newaxis, :] * ctx.int_time
 
-    if not np.all(combined_matched):
-        cal_flux[~combined_matched] = np.nan
-        cal_flux_err[~combined_matched] = np.nan
-        cal_smear_err[~combined_matched] = np.nan
+    pq_out = np.zeros((ctx.ny, ctx.nx), dtype=np.uint16)
+    pq_out[:, ctx.strap_col_mask] |= np.uint16(PixelQuality.STRAP_COL)
+    pq_out[ctx.source_mask_2d] |= np.uint16(PixelQuality.SOURCE_MASK)
 
-    # Write calibrated columns & HALOCVER = 1 provenance across all N_raw rows of HDU 1
-    col_names = hdul[1].data.names or ()
-    hdul[1].data["FLUX"] = cal_flux.astype(np.float32)
-    if "FLUX_ERR" in col_names:
-        hdul[1].data["FLUX_ERR"] = cal_flux_err.astype(np.float32)
-    if "FLUX_BKG" in col_names:
-        hdul[1].data["FLUX_BKG"] = np.float32(0.0)
-    if "FLUX_BKG_ERR" in col_names:
-        hdul[1].data["FLUX_BKG_ERR"] = np.float32(0.0)
+    if (eff_smear == "standard" and not defer_auto_smear) or all_outputs_have_alt_cache:
+        m_hat_stamp = alt_sm_stamp if all_outputs_have_alt_cache else collat.collat_smear_stamp
+        m_err_stamp = alt_err_stamp if all_outputs_have_alt_cache else collat.collat_smear_err_stamp
+        cal_smear_err, raw_sat_2d = _apply_fixed_smear_chunks(
+            ctx,
+            collat.out_params,
+            combined_matched,
+            m_hat_stamp,
+            m_err_stamp,
+            denom_rate,
+            smear_rate_denom,
+            chunk_rows,
+            good_cad=good_cad,
+        )
+        assert raw_sat_2d is not None
+        pq_out[_build_sat_bleed_mask_from_raw_sat(raw_sat_2d, ctx.col_outputs)] |= np.uint16(
+            PixelQuality.SAT_BLEED
+        )
+        if all_outputs_have_alt_cache:
+            pq_out[:, alt_unres_cols] |= np.uint16(PixelQuality.SMEAR_UNRESOLVED)
+        _finalize_calibrated_hdulist(
+            ctx,
+            cal_smear_err=cal_smear_err,
+            pq_out=pq_out,
+            eff_smear=eff_smear,
+            cadence_match=cadence_match,
+            n_missing=n_missing,
+            target_obj=target_obj,
+        )
+        return
 
-    append_smear_err_column(hdul, cal_smear_err.astype(np.float32))
-    write_pixel_quality(hdul, pq_out)
-    write_mundey_provenance(
-        target_obj if target_obj is not None else hdul,
-        bkgsub=False,
-        smear_mode=eff_smear,
+    raw_sat_2d, sat_bleed_2d, col_has_bloom, single_chunk_cache = _scan_pass1_bloom(
+        ctx, collat.out_params, combined_matched, good_cad, collat.collat_smear_stamp, chunk_rows
     )
+    pq_out[sat_bleed_2d] |= np.uint16(PixelQuality.SAT_BLEED)
 
-    hdul[0].header["CADMATCH"] = (cadence_match, "Collateral cadence pairing mode")
-    hdul[0].header["CADMISS"] = (int(n_missing), "Unmatched TPF cadences masked to NaN")
-    if target_obj is not None:
-        meta = getattr(target_obj, "meta", None)
-        meta_dict = getattr(meta, "_dict", None)
-        if isinstance(meta_dict, dict):
-            meta_dict["CADMATCH"] = cadence_match
-            meta_dict["CADMISS"] = int(n_missing)
+    # Deferred smear="automatic": NEVER trigger on ordinary science raw_sat_2d!
+    if defer_auto_smear and (
+        (ctx.y1_ccd0 + ctx.ny >= 2048)
+        or bool(np.any(collat_sm_sat_cols))
+        or bool(np.any(col_has_bloom))
+    ):
+        eff_smear = "alternate"
+        hit, alt_sm_stamp, alt_err_stamp, alt_unres_cols, alt_matched = _try_load_alt_caches(
+            ctx, ddir=ddir, cadence_match=cadence_match
+        )
+        if hit:
+            all_outputs_have_alt_cache = True
+            new_combined = combined_matched & alt_matched
+            if not np.array_equal(new_combined, combined_matched):
+                combined_matched = new_combined
+                n_missing = _enforce_missing_cadence_policy(
+                    ctx.tpf_cad, combined_matched, missing_cadence=missing_cadence
+                )
+
+    if eff_smear == "standard" or all_outputs_have_alt_cache:
+        m_hat_stamp = alt_sm_stamp if all_outputs_have_alt_cache else collat.collat_smear_stamp
+        m_err_stamp = alt_err_stamp if all_outputs_have_alt_cache else collat.collat_smear_err_stamp
+        if all_outputs_have_alt_cache:
+            pq_out[:, alt_unres_cols] |= np.uint16(PixelQuality.SMEAR_UNRESOLVED)
+        cal_smear_err, _ = _apply_fixed_smear_chunks(
+            ctx,
+            collat.out_params,
+            combined_matched,
+            m_hat_stamp,
+            m_err_stamp,
+            denom_rate,
+            smear_rate_denom,
+            chunk_rows,
+            single_chunk_cache=single_chunk_cache,
+        )
+    else:
+        m_hat_stamp, m_err_stamp, cal_smear_err, unresolved_cols = _run_cold_alternate_pass(
+            ctx,
+            out_params=collat.out_params,
+            combined_matched=combined_matched,
+            good_cad=good_cad,
+            collat_smear_stamp=collat.collat_smear_stamp,
+            collat_smear_err_stamp=collat.collat_smear_err_stamp,
+            collat_sm_sat_cols=collat_sm_sat_cols,
+            off_target_smears=collat.off_target_smears,
+            off_target_errs=collat.off_target_errs,
+            max_e_per_frame_list=collat.max_e_per_frame_list,
+            raw_sat_2d=raw_sat_2d,
+            sat_bleed_2d=sat_bleed_2d,
+            col_has_bloom=col_has_bloom,
+            single_chunk_cache=single_chunk_cache,
+            denom_rate=denom_rate,
+            smear_rate_denom=smear_rate_denom,
+            chunk_rows=chunk_rows,
+        )
+        pq_out[:, unresolved_cols] |= np.uint16(PixelQuality.SMEAR_UNRESOLVED)
+        _persist_alt_caches(
+            ctx,
+            per_out_collat_512=collat.per_out_collat_512,
+            per_out_collat_err_512=collat.per_out_collat_err_512,
+            m_hat_stamp=m_hat_stamp,
+            m_err_stamp=m_err_stamp,
+            unresolved_cols=unresolved_cols,
+            combined_matched=combined_matched,
+            cadence_match=cadence_match,
+        )
+
+    _finalize_calibrated_hdulist(
+        ctx,
+        cal_smear_err=cal_smear_err,
+        pq_out=pq_out,
+        eff_smear=eff_smear,
+        cadence_match=cadence_match,
+        n_missing=n_missing,
+        target_obj=target_obj,
+    )
 
 
 def _clone_input_tpf(
     tpf: str | os.PathLike[str] | lk.TargetPixelFile,
 ) -> tuple[fits.HDUList, Path | None, Any]:
-    """Return a deep-copied ``HDUList``, optional source path, and ``quality_bitmask``."""
     if isinstance(tpf, str | os.PathLike):
         src_path = Path(tpf).expanduser()
         with fits.open(src_path, mode="readonly", memmap=False) as src_hdul:
-            hdul = fits.HDUList([h.copy() for h in src_hdul])
-        return hdul, src_path, "default"
-
+            return fits.HDUList([h.copy() for h in src_hdul]), src_path, "default"
     if hasattr(tpf, "hdu") and isinstance(tpf.hdu, fits.HDUList):
         hdul = fits.HDUList([h.copy() for h in tpf.hdu])
         raw_path = getattr(tpf, "path", None)
@@ -3537,47 +2661,40 @@ def _clone_input_tpf(
             else None
         )
         qmask = getattr(tpf, "quality_bitmask", _MISSING)
-        if qmask is _MISSING:
-            qmask = "default"
-        return hdul, src_path, qmask
-
-    raise TypeError(
-        f"Expected file path or lightkurve.TargetPixelFile, got {type(tpf)!r}."
-    )
+        return hdul, src_path, ("default" if qmask is _MISSING else qmask)
+    raise TypeError(f"Expected file path or lightkurve.TargetPixelFile, got {type(tpf)!r}.")
 
 
 def recalibrate_tpf(
     tpf: str | os.PathLike[str] | lk.TargetPixelFile,
     *,
+    config: CalibrationConfig | None = None,
     cache_dir: str | os.PathLike[str] | None = None,
     ddir: str | os.PathLike[str] | None = None,
-    smear: SmearMode = "automatic",
-    cadence_match: CadenceMatchMode = "cadenceno",
-    missing_cadence: MissingCadenceMode = "nan",
-    offline: bool = False,
-    strict_hpc: bool = True,
-    verbose: bool = False,
+    smear: SmearMode | None = None,
+    cadence_match: CadenceMatchMode | None = None,
+    missing_cadence: MissingCadenceMode | None = None,
+    offline: bool | None = None,
+    strict_hpc: bool | None = None,
+    chunk_rows: int | None = None,
+    verbose: bool | None = None,
 ) -> lk.TargetPixelFile:
-    """Recalibrate a TESS Target Pixel File from ``RAW_CNTS`` under ``HALOCVER = 1``.
-
-    Pure functional transformation: never mutates an in-memory ``TargetPixelFile``
-    argument. Returns a calibrated ``TessTargetPixelFile`` with un-background-subtracted
-    ``FLUX`` (``e-/s``), total marginal ``FLUX_ERR``, column-coherent ``SMEAR_ERR`` in
-    ``hdu[1]``, zeroed ``FLUX_BKG`` / ``FLUX_BKG_ERR``, spatial ``PIXEL_QUALITY``
-    ``ImageHDU``, and ``HALOCVER = 1``, ``BKGSUB = False`` provenance cards.
-    """
+    """Recalibrate a TESS Target Pixel File from ``RAW_CNTS`` under ``HALOCVER = 1``."""
+    cfg = config if config is not None else CalibrationConfig()
     hdul, src_path, quality_bitmask = _clone_input_tpf(tpf)
     _recalibrate_hdulist_inplace(
         hdul,
         source_path=src_path,
-        cache_dir=cache_dir,
-        ddir=ddir,
-        smear=smear,
-        cadence_match=cadence_match,
-        missing_cadence=missing_cadence,
-        offline=offline,
-        strict_hpc=strict_hpc,
-        verbose=verbose,
+        cache_dir=cache_dir if cache_dir is not None else cfg.cache_dir,
+        ddir=ddir if ddir is not None else cfg.ddir,
+        smear=smear if smear is not None else cfg.smear,
+        cadence_match=cadence_match if cadence_match is not None else cfg.cadence_match,
+        missing_cadence=missing_cadence if missing_cadence is not None else cfg.missing_cadence,
+        offline=offline if offline is not None else cfg.offline,
+        strict_hpc=strict_hpc if strict_hpc is not None else cfg.strict_hpc,
+        chunk_rows=chunk_rows if chunk_rows is not None else cfg.chunk_rows,
+        verbose=verbose if verbose is not None else cfg.verbose,
+        quality_bitmask=quality_bitmask,
     )
     out_tpf = lk.TessTargetPixelFile(hdul, quality_bitmask=quality_bitmask)
     if src_path is not None and hasattr(out_tpf, "path"):
@@ -3591,22 +2708,10 @@ def desmear_calibrated_cutout(
     saturation_flux_threshold: float = 1.0e5,
     verbose: bool = False,
 ) -> lk.TargetPixelFile:
-    """Repair collateral-bleed smear corruption on calibrated FFI cutouts (e.g. ``TessCut``).
-
-    Designed for full-frame-image cutouts where raw ``RAW_CNTS`` and collateral
-    ``_col.fits`` tables are unavailable. Restores any previously subtracted finite
-    ``FLUX_BKG`` when ``BKGSUB`` / ``BACKAPP`` is ``True`` (zeroing ``FLUX_BKG`` /
-    ``FLUX_BKG_ERR`` and setting ``BKGSUB = False``), or preserves ``BKGSUB = True``
-    / ``BACKAPP = True`` when prior background subtraction cannot be restored because
-    ``FLUX_BKG`` is absent or all-``NaN``. Bridges clean flank columns across
-    bloomed/saturated columns with inverse-wing-weighted Huber row-location
-    estimation, writes ``SMEAR_ERR`` and ``PIXEL_QUALITY``, and stamps ``HALOCVER = 1``.
-    """
+    """Repair collateral-bleed smear corruption on calibrated FFI cutouts (e.g. ``TessCut``)."""
     hdul, src_path, quality_bitmask = _clone_input_tpf(tpf)
-    hdr0 = hdul[0].header
-    hdu1 = hdul[1]
+    hdr0, hdu1, hdr2 = hdul[0].header, hdul[1], hdul[2].header
     hdr1 = hdu1.header
-    hdr2 = hdul[2].header
 
     names = hdu1.data.names or ()
     if "FLUX" not in names:
@@ -3614,8 +2719,8 @@ def desmear_calibrated_cutout(
 
     flux_in = np.asarray(hdu1.data["FLUX"], dtype=np.float64)
     n_tpf, ny, nx = flux_in.shape
+    quality_mask = _compute_quality_mask(hdu1, quality_bitmask=quality_bitmask)
 
-    # Restore un-background-subtracted flux if cutout had background subtracted
     bkgsub_hdr = hdr0.get("BKGSUB", hdr1.get("BKGSUB", None))
     backapp_hdr = bool(hdr1.get("BACKAPP", hdr0.get("BACKAPP", False)))
     has_bkg_col = "FLUX_BKG" in names
@@ -3625,11 +2730,9 @@ def desmear_calibrated_cutout(
         bkg_nonzero = bool(np.any(np.isfinite(bkg_arr) & (bkg_arr != 0.0)))
     else:
         bkg_arr = np.zeros_like(flux_in)
-        bkg_has_finite = False
-        bkg_nonzero = False
+        bkg_has_finite, bkg_nonzero = False, False
 
-    bkg_all_nan = has_bkg_col and not bkg_has_finite
-    bkg_unrestorable = (not has_bkg_col) or bkg_all_nan
+    bkg_unrestorable = (not has_bkg_col) or (has_bkg_col and not bkg_has_finite)
     should_restore_bkg = bkg_nonzero and (
         (bkgsub_hdr is True) or (bkgsub_hdr is None and backapp_hdr)
     )
@@ -3646,20 +2749,23 @@ def desmear_calibrated_cutout(
     if "FLUX_ERR" in names:
         err_in = np.asarray(hdu1.data["FLUX_ERR"], dtype=np.float64)
         if should_restore_bkg and "FLUX_BKG_ERR" in names:
-            berr = np.asarray(hdu1.data["FLUX_BKG_ERR"], dtype=np.float64)
-            berr = np.where(np.isfinite(berr), berr, 0.0)
+            berr = np.where(
+                np.isfinite(hdu1.data["FLUX_BKG_ERR"]),
+                np.asarray(hdu1.data["FLUX_BKG_ERR"], dtype=np.float64),
+                0.0,
+            )
             sigma_in = np.sqrt(np.maximum(err_in * err_in - berr * berr, 1e-6))
         else:
             sigma_in = np.where(np.isfinite(err_in) & (err_in > 0.0), err_in, 1.0)
     else:
-        exp_sec = _effective_exposure_seconds(hdr0, hdr1)
-        sigma_in = np.sqrt(np.maximum(np.abs(u_in), 1.0) / exp_sec)
+        sigma_in = np.sqrt(
+            np.maximum(np.abs(u_in), 1.0) / _effective_exposure_seconds(hdr0, hdr1)
+        )
 
     col0_1based, row0_1based = _stamp_ccd_origin_1based(hdr1, hdr2, default=(45, 1))
     _sync_stamp_ccd_origin(hdr1, hdr2, col0_1based, row0_1based)
     cols_1based = np.arange(col0_1based, col0_1based + nx, dtype=np.int64)
-    in_sci_range = (cols_1based >= 45) & (cols_1based <= 2092)
-    if np.all(in_sci_range):
+    if np.all((cols_1based >= 45) & (cols_1based <= 2092)):
         col_outputs = tuple(output_for_rawx_col(int(c)) for c in cols_1based)
         strap_col_mask = strap_mask_for_rawx_columns(cols_1based, buffer_px=2)
     else:
@@ -3673,14 +2779,17 @@ def desmear_calibrated_cutout(
     )
     source_mask_2d = (existing_pq & int(PixelQuality.SOURCE_MASK)) != 0
 
+    good_cad = quality_mask if np.any(quality_mask) else np.ones(n_tpf, dtype=bool)
     sci_sat_3d = np.isfinite(u_in) & (u_in > float(saturation_flux_threshold))
-    raw_sat_2d = np.any(sci_sat_3d, axis=0) | ((existing_pq & int(PixelQuality.SAT_BLEED)) != 0)
-    sat_bleed_2d = _build_sat_bleed_mask_2d(sci_sat_3d, col_outputs) | raw_sat_2d
+    raw_sat_2d = np.any(sci_sat_3d[good_cad], axis=0) | (
+        (existing_pq & int(PixelQuality.SAT_BLEED)) != 0
+    )
+    sat_bleed_2d = _build_sat_bleed_mask_from_raw_sat(raw_sat_2d, col_outputs) | raw_sat_2d
 
     if verbose:
         print(f"Desmearing calibrated cutout of shape {(n_tpf, ny, nx)}")
 
-    delta_m, delta_m_err, unresolved_cols = _estimate_alternate_smear_stamp(
+    delta_m, delta_m_err, unresolved_cols, zero_floor_clamped = _estimate_alternate_smear_stamp(
         sci_pre_smear=u_in,
         sci_sigma_pre=sigma_in,
         flat_2d=np.ones((ny, nx), dtype=np.float64),
@@ -3693,11 +2802,25 @@ def desmear_calibrated_cutout(
         sat_bleed_2d=sat_bleed_2d,
         strap_col_mask=strap_col_mask,
         source_mask_2d=source_mask_2d,
-        row0_1based=row0_1based,
-        row_smear_weight=_frame_transfer_row_weight(hdr0, hdr1),
-        saturation_limit=float(saturation_flux_threshold),
+        config=AlternateSmearConfig(
+            row0_1based=row0_1based,
+            row_smear_weight=_frame_transfer_row_weight(hdr0, hdr1),
+            saturation_limit=float(saturation_flux_threshold),
+        ),
         bloom_detect_cube=flux_in if should_restore_bkg else None,
+        good_cad_mask=good_cad,
     )
+
+    effective_bkgsub = preserve_bkgsub
+    if zero_floor_clamped and not preserve_bkgsub:
+        warnings.warn(
+            "All cutout columns are bloomed with no collateral data or FLUX_BKG reference; "
+            "a uniform sky pedestal is degenerate with uniform smear bloom, so the output "
+            "floor has been zero-referenced (stamping BKGSUB=True).",
+            UserWarning,
+            stacklevel=2,
+        )
+        effective_bkgsub = True
 
     pq_out = np.zeros((ny, nx), dtype=np.uint16)
     pq_out[:, strap_col_mask] |= np.uint16(PixelQuality.STRAP_COL)
@@ -3706,18 +2829,19 @@ def desmear_calibrated_cutout(
     pq_out[source_mask_2d] |= np.uint16(PixelQuality.SOURCE_MASK)
 
     flux_out = u_in - delta_m[:, np.newaxis, :]
-    flux_err_out = np.sqrt(sigma_in * sigma_in + (delta_m_err * delta_m_err)[:, np.newaxis, :])
-
+    flux_err_out = np.hypot(sigma_in, delta_m_err[:, np.newaxis, :])
     finite_cad = np.any(np.isfinite(u_in), axis=(1, 2))
     if not np.all(finite_cad):
-        flux_out[~finite_cad] = np.nan
-        flux_err_out[~finite_cad] = np.nan
-        delta_m_err[~finite_cad] = np.nan
+        flux_out[~finite_cad], flux_err_out[~finite_cad], delta_m_err[~finite_cad] = (
+            np.nan,
+            np.nan,
+            np.nan,
+        )
 
     hdul[1].data["FLUX"] = flux_out.astype(np.float32)
     if "FLUX_ERR" in names:
         hdul[1].data["FLUX_ERR"] = flux_err_out.astype(np.float32)
-    if not preserve_bkgsub:
+    if not effective_bkgsub:
         if "FLUX_BKG" in names:
             hdul[1].data["FLUX_BKG"] = np.float32(0.0)
         if "FLUX_BKG_ERR" in names:
@@ -3725,7 +2849,7 @@ def desmear_calibrated_cutout(
 
     append_smear_err_column(hdul, delta_m_err.astype(np.float32))
     write_pixel_quality(hdul, pq_out)
-    write_mundey_provenance(hdul, bkgsub=preserve_bkgsub, smear_mode="cutout")
+    write_mundey_provenance(hdul, bkgsub=effective_bkgsub, smear_mode="cutout")
     hdul[0].header["CADMATCH"] = ("none", "Collateral cadence pairing mode")
     hdul[0].header["CADMISS"] = (0, "Unmatched TPF cadences masked to NaN")
 
