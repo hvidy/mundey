@@ -13,12 +13,13 @@ from astropy.io import fits
 from mundey import recalibrate_tpf
 from mundey.archive import (
     S3_TESS_PUBLIC_ROOT,
-    find_cached_blf,
+    CollateralSpec,
+    find_all_cached_blf,
     iter_collateral_chunks,
-    prefetch_collateral,
     resolve_collateral_file,
     resolve_static_models,
 )
+from mundey.calibration import prefetch_collateral
 from mundey.cli import main as cli_main
 
 
@@ -62,10 +63,7 @@ def test_offline_guard_blocks_before_s3_instantiation(
 
     with pytest.raises(FileNotFoundError, match="offline=True"):
         resolve_collateral_file(
-            sector=6,
-            camera=2,
-            ccd=3,
-            output="B",
+            CollateralSpec(sector=6, camera=2, ccd=3, output="B"),
             kind="smrow",
             cache_dir=tmp_path,
             offline=True,
@@ -317,17 +315,15 @@ def test_blf_cache_wildcard_excludes_alt_files_and_stamps_e_per_frame_units(
     assert len(alt_files) == 1
 
     # 1. Standard wildcard lookup must NOT match the -alt- cache!
+    spec_s6_a = CollateralSpec(sector=6, camera=2, ccd=3, output="A")
     assert (
-        find_cached_blf(
-            sector=6,
-            camera=2,
-            ccd=3,
-            output="A",
+        find_all_cached_blf(
+            spec_s6_a,
             kind="smrow",
             smear_mode="standard",
             cache_dir=cache_dir,
         )
-        is None
+        == []
     )
 
     # 2. prefetch_collateral must build the missing standard smrow -blf.fits (not skip!)
@@ -340,16 +336,14 @@ def test_blf_cache_wildcard_excludes_alt_files_and_stamps_e_per_frame_units(
         cache_dir=cache_dir,
         offline=True,
     )
-    std_blf = find_cached_blf(
-        sector=6,
-        camera=2,
-        ccd=3,
-        output="A",
+    std_matches = find_all_cached_blf(
+        spec_s6_a,
         kind="smrow",
         smear_mode="standard",
         cache_dir=cache_dir,
     )
-    assert std_blf is not None
+    assert std_matches
+    std_blf = std_matches[0]
     assert "-alt-" not in std_blf.name
 
     # 3. Verify TUNIT3/TUNIT4 == 'e-/frame', SMEARMOD == 'standard', and SMROW_SAT extension
@@ -375,3 +369,222 @@ def test_blf_cache_wildcard_excludes_alt_files_and_stamps_e_per_frame_units(
         offline=True,
     )
     assert np.all(np.isfinite(cal_std.flux.value))
+
+
+def test_s3_discovery_matches_run_id_and_picks_latest_timestamp_mund_p1(tmp_path: Path) -> None:
+    """[MUND-P1] S3 collateral & static-model resolvers must match run ID and pick latest key."""
+    # Static models: preferred 2018323 absent -> must pick latest timestamp (2021001 > 2018100)
+    s3_files: dict[str, bytes] = {
+        f"{S3_TESS_PUBLIC_ROOT}/models/tess2018100-2-3-2dblack.fits": b"old-b2d",
+        f"{S3_TESS_PUBLIC_ROOT}/models/tess2021001-2-3-2dblack.fits": b"new-b2d",
+        f"{S3_TESS_PUBLIC_ROOT}/models/tess2018100-2-3-flat.fits": b"old-flat",
+        f"{S3_TESS_PUBLIC_ROOT}/models/tess2021001-2-3-flat.fits": b"new-flat",
+        f"{S3_TESS_PUBLIC_ROOT}/models/tess2018001000000-41006_100-linearity.xml": b"old-lin",
+        f"{S3_TESS_PUBLIC_ROOT}/models/tess2021001000000-41006_100-linearity.xml": b"new-lin",
+        # Collateral files with two run IDs (0126 vs 0165) and multiple reprocessing timestamps
+        (
+            f"{S3_TESS_PUBLIC_ROOT}/ffi/s0006/2018/349/2-3/"
+            "tess2018349182459-s0006-smrow-2-3-b-0126-s_col.fits"
+        ): b"run0126-old",
+        (
+            f"{S3_TESS_PUBLIC_ROOT}/ffi/s0006/2018/349/2-3/"
+            "tess2019001000000-s0006-smrow-2-3-b-0126-s_col.fits"
+        ): b"run0126-new",
+        (
+            f"{S3_TESS_PUBLIC_ROOT}/ffi/s0006/2018/349/2-3/"
+            "tess2020001000000-s0006-smrow-2-3-b-0165-s_col.fits"
+        ): b"run0165-latest",
+    }
+    fake_s3 = FakeS3FileSystem(s3_files)
+
+    models = resolve_static_models(2, 3, cache_dir=tmp_path / "mcache", s3_fs=fake_s3)
+    assert models.black2d_path.name == "tess2021001-2-3-2dblack.fits"
+    assert models.flat_path.name == "tess2021001-2-3-flat.fits"
+    assert models.linearity_path.name == "tess2021001000000-41006_100-linearity.xml"
+
+    # Matching run ID '0126' picks latest timestamp for run '0126' (ignoring '0165')
+    tpf_parts_0126 = ("tess2018349182459", "s0006", "0000000322899250", "0126", "s_tp.fits")
+    spec_0126 = CollateralSpec(sector=6, camera=2, ccd=3, output="B", tpf_parts=tpf_parts_0126)
+    spec_any = CollateralSpec(sector=6, camera=2, ccd=3, output="B")
+    col_0126 = resolve_collateral_file(
+        spec_0126,
+        kind="smrow",
+        cache_dir=tmp_path / "ccache1",
+        s3_fs=fake_s3,
+    )
+    assert col_0126.name == "tess2019001000000-s0006-smrow-2-3-b-0126-s_col.fits"
+    assert col_0126.read_bytes() == b"run0126-new"
+
+    # Without run ID (or unmatched run ID), picks latest reprocessing timestamp overall ('0165')
+    col_latest = resolve_collateral_file(
+        spec_any,
+        kind="smrow",
+        cache_dir=tmp_path / "ccache2",
+        s3_fs=fake_s3,
+    )
+    assert col_latest.name == "tess2020001000000-s0006-smrow-2-3-b-0165-s_col.fits"
+    assert col_latest.read_bytes() == b"run0165-latest"
+
+    # Warm local directory with the exact same multi-timestamp / multi-run-ID file set
+    # must match cold S3 selection (latest timestamp and matching run ID)!
+    local_dir = tmp_path / "local_mirror"
+    local_dir.mkdir()
+    for s3_k, payload in s3_files.items():
+        (local_dir / Path(s3_k).name).write_bytes(payload)
+
+    local_models = resolve_static_models(2, 3, ddir=local_dir, offline=True)
+    assert local_models.black2d_path.name == models.black2d_path.name
+    assert local_models.flat_path.name == models.flat_path.name
+    assert local_models.linearity_path.name == models.linearity_path.name
+
+    local_col_0126 = resolve_collateral_file(
+        spec_0126,
+        kind="smrow",
+        ddir=local_dir,
+        offline=True,
+    )
+    assert local_col_0126.name == col_0126.name
+
+    local_col_latest = resolve_collateral_file(
+        spec_any,
+        kind="smrow",
+        ddir=local_dir,
+        offline=True,
+    )
+    assert local_col_latest.name == col_latest.name
+
+
+def test_cli_prefetch_honours_1crv5p_build_alt_and_readonly_cache_mund_p2(
+    tpf_builder,
+    tmp_path: Path,
+) -> None:
+    """[MUND-P2] prefetch --tpf honours 1CRV5P, supports --build-alt, & readonly cache succeeds."""
+    bundle = tpf_builder(
+        tmp_path / "ro_src",
+        col0_1based=551,
+        row0_1based=1993,
+        nx=16,  # straddles A (551..556) and B (557..566)
+        ny=56,
+        n_cadences=6,
+        sector=6,
+        camera=2,
+        ccd=3,
+        bleed_in_smrow=True,
+        flag_bad_cadence=False,
+        noise_sigma=0.0,
+        seed=901,
+    )
+    # Create a Lightkurve cutout restricted strictly to Output B (cols 557..564, including
+    # bleed_col = 8 -> RAWX 559) where HDU[2] CRVAL1P stays stale at 551 (Output A)!
+    tpf_full = lk.read(bundle.tpf_path)
+    sky_b = tpf_full.wcs.pixel_to_world(10, 28)
+    tpf_b_cut = tpf_full.cutout(center=sky_b, size=(7, 56))
+    assert int(tpf_b_cut.hdu[1].header["1CRV5P"]) >= 557
+    cut_path = tmp_path / "tess2020001000000-s0006-0000000123456789-0165-s_tp.fits"
+    # Rebuild BinTableHDU cleanly (Lightkurve.cutout() mutates column views/TDIM in-place)
+    cut_cols = []
+    for c in tpf_b_cut.hdu[1].columns:
+        arr = np.array(tpf_b_cut.hdu[1].data[c.name], copy=True)
+        fmt_code = c.format[-1]
+        if arr.ndim == 3:
+            ny_c, nx_c = arr.shape[1], arr.shape[2]
+            cut_cols.append(
+                fits.Column(
+                    name=c.name,
+                    format=f"{ny_c * nx_c}{fmt_code}",
+                    unit=c.unit,
+                    dim=f"({nx_c},{ny_c})",
+                    null=c.null,
+                    array=arr,
+                )
+            )
+        else:
+            cut_cols.append(
+                fits.Column(
+                    name=c.name,
+                    format=fmt_code,
+                    unit=c.unit,
+                    null=c.null,
+                    array=arr,
+                )
+            )
+    cut_hdr1 = tpf_b_cut.hdu[1].header.copy()
+    for k in list(cut_hdr1.keys()):
+        if k.startswith(("TFORM", "TDIM", "TTYPE", "TUNIT", "TNULL")):
+            del cut_hdr1[k]
+    cut_hdu1 = fits.BinTableHDU.from_columns(cut_cols, header=cut_hdr1, name="PIXELS")
+    fits.HDUList([tpf_b_cut.hdu[0].copy(), cut_hdu1, tpf_b_cut.hdu[2].copy()]).writeto(
+        cut_path, overwrite=True
+    )
+
+    # Prefetch with --tpf + --build-alt must resolve Output B ONLY (not stale Output A!)
+    # and pre-build the -alt-*-blf.fits cache.
+    cache_alt = tmp_path / "cache_alt"
+    rc = cli_main(
+        [
+            "prefetch",
+            "--tpf",
+            str(cut_path),
+            "--ddir",
+            str(bundle.ddir),
+            "--cache-dir",
+            str(cache_alt),
+            "--build-alt",
+            "--offline",
+        ]
+    )
+    assert rc == 0
+    s6_files = sorted(p.name for p in (cache_alt / "s0006").glob("*-blf.fits"))
+    assert any("-b-" in n and "-alt-" in n for n in s6_files)
+    assert not any("-a-" in n for n in s6_files)
+
+    # Read-only cache directory containing only standard prefetched BLFs must warn & succeed
+    cache_ro = tmp_path / "cache_ro"
+    rc_std = cli_main(
+        [
+            "prefetch",
+            "--tpf",
+            str(bundle.tpf_path),
+            "--ddir",
+            str(bundle.ddir),
+            "--cache-dir",
+            str(cache_ro),
+            "--offline",
+        ]
+    )
+    assert rc_std == 0
+    sec_ro = cache_ro / "s0006"
+    try:
+        sec_ro.chmod(0o555)
+        cache_ro.chmod(0o555)
+        with pytest.warns(UserWarning, match="read-only"):
+            cal_ro = recalibrate_tpf(
+                bundle.tpf_path,
+                ddir=bundle.ddir,
+                cache_dir=cache_ro,
+                smear="alternate",
+                offline=True,
+            )
+        assert cal_ro.hdu[0].header["SMEARMOD"] == "alternate"
+        assert np.all(np.isfinite(cal_ro.flux.value))
+    finally:
+        cache_ro.chmod(0o755)
+        sec_ro.chmod(0o755)
+
+    # Stage-1 prefetched standard BLF (TVMATCH=True) must remain reusable offline under
+    # cadence_match='positional' even when raw _col.fits files are absent!
+    raw_free_dir = tmp_path / "models_only"
+    raw_free_dir.mkdir()
+    for p in bundle.ddir.iterdir():
+        if p.name.endswith(("2dblack.fits", "flat.fits", "linearity.xml")):
+            (raw_free_dir / p.name).symlink_to(p)
+    cal_pos_offline = recalibrate_tpf(
+        bundle.tpf_path,
+        ddir=raw_free_dir,
+        cache_dir=cache_ro,
+        smear="standard",
+        cadence_match="positional",
+        offline=True,
+    )
+    assert cal_pos_offline.hdu[0].header["CADMATCH"] == "positional"
+    assert np.all(np.isfinite(cal_pos_offline.flux.value))

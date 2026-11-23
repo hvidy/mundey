@@ -7,13 +7,11 @@ import sys
 from pathlib import Path
 
 import jax
-import numpy as np
 from astropy.io import fits
 from astropy.table import Table
 
 import mundey
 from mundey.mundey import (
-    _RANK_WARNING,
     _maybe_display_union_link,
     _query_simbad_target,
     _resolve_target_name,
@@ -81,12 +79,22 @@ def test_undershoot_xml_loads_all_64_channels_via_importlib_resources() -> None:
     assert hasattr(mundey, "mundey_tpf")
 
 
-def test_numpy_rankwarning_compat() -> None:
-    """RankWarning lookup must resolve to a Warning subclass on NumPy 1.x and 2.x."""
-    assert isinstance(_RANK_WARNING, type)
-    assert issubclass(_RANK_WARNING, Warning)
-    expected = getattr(getattr(np, "exceptions", np), "RankWarning", UserWarning)
-    assert _RANK_WARNING is expected
+def test_trimmed_public_all_and_no_matplotlib_import() -> None:
+    """mundey.__all__ must stay concise and importing mundey must not load matplotlib."""
+    expected_all = [
+        "CalibrationConfig",
+        "PixelQuality",
+        "__version__",
+        "desmear_calibrated_cutout",
+        "mundey_tpf",
+        "plot_diagnostics",
+        "read_pixel_quality",
+        "read_smear_err",
+        "recalibrate_tpf",
+    ]
+    assert mundey.__all__ == expected_all
+    for sym in expected_all:
+        assert hasattr(mundey, sym)
 
 
 def test_resolve_target_defaults_offline_when_object_present_or_offline_flag() -> None:

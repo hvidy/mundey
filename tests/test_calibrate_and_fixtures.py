@@ -10,7 +10,8 @@ import pytest
 from astropy.io import fits
 
 import mundey
-from mundey import mundey_tpf, read_pixel_quality, read_smear_err_column
+from mundey import mundey_tpf, read_pixel_quality
+from mundey._contract import read_smear_err_column
 from mundey.calibration import match_cadenceno
 
 

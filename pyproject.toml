@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mundey"
-version = "2.0.0"
+version = "2.0.1"
 description = "Recalibration of TESS target pixel files for saturated bright stars."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -31,7 +31,6 @@ dependencies = [
     "astropy>=6.0",
     "lightkurve>=2.4",
     "jax>=0.4.30",
-    "astroquery>=0.4.7",
 ]
 
 [project.optional-dependencies]
@@ -39,9 +38,16 @@ hpc = [
     "fsspec>=2024.2",
     "s3fs>=2024.2",
 ]
+simbad = [
+    "astroquery>=0.4.7",
+]
+plot = [
+    "matplotlib>=3.7",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
+    "matplotlib>=3.7",
 ]
 
 [project.scripts]

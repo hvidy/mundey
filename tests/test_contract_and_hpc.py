@@ -14,19 +14,15 @@ import numpy as np
 import pytest
 
 import mundey
-from mundey import (
+from mundey import PixelQuality, _contract, read_pixel_quality, read_smear_err, recalibrate_tpf
+from mundey._contract import (
     HALOCVER,
-    PixelQuality,
-    _contract,
     append_smear_err_column,
     atomic_publish,
     atomic_temp_path,
     make_atomic_tmp_path,
     read_mundey_provenance,
-    read_pixel_quality,
-    read_smear_err,
     read_smear_err_column,
-    recalibrate_tpf,
     resolve_cache_dir,
     write_mundey_provenance,
     write_pixel_quality,
@@ -141,24 +137,24 @@ def test_contract_validation_errors(synthetic_1output_tpf: lk.TessTargetPixelFil
     tpf = synthetic_1output_tpf
     _, ny, nx = tpf.flux.shape
 
-    with pytest.raises(TypeError, match="integer or boolean dtype"):
+    with pytest.raises(ValueError, match="2D int"):
         write_pixel_quality(tpf, np.zeros((ny, nx), dtype=np.float32))
 
-    with pytest.raises(TypeError, match="integer or boolean dtype"):
+    with pytest.raises(ValueError, match="2D int"):
         write_pixel_quality(tpf, np.full((ny, nx), "0", dtype="<U2"))
 
-    with pytest.raises(ValueError, match="negative"):
+    with pytest.raises(ValueError, match="uint16"):
         write_pixel_quality(tpf, np.full((ny, nx), -1, dtype=np.int32))
 
     overflow = np.zeros((ny, nx), dtype=np.uint32)
     overflow[0, 0] = 1 << 16
-    with pytest.raises(ValueError, match="exceeding uint16 max"):
+    with pytest.raises(ValueError, match="uint16"):
         write_pixel_quality(tpf, overflow)
 
-    with pytest.raises(ValueError, match="does not match TPF spatial shape"):
+    with pytest.raises(ValueError, match="PIXEL_QUALITY shape"):
         write_pixel_quality(tpf, np.zeros((ny + 1, nx), dtype=np.uint16))
 
-    with pytest.raises(ValueError, match="does not match HDU\\[1\\]"):
+    with pytest.raises(ValueError, match="SMEAR_ERR shape"):
         append_smear_err_column(tpf, np.ones((len(tpf.flux) - 3, nx), dtype=np.float32))
 
     write_mundey_provenance(tpf, bkgsub=False)
@@ -167,13 +163,41 @@ def test_contract_validation_errors(synthetic_1output_tpf: lk.TessTargetPixelFil
         read_mundey_provenance(tpf)
 
     tpf.hdu[1].header["BKGSUB"] = "F"
-    with pytest.raises(ValueError, match="Invalid BKGSUB"):
+    with pytest.raises(ValueError, match="Bad BKGSUB"):
         read_mundey_provenance(tpf)
 
     tpf.hdu[1].header["BKGSUB"] = False
     tpf.hdu[1].header["HALOCVER"] = 2
-    with pytest.raises(ValueError, match="Conflicting HALOCVER"):
+    with pytest.raises(ValueError, match="Unsupported HALOCVER"):
         read_mundey_provenance(tpf)
+
+    # [TBKG-03a] HALOCVER != 1 and boolean HALOCVER must be rejected on write & read
+    with pytest.raises(ValueError, match="Bad arg|Unsupported HALOCVER"):
+        write_mundey_provenance(tpf, bkgsub=False, halocver=99)
+
+    with pytest.raises(ValueError, match="Bad arg|Unsupported HALOCVER"):
+        write_mundey_provenance(tpf, bkgsub=False, halocver=True)
+
+    tpf.hdu[0].header["HALOCVER"] = 99
+    tpf.hdu[1].header["HALOCVER"] = 99
+    with pytest.raises(ValueError, match="Unsupported HALOCVER"):
+        read_mundey_provenance(tpf)
+
+    # Restore valid HALOCVER = 1 before testing SMEAR_ERR validation
+    tpf.hdu[0].header["HALOCVER"] = 1
+    tpf.hdu[1].header["HALOCVER"] = 1
+
+    # [TBKG-03a] Negative SMEAR_ERR must be rejected on write & read
+    n_raw = len(tpf.hdu[1].data)
+    bad_smear_err = np.full((n_raw, nx), -5.0, dtype=np.float32)
+    with pytest.raises(ValueError, match="non-negative"):
+        append_smear_err_column(tpf, bad_smear_err)
+
+    good_smear_err = np.full((n_raw, nx), 2.5, dtype=np.float32)
+    append_smear_err_column(tpf, good_smear_err)
+    tpf.hdu[1].data["SMEAR_ERR"][0, 0] = np.float32(-1.0)
+    with pytest.raises(ValueError, match="negative"):
+        read_smear_err_column(tpf)
 
 
 def test_resolve_cache_dir_scratch_default_and_fred_hpc_guard(
@@ -213,45 +237,50 @@ def test_resolve_cache_dir_scratch_default_and_fred_hpc_guard(
 
     mundey_dir = tmp_path / "mundey_env"
     monkeypatch.setenv("MUNDEY_CACHE_DIR", str(mundey_dir))
-    assert resolve_cache_dir() == mundey_dir.resolve(strict=False)
+    assert (
+        resolve_cache_dir(env_var="MUNDEY_CACHE_DIR") == mundey_dir.resolve(strict=False)
+    )
 
     # Explicit cache_dir argument overrides all env vars
     explicit_dir = tmp_path / "explicit_cache"
     assert resolve_cache_dir(explicit_dir) == explicit_dir.resolve(strict=False)
 
-    # 5. Direct /fred paths must fail by default (strict_hpc=True is the default!)
-    with pytest.raises(ValueError, match="Refusing cache directory .* under /fred"):
-        resolve_cache_dir("/fred/oz440/user/.cache")
+    # 5. Direct /fred paths fail under strict_hpc=True and warn under default strict_hpc=False
+    with pytest.raises(ValueError, match="under /fred/"):
+        resolve_cache_dir("/fred/oz440/user/.cache", strict_hpc=True)
 
-    with pytest.raises(ValueError, match="Refusing cache directory .* under /fred"):
-        resolve_cache_dir("/fred")
+    with pytest.raises(ValueError, match="under /fred/"):
+        resolve_cache_dir("/fred", strict_hpc=True)
 
-    # Traversal into /fred must also fail
-    with pytest.raises(ValueError, match="Refusing cache directory .* under /fred"):
-        resolve_cache_dir("/tmp/../fred/oz440/cache")
+    # Traversal into /fred must also fail under strict_hpc=True
+    with pytest.raises(ValueError, match="under /fred/"):
+        resolve_cache_dir("/tmp/../fred/oz440/cache", strict_hpc=True)
 
-    # Symlink into /fred must fail by default (including via $TESS_BRIGHT_CACHE_DIR / $HOME)
+    # Symlink into /fred must fail under strict_hpc=True
     fred_link = tmp_path / "symlink_to_fred"
     fred_link.symlink_to("/fred/oz440/cache")
-    with pytest.raises(ValueError, match="Refusing cache directory .* under /fred"):
-        resolve_cache_dir(fred_link)
+    with pytest.raises(ValueError, match="under /fred/"):
+        resolve_cache_dir(fred_link, strict_hpc=True)
 
     monkeypatch.delenv("MUNDEY_CACHE_DIR", raising=False)
     monkeypatch.setenv("TESS_BRIGHT_CACHE_DIR", str(fred_link))
-    with pytest.raises(ValueError, match="Refusing cache directory .* under /fred"):
-        resolve_cache_dir()
+    with pytest.raises(ValueError, match="under /fred/"):
+        resolve_cache_dir(strict_hpc=True)
 
-    # 6. strict_hpc=False emits UserWarning on /fred (direct and symlink) and proceeds
-    with pytest.warns(UserWarning, match="under /fred"):
-        warned_direct = resolve_cache_dir("/fred/oz440/user/.cache", strict_hpc=False)
+    # 6. Default strict_hpc=False emits UserWarning on /fred (direct and symlink) and proceeds
+    with pytest.warns(UserWarning, match="under /fred/"):
+        warned_direct = resolve_cache_dir("/fred/oz440/user/.cache")
     assert warned_direct == Path("/fred/oz440/user/.cache").resolve(strict=False)
 
-    with pytest.warns(UserWarning, match="under /fred"):
-        warned_link = resolve_cache_dir(fred_link, strict_hpc=False)
+    with pytest.warns(UserWarning, match="under /fred/"):
+        warned_link = resolve_cache_dir(fred_link)
     assert warned_link == Path("/fred/oz440/cache").resolve(strict=False)
 
     # Non-/fred prefix like /frederick must NOT be falsely rejected
-    assert resolve_cache_dir("/frederick/cache") == Path("/frederick/cache").resolve(strict=False)
+    assert (
+        resolve_cache_dir("/frederick/cache", strict_hpc=True)
+        == Path("/frederick/cache").resolve(strict=False)
+    )
 
 
 def test_recalibrate_ddir_on_fred_routes_to_xdg_and_scratch_env_caches(
@@ -276,8 +305,8 @@ def test_recalibrate_ddir_on_fred_routes_to_xdg_and_scratch_env_caches(
     tpf = lk.read(bundle.tpf_path)
 
     # 1. Without any cache env var set, ddir under /fred fails under strict_hpc=True
-    with pytest.raises(ValueError, match="Refusing cache directory .* under /fred"):
-        recalibrate_tpf(tpf, ddir="/fred/oz440/input", offline=True)
+    with pytest.raises(ValueError, match="under /fred/"):
+        recalibrate_tpf(tpf, ddir="/fred/oz440/input", offline=True, strict_hpc=True)
 
     def _seed_cache_root(root: Path) -> None:
         models_dir = root / "models"
@@ -309,12 +338,12 @@ def test_recalibrate_ddir_on_fred_routes_to_xdg_and_scratch_env_caches(
     assert len(list((scratch_dir / ".cache" / "tess_bright" / "s0020").glob("*-blf.fits"))) == 2
 
 
-def test_version_2_0_0_and_read_smear_err_export_symmetry(
+def test_version_2_0_1_and_read_smear_err_export_symmetry(
     synthetic_1output_bundle,
     tmp_path: Path,
 ) -> None:
-    """mundey v2.0.0 must export read_smear_err with FITS-path and quality_mask=None symmetry."""
-    assert mundey.__version__ == "2.0.0"
+    """mundey v2.0.1 must export read_smear_err with FITS-path and quality_mask=None symmetry."""
+    assert mundey.__version__ == "2.0.1"
     assert "read_smear_err" in mundey.__all__
     assert read_smear_err is read_smear_err_column
 
@@ -362,7 +391,7 @@ def test_version_2_0_0_and_read_smear_err_export_symmetry(
             self.hdu = hdu
             self.quality_mask = np.ones(n_raw - 1, dtype=bool)
 
-    with pytest.raises(ValueError, match="quality_mask shape"):
+    with pytest.raises(ValueError, match="quality_mask"):
         read_smear_err(_BadMaskWrapper(tpf.hdu))
 
 

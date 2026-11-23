@@ -1,10 +1,11 @@
 """MAST S3 archive discovery, 4,096-row chunked collateral streaming, and ``-blf`` caching.
 
+Pure I/O and archive discovery layer (zero imports from :mod:`mundey.calibration`).
 Supports dynamic resolution of static Camera/CCD calibration models (``2dblack``,
 ``flat``, ``linearity``) and both 2-minute (``-s_col.fits``) and 20-second
-(``-a_fast-col.fits``) collateral pixel tables from local directories or
-anonymous MAST S3 (``s3://stpubdata/tess/public/``), while enforcing strict
-offline execution on HPC compute nodes when ``offline=True``.
+(``-a_fast-col.fits``) collateral pixel tables from local directories or anonymous
+MAST S3 (``s3://stpubdata/tess/public/``), while enforcing strict offline execution
+on HPC compute nodes when ``offline=True``.
 """
 
 from __future__ import annotations
@@ -36,6 +37,31 @@ class StaticModelPaths:
     linearity_path: Path
 
 
+@dataclass(frozen=True)
+class CollateralSpec:
+    """Identifying metadata for a TESS sector/camera/CCD/output collateral stream."""
+
+    sector: int
+    camera: int
+    ccd: int
+    output: str
+    cadence: CadenceKind = "2min"
+    tpf_parts: tuple[str, ...] | None = None
+    ticid: int | None = None
+
+    @property
+    def output_lower(self) -> str:
+        return self.output.lower()
+
+    @property
+    def sector_subdir(self) -> str:
+        return f"s{self.sector:04d}"
+
+    @property
+    def col_tag(self) -> str:
+        return collateral_suffix(self.cadence)
+
+
 def infer_cadence_kind(
     *,
     tpf_path: str | os.PathLike[str] | Any = None,
@@ -52,15 +78,13 @@ def infer_cadence_kind(
 
     for hdr in (hdu1_header, hdu0_header):
         if hdr is not None and "TIMEDEL" in hdr:
-            try:
+            with contextlib.suppress(TypeError, ValueError):
                 dt_sec = float(hdr["TIMEDEL"]) * 86400.0
                 if 0.0 < dt_sec < 45.0:
                     return "20s"
-            except (TypeError, ValueError):
-                pass
     for hdr in (hdu1_header, hdu0_header):
         if hdr is not None and "NUM_FRM" in hdr:
-            try:
+            with contextlib.suppress(TypeError, ValueError):
                 num_frm = int(hdr["NUM_FRM"])
                 crmiten = bool(
                     hdu0_header.get("CRMITEN", False)
@@ -73,8 +97,6 @@ def infer_cadence_kind(
                 )
                 if num_frm <= 15 and not crmiten:
                     return "20s"
-            except (TypeError, ValueError):
-                pass
     return "2min"
 
 
@@ -95,15 +117,12 @@ def _candidate_search_dirs(
 ) -> list[Path]:
     """Return ordered local directories to search for reference and collateral files."""
     dirs: list[Path] = []
-    if ddir is not None:
-        dpath = Path(ddir).expanduser()
+    for base in (Path(ddir).expanduser() if ddir is not None else None, cache_dir):
+        if base is None:
+            continue
         if subdir:
-            dirs.append(dpath / subdir)
-        dirs.append(dpath)
-    if cache_dir is not None:
-        if subdir:
-            dirs.append(cache_dir / subdir)
-        dirs.append(cache_dir)
+            dirs.append(base / subdir)
+        dirs.append(base)
     deduped: list[Path] = []
     seen: set[str] = set()
     for d in dirs:
@@ -132,9 +151,12 @@ def _find_all_local_matches(
                 candidates = [exact] if exact.is_file() else []
             else:
                 candidates = sorted(
-                    p
-                    for p in directory.glob(pat)
-                    if p.is_file() and not p.name.endswith(".tmp")
+                    (
+                        p
+                        for p in directory.glob(pat)
+                        if p.is_file() and not p.name.endswith(".tmp")
+                    ),
+                    reverse=True,
                 )
             for p in candidates:
                 if p.name.endswith(".tmp"):
@@ -154,7 +176,6 @@ def _find_local_match(
     *,
     predicate: Callable[[Path], bool] | None = None,
 ) -> Path | None:
-    """Find the first matching existing non-temporary file across ``search_dirs``."""
     matches = _find_all_local_matches(search_dirs, patterns, predicate=predicate)
     return matches[0] if matches else None
 
@@ -226,143 +247,115 @@ def resolve_static_models(
         raise ValueError(f"Expected camera, ccd in 1..4, got camera={camera}, ccd={ccd}.")
 
     search_dirs = _candidate_search_dirs(ddir, cache_dir, subdir="models")
+    model_specs = (
+        (
+            f"2dblack ({camera}-{ccd})",
+            [
+                f"tess2018323-{camera}-{ccd}-2dblack.fits",
+                f"tess*-{camera}-{ccd}-2dblack.fits",
+                f"*{camera}-{ccd}-2dblack.fits",
+            ],
+            f"-{camera}-{ccd}-2dblack.fits",
+            f"tess2018323-{camera}-{ccd}-2dblack.fits",
+        ),
+        (
+            f"flat ({camera}-{ccd})",
+            [
+                f"tess2018323-{camera}-{ccd}-flat.fits",
+                f"tess*-{camera}-{ccd}-flat.fits",
+                f"*{camera}-{ccd}-flat.fits",
+            ],
+            f"-{camera}-{ccd}-flat.fits",
+            f"tess2018323-{camera}-{ccd}-flat.fits",
+        ),
+        (
+            "linearity.xml",
+            [
+                "tess2018143203310-41006_100-linearity.xml",
+                "tess*-linearity.xml",
+                "*-linearity.xml",
+            ],
+            "-linearity.xml",
+            "tess2018143203310-41006_100-linearity.xml",
+        ),
+    )
 
-    b2d_patterns = [
-        f"tess2018323-{camera}-{ccd}-2dblack.fits",
-        f"tess*-{camera}-{ccd}-2dblack.fits",
-        f"*{camera}-{ccd}-2dblack.fits",
-    ]
-    flat_patterns = [
-        f"tess2018323-{camera}-{ccd}-flat.fits",
-        f"tess*-{camera}-{ccd}-flat.fits",
-        f"*{camera}-{ccd}-flat.fits",
-    ]
-    lin_patterns = [
-        "tess2018143203310-41006_100-linearity.xml",
-        "tess*-linearity.xml",
-        "*-linearity.xml",
-    ]
+    found = [_find_local_match(search_dirs, pats) for _, pats, _, _ in model_specs]
+    if all(p is not None for p in found):
+        return StaticModelPaths(found[0], found[1], found[2])  # type: ignore[arg-type]
 
-    black2d_path = _find_local_match(search_dirs, b2d_patterns)
-    flat_path = _find_local_match(search_dirs, flat_patterns)
-    linearity_path = _find_local_match(search_dirs, lin_patterns)
-
-    if black2d_path is not None and flat_path is not None and linearity_path is not None:
-        return StaticModelPaths(
-            black2d_path=black2d_path,
-            flat_path=flat_path,
-            linearity_path=linearity_path,
-        )
-
-    missing_labels: list[str] = []
-    if black2d_path is None:
-        missing_labels.append(f"2dblack ({camera}-{ccd})")
-    if flat_path is None:
-        missing_labels.append(f"flat ({camera}-{ccd})")
-    if linearity_path is None:
-        missing_labels.append("linearity.xml")
-    _guard_offline(offline, ", ".join(missing_labels), search_dirs)
+    missing = [label for (label, _, _, _), p in zip(model_specs, found, strict=True) if p is None]
+    _guard_offline(offline, ", ".join(missing), search_dirs)
 
     if cache_dir is not None:
         target_models_dir = cache_dir / "models"
     elif ddir is not None:
         target_models_dir = Path(ddir).expanduser()
     else:
-        target_models_dir = resolve_cache_dir(create=True) / "models"
+        target_models_dir = (
+            resolve_cache_dir(env_var="MUNDEY_CACHE_DIR", create=True) / "models"
+        )
+
     fs = _open_anon_s3_filesystem(s3_fs=s3_fs)
     s3_models = sorted(fs.ls(f"{S3_TESS_PUBLIC_ROOT}/models"))
 
-    def _pick_s3_model(suffix_candidates: tuple[str, ...], preferred: str) -> str:
-        for key in s3_models:
-            if Path(key).name == preferred:
-                return key
-        matches = [k for k in s3_models if Path(k).name.endswith(suffix_candidates)]
-        if not matches:
-            raise FileNotFoundError(
-                f"Could not find static model matching {suffix_candidates} under "
-                f"s3://{S3_TESS_PUBLIC_ROOT}/models."
-            )
-        return matches[0]
-
-    if black2d_path is None:
-        key = _pick_s3_model(
-            (f"-{camera}-{ccd}-2dblack.fits",),
-            f"tess2018323-{camera}-{ccd}-2dblack.fits",
-        )
+    resolved: list[Path] = []
+    for (_, _, suffix, preferred), local_path in zip(model_specs, found, strict=True):
+        if local_path is not None:
+            resolved.append(local_path)
+            continue
+        key = next((k for k in s3_models if Path(k).name == preferred), None)
+        if key is None:
+            matches = [k for k in s3_models if Path(k).name.endswith(suffix)]
+            if not matches:
+                raise FileNotFoundError(
+                    f"Could not find static model ending in {suffix!r} under "
+                    f"s3://{S3_TESS_PUBLIC_ROOT}/models."
+                )
+            key = matches[-1]
         dst = target_models_dir / Path(key).name
         if verbose:
             print(f"Downloading S3 static model s3://{key} -> {dst}")
-        black2d_path = _download_s3_to_path(fs, key, dst, stage_dir=stage_dir)
+        resolved.append(_download_s3_to_path(fs, key, dst, stage_dir=stage_dir))
 
-    if flat_path is None:
-        key = _pick_s3_model(
-            (f"-{camera}-{ccd}-flat.fits",),
-            f"tess2018323-{camera}-{ccd}-flat.fits",
-        )
-        dst = target_models_dir / Path(key).name
-        if verbose:
-            print(f"Downloading S3 static model s3://{key} -> {dst}")
-        flat_path = _download_s3_to_path(fs, key, dst, stage_dir=stage_dir)
-
-    if linearity_path is None:
-        key = _pick_s3_model(
-            ("-linearity.xml",),
-            "tess2018143203310-41006_100-linearity.xml",
-        )
-        dst = target_models_dir / Path(key).name
-        if verbose:
-            print(f"Downloading S3 static model s3://{key} -> {dst}")
-        linearity_path = _download_s3_to_path(fs, key, dst, stage_dir=stage_dir)
-
-    return StaticModelPaths(
-        black2d_path=black2d_path,
-        flat_path=flat_path,
-        linearity_path=linearity_path,
-    )
+    return StaticModelPaths(resolved[0], resolved[1], resolved[2])
 
 
 def collateral_blf_cache_path(
     base_dir: Path,
+    spec: CollateralSpec,
     *,
-    sector: int,
-    camera: int,
-    ccd: int,
-    output: str,
     kind: Literal["smrow", "tvcol"],
-    cadence: CadenceKind = "2min",
     smear_mode: str = "standard",
-    tpf_parts: list[str] | None = None,
     col_stem: str | None = None,
 ) -> Path:
     """Construct the canonical ``-blf.fits`` cache path for ``tvcol`` or ``smrow``."""
-    out_lower = output.lower()
-    col_tag = collateral_suffix(cadence)
+    parts = spec.tpf_parts
+    out_l = spec.output_lower
+    tag = spec.col_tag
 
     if kind == "smrow" and smear_mode == "alternate":
-        if tpf_parts is not None and len(tpf_parts) >= 4:
-            prefix, sec_str, tic_str, run_str = (
-                tpf_parts[0],
-                tpf_parts[1],
-                tpf_parts[2],
-                tpf_parts[3],
-            )
+        if parts is not None and len(parts) >= 4:
             return base_dir / (
-                f"{prefix}-{sec_str}-smrow-{camera}-{ccd}-"
-                f"{out_lower}-{tic_str}-{run_str}-alt-{col_tag}-blf.fits"
+                f"{parts[0]}-{parts[1]}-smrow-{spec.camera}-{spec.ccd}-"
+                f"{out_l}-{parts[2]}-{parts[3]}-alt-{tag}-blf.fits"
             )
-        stem = col_stem or f"tess-s{sector:04d}-smrow-{camera}-{ccd}-{out_lower}-{col_tag}"
+        stem = col_stem or f"tess-s{spec.sector:04d}-smrow-{spec.camera}-{spec.ccd}-{out_l}-{tag}"
         return base_dir / f"{stem}-alt-blf.fits"
 
     if col_stem is not None:
         return base_dir / f"{col_stem}-blf.fits"
 
-    if tpf_parts is not None and len(tpf_parts) >= 4:
+    if parts is not None and len(parts) >= 4:
         return base_dir / (
-            f"{tpf_parts[0]}-{tpf_parts[1]}-{kind}-{camera}-{ccd}-"
-            f"{out_lower}-{tpf_parts[3]}-{col_tag}-blf.fits"
+            f"{parts[0]}-{parts[1]}-{kind}-{spec.camera}-{spec.ccd}-"
+            f"{out_l}-{parts[3]}-{tag}-blf.fits"
         )
 
-    return base_dir / f"tess-s{sector:04d}-{kind}-{camera}-{ccd}-{out_lower}-{col_tag}-blf.fits"
+    return (
+        base_dir
+        / f"tess-s{spec.sector:04d}-{kind}-{spec.camera}-{spec.ccd}-{out_l}-{tag}-blf.fits"
+    )
 
 
 def _is_alt_blf_name(path: Path) -> bool:
@@ -371,133 +364,101 @@ def _is_alt_blf_name(path: Path) -> bool:
 
 
 def find_all_cached_blf(
+    spec: CollateralSpec,
     *,
-    sector: int,
-    camera: int,
-    ccd: int,
-    output: str,
     kind: Literal["smrow", "tvcol"],
-    cadence: CadenceKind = "2min",
     smear_mode: str = "standard",
     ddir: str | os.PathLike[str] | None = None,
     cache_dir: Path | None = None,
-    tpf_parts: list[str] | None = None,
-    ticid: int | None = None,
 ) -> list[Path]:
     """Return all candidate ``-blf.fits`` cache paths across ``ddir`` and ``cache_dir``."""
-    out_lower = output.lower()
-    col_tag = collateral_suffix(cadence)
-    sec_sub = f"s{sector:04d}"
-    search_dirs = _candidate_search_dirs(ddir, cache_dir, subdir=sec_sub)
+    out_l = spec.output_lower
+    tag = spec.col_tag
+    sec_s = spec.sector_subdir
+    parts = spec.tpf_parts
+    search_dirs = _candidate_search_dirs(ddir, cache_dir, subdir=sec_s)
 
     patterns: list[str] = []
     if kind == "smrow" and smear_mode == "alternate":
-        if tpf_parts is not None and len(tpf_parts) >= 4:
-            patterns.append(
-                f"{tpf_parts[0]}-{tpf_parts[1]}-smrow-{camera}-{ccd}-"
-                f"{out_lower}-{tpf_parts[2]}-{tpf_parts[3]}-alt-{col_tag}-blf.fits"
-            )
-        if ticid is not None:
-            patterns.append(
-                f"tess*-s{sector:04d}-smrow-{camera}-{ccd}-"
-                f"{out_lower}-{int(ticid):016d}-*-alt-{col_tag}-blf.fits"
-            )
-            patterns.append(
-                f"tess-s{sector:04d}-smrow-{camera}-{ccd}-"
-                f"{out_lower}-{int(ticid):016d}-{col_tag}-alt-blf.fits"
-            )
-            if cadence == "2min":
-                patterns.append(
-                    f"tess-s{sector:04d}-smrow-{camera}-{ccd}-"
-                    f"{out_lower}-{int(ticid):016d}-alt-blf.fits"
+        if parts is not None and len(parts) >= 4:
+            patterns.extend(
+                (
+                    f"tess*-{sec_s}-smrow-{spec.camera}-{spec.ccd}-"
+                    f"{out_l}-{parts[2]}-{parts[3]}-alt-{tag}-blf.fits",
+                    f"{parts[0]}-{parts[1]}-smrow-{spec.camera}-{spec.ccd}-"
+                    f"{out_l}-{parts[2]}-{parts[3]}-alt-{tag}-blf.fits",
                 )
-        patterns.append(
-            f"tess*-s{sector:04d}-smrow-{camera}-{ccd}-{out_lower}-*-alt-{col_tag}-blf.fits"
-        )
-        patterns.append(
-            f"tess*-s{sector:04d}-smrow-{camera}-{ccd}-{out_lower}-*-{col_tag}-alt-blf.fits"
+            )
+        if spec.ticid is not None:
+            tic = f"{int(spec.ticid):016d}"
+            patterns.extend(
+                (
+                    f"tess*-{sec_s}-smrow-{spec.camera}-{spec.ccd}-{out_l}-{tic}-*-alt-{tag}-blf.fits",
+                    f"tess-{sec_s}-smrow-{spec.camera}-{spec.ccd}-{out_l}-{tic}-{tag}-alt-blf.fits",
+                )
+            )
+            if spec.cadence == "2min":
+                patterns.append(
+                    f"tess-{sec_s}-smrow-{spec.camera}-{spec.ccd}-{out_l}-{tic}-alt-blf.fits"
+                )
+        patterns.extend(
+            (
+                f"tess*-{sec_s}-smrow-{spec.camera}-{spec.ccd}-{out_l}-*-alt-{tag}-blf.fits",
+                f"tess*-{sec_s}-smrow-{spec.camera}-{spec.ccd}-{out_l}-*-{tag}-alt-blf.fits",
+            )
         )
         predicate: Callable[[Path], bool] = _is_alt_blf_name
     else:
-        if tpf_parts is not None and len(tpf_parts) >= 4:
-            patterns.append(
-                f"{tpf_parts[0]}-{tpf_parts[1]}-{kind}-{camera}-{ccd}-"
-                f"{out_lower}-{tpf_parts[3]}-{col_tag}-blf.fits"
+        if parts is not None and len(parts) >= 4:
+            patterns.extend(
+                (
+                    f"tess*-{sec_s}-{kind}-{spec.camera}-{spec.ccd}-"
+                    f"{out_l}-{parts[3]}-{tag}-blf.fits",
+                    f"{parts[0]}-{parts[1]}-{kind}-{spec.camera}-{spec.ccd}-"
+                    f"{out_l}-{parts[3]}-{tag}-blf.fits",
+                )
             )
-        patterns.append(
-            f"tess*-s{sector:04d}-{kind}-{camera}-{ccd}-{out_lower}-*-{col_tag}-blf.fits"
-        )
-        patterns.append(
-            f"tess-s{sector:04d}-{kind}-{camera}-{ccd}-{out_lower}-{col_tag}-blf.fits"
+        patterns.extend(
+            (
+                f"tess*-{sec_s}-{kind}-{spec.camera}-{spec.ccd}-{out_l}-*-{tag}-blf.fits",
+                f"tess-{sec_s}-{kind}-{spec.camera}-{spec.ccd}-{out_l}-{tag}-blf.fits",
+            )
         )
         predicate = lambda p: not _is_alt_blf_name(p)  # noqa: E731
 
     return _find_all_local_matches(search_dirs, patterns, predicate=predicate)
 
 
-def find_cached_blf(
-    *,
-    sector: int,
-    camera: int,
-    ccd: int,
-    output: str,
-    kind: Literal["smrow", "tvcol"],
-    cadence: CadenceKind = "2min",
-    smear_mode: str = "standard",
-    ddir: str | os.PathLike[str] | None = None,
-    cache_dir: Path | None = None,
-    tpf_parts: list[str] | None = None,
-    ticid: int | None = None,
-) -> Path | None:
-    """Locate an existing ``-blf.fits`` cache locally across ``ddir`` and ``cache_dir``."""
-    matches = find_all_cached_blf(
-        sector=sector,
-        camera=camera,
-        ccd=ccd,
-        output=output,
-        kind=kind,
-        cadence=cadence,
-        smear_mode=smear_mode,
-        ddir=ddir,
-        cache_dir=cache_dir,
-        tpf_parts=tpf_parts,
-        ticid=ticid,
-    )
-    return matches[0] if matches else None
-
-
 def resolve_collateral_file(
+    spec: CollateralSpec,
     *,
-    sector: int,
-    camera: int,
-    ccd: int,
-    output: str,
     kind: Literal["smrow", "tvcol"],
-    cadence: CadenceKind = "2min",
     ddir: str | os.PathLike[str] | None = None,
     cache_dir: Path | None = None,
     offline: bool = False,
     stage_dir: Path | None = None,
     keep_raw_in_stage_only: bool = False,
-    tpf_parts: list[str] | None = None,
     s3_fs: Any = None,
     verbose: bool = False,
 ) -> Path:
     """Resolve a raw ``_col.fits`` / ``_fast-col.fits`` file locally or from MAST S3."""
-    out_lower = output.lower()
-    col_tag = collateral_suffix(cadence)
-    sec_sub = f"s{sector:04d}"
-    search_dirs = _candidate_search_dirs(ddir, cache_dir, subdir=sec_sub)
+    out_l = spec.output_lower
+    tag = spec.col_tag
+    sec_s = spec.sector_subdir
+    parts = spec.tpf_parts
+    search_dirs = _candidate_search_dirs(ddir, cache_dir, subdir=sec_s)
     if stage_dir is not None:
         search_dirs = [stage_dir, *search_dirs]
 
     patterns: list[str] = []
-    if tpf_parts is not None and len(tpf_parts) >= 4:
-        patterns.append(
-            f"{tpf_parts[0]}-{tpf_parts[1]}-{kind}-{camera}-{ccd}-"
-            f"{out_lower}-{tpf_parts[3]}-{col_tag}.fits"
+    if parts is not None and len(parts) >= 4:
+        patterns.extend(
+            (
+                f"tess*-{sec_s}-{kind}-{spec.camera}-{spec.ccd}-{out_l}-{parts[3]}-{tag}.fits",
+                f"{parts[0]}-{parts[1]}-{kind}-{spec.camera}-{spec.ccd}-{out_l}-{parts[3]}-{tag}.fits",
+            )
         )
-    patterns.append(f"tess*-s{sector:04d}-{kind}-{camera}-{ccd}-{out_lower}-*-{col_tag}.fits")
+    patterns.append(f"tess*-{sec_s}-{kind}-{spec.camera}-{spec.ccd}-{out_l}-*-{tag}.fits")
 
     found = _find_local_match(search_dirs, patterns)
     if found is not None:
@@ -505,31 +466,37 @@ def resolve_collateral_file(
 
     _guard_offline(
         offline,
-        f"{kind} collateral ({sec_sub}, cam={camera}, ccd={ccd}, out={output}, {col_tag})",
+        f"{kind} collateral ({sec_s}, cam={spec.camera}, ccd={spec.ccd}, out={spec.output}, {tag})",
         search_dirs,
     )
 
     fs = _open_anon_s3_filesystem(s3_fs=s3_fs)
     glob_pat = (
-        f"{S3_TESS_PUBLIC_ROOT}/ffi/s{sector:04d}/*/*/{camera}-{ccd}/"
-        f"tess*-s{sector:04d}-{kind}-{camera}-{ccd}-{out_lower}-*-{col_tag}.fits"
+        f"{S3_TESS_PUBLIC_ROOT}/ffi/{sec_s}/*/*/{spec.camera}-{spec.ccd}/"
+        f"tess*-{sec_s}-{kind}-{spec.camera}-{spec.ccd}-{out_l}-*-{tag}.fits"
     )
     matches = sorted(fs.glob(glob_pat))
     if not matches:
         raise FileNotFoundError(
             f"Collateral file not found on MAST S3 matching s3://{glob_pat}."
         )
-    s3_key = matches[0]
+    selected = matches
+    if parts is not None and len(parts) >= 4:
+        run_suffix = f"-{parts[3]}-{tag}.fits"
+        run_matches = [k for k in matches if Path(k).name.endswith(run_suffix)]
+        if run_matches:
+            selected = run_matches
+    s3_key = selected[-1]
     filename = Path(s3_key).name
 
     if keep_raw_in_stage_only and stage_dir is not None:
         dst = stage_dir / filename
     elif cache_dir is not None:
-        dst = cache_dir / sec_sub / filename
+        dst = cache_dir / sec_s / filename
     elif ddir is not None:
         dst = Path(ddir).expanduser() / filename
     else:
-        dst = resolve_cache_dir(create=True) / sec_sub / filename
+        dst = resolve_cache_dir(env_var="MUNDEY_CACHE_DIR", create=True) / sec_s / filename
 
     if verbose:
         print(f"Downloading S3 collateral file s3://{s3_key} -> {dst}")
@@ -556,15 +523,7 @@ def iter_collateral_chunks(
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
     row_indices: np.ndarray | None = None,
 ) -> Iterator[tuple[int, int, np.ndarray, np.ndarray, np.ndarray]]:
-    """Stream ``TSCALn``/``TZEROn`` collateral tables in ``chunk_rows`` slices (< 2 GB RSS).
-
-    Slices ``hdul[1].data[t0:t1]`` by row range *before* column extraction so
-    Astropy never materializes the full-sector scaled ``float64`` table in RAM,
-    and masks negative sentinel values (``-1`` / ``TNULLn``) to ``NaN`` in ``float64``.
-
-    When ``row_indices`` is provided (sorted or arbitrary 1D ``int64`` indices into
-    the collateral table), only chunks intersecting ``row_indices`` are read.
-    """
+    """Stream ``TSCALn``/``TZEROn`` collateral tables in ``chunk_rows`` slices (< 2 GB RSS)."""
     if chunk_rows <= 0:
         raise ValueError(f"chunk_rows must be positive, got {chunk_rows}.")
 
@@ -573,7 +532,6 @@ def iter_collateral_chunks(
         data = hdu1.data
         n_total = len(data)
 
-        # Inspect TNULL (and TSCAL/TZERO scaling) for raw_colname if present
         scaled_null: float | None = None
         for idx, col_def in enumerate(hdu1.columns, start=1):
             if col_def.name == raw_colname:
@@ -587,10 +545,11 @@ def iter_collateral_chunks(
                     scaled_null = bscale * float(tnull_val) + bzero
                 break
 
-        if row_indices is not None:
-            needed = np.unique(np.asarray(row_indices, dtype=np.int64))
-        else:
-            needed = None
+        needed = (
+            np.unique(np.asarray(row_indices, dtype=np.int64))
+            if row_indices is not None
+            else None
+        )
 
         for t0 in range(0, n_total, chunk_rows):
             t1 = min(t0 + chunk_rows, n_total)
@@ -602,12 +561,11 @@ def iter_collateral_chunks(
             chunk_rec = data[t0:t1]
             time_chunk = np.asarray(chunk_rec["TIME"], dtype=np.float64)
             cad_chunk = np.asarray(chunk_rec["CADENCENO"], dtype=np.int64)
-            raw_arr = chunk_rec[raw_colname]
-            raw_f64 = np.asarray(raw_arr, dtype=np.float64)
+            raw_f64 = np.asarray(chunk_rec[raw_colname], dtype=np.float64)
 
             bad = (raw_f64 < 0.0) | (~np.isfinite(raw_f64))
             if scaled_null is not None:
-                bad = bad | (raw_f64 == scaled_null)
+                bad |= raw_f64 == scaled_null
             if np.any(bad):
                 raw_f64 = raw_f64.copy()
                 raw_f64[bad] = np.nan
@@ -615,65 +573,36 @@ def iter_collateral_chunks(
             yield t0, t1, time_chunk, cad_chunk, raw_f64
 
 
-def write_onedblack_blf(
-    dst_path: str | os.PathLike[str],
-    *,
+def _time_cadence_columns(
     time: np.ndarray,
     cadenceno: np.ndarray,
-    black1d: np.ndarray,
-    black1d_err: np.ndarray | None = None,
-    n_eff: float | None = None,
-    time_unit: str = "BJD - 2457000, days",
-    stage_dir: Path | None = None,
-) -> Path:
-    """Atomically write a ``tvcol-...-blf.fits`` 1D-black cache with ``CADENCENO`` (``'J'``)."""
-    dst = Path(dst_path)
-    time_arr = np.asarray(time, dtype=np.float64)
-    cad_arr = np.asarray(cadenceno, dtype=np.int32)
-    b1d_arr = np.asarray(black1d, dtype=np.float64)
-    nrows = b1d_arr.shape[1]
-
-    cols = [
+    time_unit: str,
+) -> list[fits.Column]:
+    return [
         fits.Column(
             name="TIME",
             format="D",
             unit=time_unit,
             disp="D14.7",
-            array=time_arr,
+            array=np.asarray(time, dtype=np.float64),
         ),
         fits.Column(
             name="CADENCENO",
             format="J",
             disp="I10",
-            array=cad_arr,
-        ),
-        fits.Column(
-            name="1DBLACK",
-            format=f"{nrows}D",
-            unit="count",
-            disp="F14.7",
-            dim=f"({nrows})",
-            array=b1d_arr,
+            array=np.asarray(cadenceno, dtype=np.int32),
         ),
     ]
-    if black1d_err is not None:
-        cols.append(
-            fits.Column(
-                name="1DBLACK_ERR",
-                format=f"{nrows}E",
-                unit="count",
-                disp="E14.7",
-                dim=f"({nrows})",
-                array=np.asarray(black1d_err, dtype=np.float32),
-            )
-        )
 
-    hdu1 = fits.BinTableHDU.from_columns(fits.ColDefs(cols), name="1DBLACK")
-    hdu1.header["BLFVER"] = (2, "Mundey -blf cache schema version")
-    if n_eff is not None:
-        hdu1.header["NEFF"] = (float(n_eff), "Effective co-added frames")
-    hdul = fits.HDUList([fits.PrimaryHDU(), hdu1])
 
+def _write_blf_hdul(
+    dst_path: str | os.PathLike[str],
+    hdul: fits.HDUList,
+    *,
+    stage_dir: Path | None = None,
+) -> Path:
+    """Atomically write ``hdul`` to ``dst_path`` (optionally staging in ``stage_dir``)."""
+    dst = Path(dst_path)
     if stage_dir is not None:
         stage_dir.mkdir(parents=True, exist_ok=True)
         tmp = make_atomic_tmp_path(stage_dir / dst.name)
@@ -690,6 +619,50 @@ def write_onedblack_blf(
     return dst
 
 
+def write_onedblack_blf(
+    dst_path: str | os.PathLike[str],
+    *,
+    time: np.ndarray,
+    cadenceno: np.ndarray,
+    black1d: np.ndarray,
+    black1d_err: np.ndarray | None = None,
+    n_eff: float | None = None,
+    time_unit: str = "BJD - 2457000, days",
+    stage_dir: Path | None = None,
+) -> Path:
+    """Atomically write a ``tvcol-...-blf.fits`` 1D-black cache with ``CADENCENO`` (``'J'``)."""
+    b1d_arr = np.asarray(black1d, dtype=np.float64)
+    nrows = b1d_arr.shape[1]
+    cols = _time_cadence_columns(time, cadenceno, time_unit)
+    cols.append(
+        fits.Column(
+            name="1DBLACK",
+            format=f"{nrows}D",
+            unit="count",
+            disp="F14.7",
+            dim=f"({nrows})",
+            array=b1d_arr,
+        )
+    )
+    if black1d_err is not None:
+        cols.append(
+            fits.Column(
+                name="1DBLACK_ERR",
+                format=f"{nrows}E",
+                unit="count",
+                disp="E14.7",
+                dim=f"({nrows})",
+                array=np.asarray(black1d_err, dtype=np.float32),
+            )
+        )
+
+    hdu1 = fits.BinTableHDU.from_columns(fits.ColDefs(cols), name="1DBLACK")
+    hdu1.header["BLFVER"] = (2, "Mundey -blf cache schema version")
+    if n_eff is not None:
+        hdu1.header["NEFF"] = (float(n_eff), "Effective co-added frames")
+    return _write_blf_hdul(dst_path, fits.HDUList([fits.PrimaryHDU(), hdu1]), stage_dir=stage_dir)
+
+
 def write_smear_blf(
     dst_path: str | os.PathLike[str],
     *,
@@ -699,33 +672,21 @@ def write_smear_blf(
     smear_err: np.ndarray | None = None,
     smear_sat: np.ndarray | None = None,
     unresolved_cols: np.ndarray | None = None,
+    col_matched: np.ndarray | None = None,
     smear_mode: str = "standard",
     cutout_bounds: tuple[int, int, int, int] | None = None,
+    cadence_match: str = "cadenceno",
+    source_mask_digest: str = "NONE",
+    tv_all_matched: bool | None = None,
     int_time: float | None = None,
     time_unit: str = "BJD - 2457000, days",
     stage_dir: Path | None = None,
 ) -> Path:
     """Atomically write a ``smrow-...-blf.fits`` cache with ``CADENCENO`` (``'J'``)."""
-    dst = Path(dst_path)
-    time_arr = np.asarray(time, dtype=np.float64)
-    cad_arr = np.asarray(cadenceno, dtype=np.int32)
     sm_arr = np.asarray(smear, dtype=np.float64)
     ncols = sm_arr.shape[1]
-
-    cols = [
-        fits.Column(
-            name="TIME",
-            format="D",
-            unit=time_unit,
-            disp="D14.7",
-            array=time_arr,
-        ),
-        fits.Column(
-            name="CADENCENO",
-            format="J",
-            disp="I10",
-            array=cad_arr,
-        ),
+    cols = _time_cadence_columns(time, cadenceno, time_unit)
+    cols.append(
         fits.Column(
             name="SMEAR",
             format=f"{ncols}D",
@@ -733,8 +694,8 @@ def write_smear_blf(
             disp="F14.7",
             dim=f"({ncols})",
             array=sm_arr,
-        ),
-    ]
+        )
+    )
     if smear_err is not None:
         cols.append(
             fits.Column(
@@ -746,10 +707,28 @@ def write_smear_blf(
                 array=np.asarray(smear_err, dtype=np.float32),
             )
         )
+    if col_matched is not None:
+        cols.append(
+            fits.Column(
+                name="COLMATCH",
+                format="L",
+                array=np.asarray(col_matched, dtype=bool),
+            )
+        )
 
     hdu1 = fits.BinTableHDU.from_columns(fits.ColDefs(cols), name="SMEAR")
     hdu1.header["BLFVER"] = (2, "Mundey -blf cache schema version")
     hdu1.header["SMEARMOD"] = (smear_mode, "Mundey smear estimation mode")
+    hdu1.header["CADMATCH"] = (str(cadence_match), "Collateral cadence pairing mode")
+    hdu1.header["SRCMASK"] = (
+        str(source_mask_digest),
+        "SHA-256 prefix of SOURCE_MASK (or NONE)",
+    )
+    if tv_all_matched is not None:
+        hdu1.header["TVMATCH"] = (
+            bool(tv_all_matched),
+            "Whether all smrow cadences matched tvcol 1:1",
+        )
     if int_time is not None:
         hdu1.header["INT_TIME"] = (float(int_time), "Single-frame integration time (s)")
     if cutout_bounds is not None:
@@ -771,95 +750,4 @@ def write_smear_blf(
         hdu_list.append(
             fits.ImageHDU(data=np.asarray(unresolved_cols, dtype=np.uint8), name="ALT_UNRES")
         )
-    hdul = fits.HDUList(hdu_list)
-
-    if stage_dir is not None:
-        stage_dir.mkdir(parents=True, exist_ok=True)
-        tmp = make_atomic_tmp_path(stage_dir / dst.name)
-        try:
-            hdul.writeto(tmp, overwrite=True)
-            return atomic_publish(tmp, dst)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                tmp.unlink()
-            raise
-
-    with atomic_temp_path(dst) as tmp:
-        hdul.writeto(tmp, overwrite=True)
-    return dst
-
-
-def prefetch_collateral(
-    *,
-    sector: int,
-    camera: int,
-    ccd: int,
-    outputs: tuple[str, ...] = ("A", "B", "C", "D"),
-    cadences: tuple[CadenceKind, ...] = ("2min",),
-    cache_dir: str | os.PathLike[str] | None = None,
-    ddir: str | os.PathLike[str] | None = None,
-    stage_dir: str | os.PathLike[str] | None = None,
-    chunk_rows: int = DEFAULT_CHUNK_ROWS,
-    offline: bool = False,
-    strict_hpc: bool = True,
-    cleanup_staged_raw: bool = True,
-    s3_fs: Any = None,
-    verbose: bool = False,
-) -> list[Path]:
-    """Prefetch static models and build ``-blf.fits`` caches in ``chunk_rows`` slices.
-
-    Streams raw ``_col.fits`` / ``_fast-col.fits`` tables in ``chunk_rows`` (default
-    4,096) cadence chunks through the ``@in_float64`` calibration kernels, keeping
-    memory below 2 GB RSS and publishing ``-blf.fits`` files locklessly via
-    :func:`~mundey._contract.atomic_publish`.
-    """
-    from .calibration import build_sector_output_blf_caches
-
-    resolved_cache = resolve_cache_dir(cache_dir, strict_hpc=strict_hpc, create=True)
-    resolved_stage: Path | None
-    if stage_dir is not None:
-        resolved_stage = Path(stage_dir).expanduser()
-    elif os.environ.get("JOBFS", "").strip():
-        resolved_stage = Path(os.environ["JOBFS"].strip()).expanduser()
-    else:
-        resolved_stage = None
-
-    models = resolve_static_models(
-        camera,
-        ccd,
-        ddir=ddir,
-        cache_dir=resolved_cache,
-        offline=offline,
-        stage_dir=resolved_stage,
-        s3_fs=s3_fs,
-        verbose=verbose,
-    )
-
-    published: list[Path] = [models.black2d_path, models.flat_path, models.linearity_path]
-    normalized_outputs = tuple(o.upper() for o in outputs)
-    for out in normalized_outputs:
-        if out not in ("A", "B", "C", "D"):
-            raise ValueError(f"Invalid CCD output {out!r}; expected 'A', 'B', 'C', or 'D'.")
-
-    for cad in cadences:
-        for out in normalized_outputs:
-            tv_blf, sm_blf = build_sector_output_blf_caches(
-                sector=sector,
-                camera=camera,
-                ccd=ccd,
-                output=out,
-                cadence=cad,
-                models=models,
-                cache_dir=resolved_cache,
-                ddir=ddir,
-                stage_dir=resolved_stage,
-                chunk_rows=chunk_rows,
-                offline=offline,
-                strict_hpc=strict_hpc,
-                cleanup_staged_raw=cleanup_staged_raw,
-                s3_fs=s3_fs,
-                verbose=verbose,
-            )
-            published.extend([tv_blf, sm_blf])
-
-    return published
+    return _write_blf_hdul(dst_path, fits.HDUList(hdu_list), stage_dir=stage_dir)

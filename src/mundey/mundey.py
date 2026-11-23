@@ -15,7 +15,6 @@ from xml.etree.ElementTree import Element
 import astropy.coordinates as coord
 import astropy.units as u
 import lightkurve
-import numpy as np
 from astropy.io import fits
 
 from .calibration import (
@@ -26,10 +25,6 @@ from .calibration import (
 )
 
 F = TypeVar("F", bound=Callable[..., Any])
-
-_RANK_WARNING: type[Warning] = getattr(
-    getattr(np, "exceptions", np), "RankWarning", UserWarning
-)
 
 
 def _deprecated(message: str) -> Callable[[F], F]:
@@ -133,11 +128,7 @@ def _resolve_target_name(
     offline: bool = False,
     simbad_cls: Any = None,
 ) -> str:
-    """Resolve a human-readable target label without requiring network access on HPC.
-
-    Defaults ``use_simbad`` to ``False`` whenever ``OBJECT`` is already populated
-    in ``hdu[0].header`` or ``offline=True``.
-    """
+    """Resolve a human-readable target label without requiring network access on HPC."""
     if target is not None:
         return str(target)
 
@@ -177,7 +168,7 @@ class mundey_tpf(lightkurve.TessTargetPixelFile):
         cadence_match: CadenceMatchMode = "cadenceno",
         missing_cadence: MissingCadenceMode = "nan",
         offline: bool = False,
-        strict_hpc: bool = True,
+        strict_hpc: bool = False,
     ) -> None:
         """Recalibrate ``self.hdu`` in place via the ``mundey`` v2.0 JAX engine."""
         resolved_target = _resolve_target_name(

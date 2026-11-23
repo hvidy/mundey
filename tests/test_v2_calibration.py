@@ -16,13 +16,17 @@ from mundey import (
     mundey_tpf,
     read_pixel_quality,
     read_smear_err,
-    read_smear_err_column,
     recalibrate_tpf,
 )
+from mundey._contract import read_smear_err_column, write_pixel_quality
 from mundey.calibration import (
     CRMITEN_BLOCK10_VAR_FACTOR,
     OUTPUT_BOUNDS_0BASED,
+    TESS_PARALLEL_SHIFTS,
     _detect_bloom_columns,
+    _frame_transfer_row_weight,
+    _source_mask_digest,
+    _stamp_ccd_origin_1based,
     _unit_normal_median_variance,
     fit_onedblack_legendre,
     load_undershoot_coeff,
@@ -853,8 +857,14 @@ def test_sliced_lightkurve_tpf_hdulist_path_fallback_mund01(
         assert sub_cal.hdu[0].header["CADMISS"] == 0
         assert np.all(np.isfinite(sub_cal.flux.value))
 
-    np.testing.assert_allclose(cal_alt_s1.flux.value, full_alt_ref.flux.value[2:5], rtol=1e-5)
-    np.testing.assert_allclose(cal_alt_s2.flux.value, full_alt_ref.flux.value[6:10], rtol=1e-5)
+    # Cold sub-slices estimate time-medianed inv_wing_w over their own cadence subset (small
+    # ~0.1 e-/s shift across bright/dark sky-gradient subsets), while full & warm-cached match 1e-5
+    np.testing.assert_allclose(
+        cal_alt_s1.flux.value, full_alt_ref.flux.value[2:5], rtol=1e-3, atol=0.3
+    )
+    np.testing.assert_allclose(
+        cal_alt_s2.flux.value, full_alt_ref.flux.value[6:10], rtol=1e-3, atol=0.3
+    )
     np.testing.assert_allclose(cal_alt_full.flux.value, full_alt_ref.flux.value, rtol=1e-5)
     np.testing.assert_allclose(cal_alt_s3.flux.value, full_alt_ref.flux.value[1:4], rtol=1e-5)
 
@@ -907,7 +917,9 @@ def test_sliced_lightkurve_tpf_hdulist_path_fallback_mund01(
         cadence_match="positional",
         offline=True,
     )
-    np.testing.assert_allclose(cal_pos_0_4.flux.value, full_alt_ref.flux.value[0:4], rtol=1e-5)
+    np.testing.assert_allclose(
+        cal_pos_0_4.flux.value, full_alt_ref.flux.value[0:4], rtol=1e-3, atol=0.3
+    )
 
 
 def test_falsy_quality_bitmask_zero_and_none_preserved_mund02(
@@ -1268,3 +1280,633 @@ def test_order_statistic_smear_err_and_crmiten_flux_err_mc_pull_mund03(
     assert abs(smear_ratio_2m - 1.0) <= 0.06
     # Column 0 with injected row-to-row scatter (> 2.5 * theo_var) triggers empirical MAD override
     assert float(np.median(serr_2m[:, 0])) > 3.0 * float(np.median(serr_2m[:, 1:]))
+
+
+def test_frame_transfer_row_weight_crmiten_deadc_and_sirius_s06_mund_v201_01(
+    tmp_path: Path,
+) -> None:
+    """[MUND-01] _frame_transfer_row_weight must ignore CRMITEN duty-cycle loss in DEADC=0.792."""
+    expected_w = 0.02 / (1.98 * float(TESS_PARALLEL_SHIFTS))
+
+    # 1. Explicit READTIME & INT_TIME with realistic SPOC CRMITEN=True, DEADC=0.792
+    hdr0 = fits.Header({"CRMITEN": True, "CRBLKSZ": 10})
+    hdr1 = fits.Header({"READTIME": 0.02, "INT_TIME": 1.98, "DEADC": 0.792})
+    assert _frame_transfer_row_weight(hdr0, hdr1) == pytest.approx(expected_w, rel=1e-12)
+
+    # 2. Fallback when READTIME/INT_TIME are absent: undo CRMITEN=(CRBLKSZ-2)/CRBLKSZ on DEADC
+    hdr1_no_rt = fits.Header({"DEADC": 0.792})
+    assert _frame_transfer_row_weight(hdr0, hdr1_no_rt) == pytest.approx(expected_w, rel=1e-12)
+
+    hdr0_fast = fits.Header({"CRMITEN": False, "CRBLKSZ": 10})
+    hdr1_fast = fits.Header({"DEADC": 0.99})
+    assert _frame_transfer_row_weight(hdr0_fast, hdr1_fast) == pytest.approx(expected_w, rel=1e-12)
+
+    # 3. Bundled Sirius Sector 6 SPOC TPF header and calibrated bottom-row sky flux
+    nb_dir = Path(__file__).resolve().parent.parent / "notebooks"
+    sirius_tpf = nb_dir / "tess2018349182459-s0006-0000000322899250-0126-s_tp.fits"
+    with fits.open(sirius_tpf) as hdul:
+        assert hdul[1].header["DEADC"] == pytest.approx(0.792, rel=1e-3)
+        w_sirius = _frame_transfer_row_weight(hdul[0].header, hdul[1].header)
+    assert w_sirius == pytest.approx(expected_w, rel=1e-12)
+
+    # Verify Sirius S06 clean sky at row 0 is ~126 e-/s (not ~69 e-/s from 26x bug)
+    with pytest.warns(UserWarning, match="8 / 100"):
+        cal_sirius = recalibrate_tpf(
+            sirius_tpf,
+            ddir=nb_dir,
+            cache_dir=tmp_path / "sirius_m01",
+            smear="automatic",
+            offline=True,
+        )
+    col0_row0_med = float(np.nanmedian(cal_sirius.hdu[1].data["FLUX"][:92, 0, 0]))
+    assert col0_row0_med > 110.0
+
+
+def test_smear_automatic_compact_sub_row_2048_bloom_cutout_mund_v201_02(
+    tpf_builder,
+    tmp_path: Path,
+) -> None:
+    """[MUND-02] smear='automatic' must switch to 'alternate' below row 2048 when bloom occurs."""
+    # 1. Compact sub-row-2048 synthetic cutout (rows 1300..1347, y1+ny=1347 < 2048) with smrow bloom
+    bundle_bloom = tpf_builder(
+        tmp_path / "sub2048_bloom",
+        col0_1based=210,
+        row0_1based=1300,
+        nx=10,
+        ny=48,
+        n_cadences=8,
+        bleed_in_smrow=True,
+        include_bleed=True,
+        flag_bad_cadence=False,
+        noise_sigma=0.0,
+        sky_dark_level=150.0,
+        seed=2012,
+    )
+    cal_auto = recalibrate_tpf(
+        bundle_bloom.tpf_path,
+        ddir=bundle_bloom.ddir,
+        cache_dir=tmp_path / "cache_sub_bloom",
+        smear="automatic",
+        offline=True,
+    )
+    assert cal_auto.hdu[0].header["SMEARMOD"] == "alternate"
+    # Bloomed central column 5 is cleanly repaired on unsaturated bottom rows
+    truth = bundle_bloom.true_star_cube + bundle_bloom.true_sky_cube
+    assert float(np.nanmedian(cal_auto.flux.value[:4, :10, 5])) > 100.0
+    np.testing.assert_allclose(
+        cal_auto.flux.value[:4, :10, 5],
+        truth[:4, :10, 5],
+        rtol=5e-3,
+        atol=3.0,
+    )
+
+    # Warm sub-row-2048 smear='automatic' run on a read-only cache must hit -alt- BLF directly
+    # without recomputing or emitting a read-only cache write warning!
+    sub_cache = tmp_path / "cache_sub_bloom"
+    sec_sub = sub_cache / "s0020"
+    try:
+        sec_sub.chmod(0o555)
+        sub_cache.chmod(0o555)
+        cal_auto_warm = recalibrate_tpf(
+            bundle_bloom.tpf_path,
+            ddir=bundle_bloom.ddir,
+            cache_dir=sub_cache,
+            smear="automatic",
+            offline=True,
+        )
+        assert cal_auto_warm.hdu[0].header["SMEARMOD"] == "alternate"
+        np.testing.assert_allclose(cal_auto_warm.flux.value, cal_auto.flux.value, rtol=1e-5)
+    finally:
+        sub_cache.chmod(0o755)
+        sec_sub.chmod(0o755)
+
+    # 2. Unbloomed, unsaturated sub-row-2048 cutout stays in SMEARMOD='standard'
+    bundle_clean = tpf_builder(
+        tmp_path / "sub2048_clean",
+        col0_1based=210,
+        row0_1based=1300,
+        nx=10,
+        ny=20,
+        n_cadences=6,
+        bleed_in_smrow=False,
+        include_bleed=False,
+        flag_bad_cadence=False,
+        noise_sigma=0.0,
+        sky_dark_level=150.0,
+        seed=2013,
+    )
+    cal_clean = recalibrate_tpf(
+        bundle_clean.tpf_path,
+        ddir=bundle_clean.ddir,
+        cache_dir=tmp_path / "cache_sub_clean",
+        smear="automatic",
+        offline=True,
+    )
+    assert cal_clean.hdu[0].header["SMEARMOD"] == "standard"
+
+
+def test_blf_cache_provenance_cadmatch_and_srcmask_isolation_mund_v201_03(
+    tpf_builder,
+    tmp_path: Path,
+) -> None:
+    """[MUND-03] -blf.fits caches must validate CADMATCH and SHA-256 SRCMASK provenance."""
+    bundle = tpf_builder(
+        tmp_path / "cache_prov",
+        col0_1based=210,
+        row0_1based=1993,
+        nx=10,
+        ny=56,
+        n_cadences=20,
+        bleed_in_smrow=True,
+        include_bleed=True,
+        flag_bad_cadence=False,
+        noise_sigma=0.0,
+        sky_dark_level=120.0,
+        seed=2014,
+    )
+    # Shift last 5 CADENCENO in smrow while keeping tvcol aligned to tpf_cad
+    sm_path = next(bundle.ddir.glob("*-smrow-*-s_col.fits"))
+    with fits.open(sm_path, mode="update", memmap=False) as sh:
+        sh[1].data["CADENCENO"][15:] += 50
+        sh[1].data["SMROW_RAW"][15:] += 5000
+        sh.flush()
+
+    shared_cache = tmp_path / "shared_prov_cache"
+
+    # 1. positional -> cadenceno(missing_cadence='error') must NOT reuse positional -alt- cache
+    cal_pos = recalibrate_tpf(
+        bundle.tpf_path,
+        ddir=bundle.ddir,
+        cache_dir=shared_cache,
+        smear="alternate",
+        cadence_match="positional",
+        missing_cadence="nan",
+        offline=True,
+    )
+    assert cal_pos.hdu[0].header["CADMATCH"] == "positional"
+    assert cal_pos.hdu[0].header["CADMISS"] == 0
+    assert np.all(np.isfinite(cal_pos.flux.value))
+
+    with pytest.raises(ValueError, match="5 / 20"):
+        recalibrate_tpf(
+            bundle.tpf_path,
+            ddir=bundle.ddir,
+            cache_dir=shared_cache,
+            smear="alternate",
+            cadence_match="cadenceno",
+            missing_cadence="error",
+            offline=True,
+        )
+
+    # 2. cadenceno(nan) -> positional must NOT reuse cadenceno cache (all 20 rows finite)
+    with pytest.warns(UserWarning, match="5 / 20"):
+        cal_cad = recalibrate_tpf(
+            bundle.tpf_path,
+            ddir=bundle.ddir,
+            cache_dir=shared_cache,
+            smear="alternate",
+            cadence_match="cadenceno",
+            missing_cadence="nan",
+            offline=True,
+        )
+    assert cal_cad.hdu[0].header["CADMISS"] == 5
+    assert int(np.sum(np.all(np.isfinite(cal_cad.flux.value), axis=(1, 2)))) == 15
+
+    # Verify -alt- BLF stored all 20 CADENCENO rows + COLMATCH boolean column (100% warm hit!)
+    alt_cad_blf = next((shared_cache / "s0020").glob("*-alt-s_col-blf.fits"))
+    with fits.open(alt_cad_blf) as ah:
+        assert len(ah[1].data["CADENCENO"]) == 20
+        assert "COLMATCH" in (ah[1].data.names or ())
+        assert int(np.sum(ah[1].data["COLMATCH"])) == 15
+
+    # Subsequent cadenceno(missing_cadence='error') on same warm cache hits -alt- BLF with
+    # COLMATCH and STILL raises ValueError!
+    with pytest.raises(ValueError, match="5 / 20"):
+        recalibrate_tpf(
+            bundle.tpf_path,
+            ddir=bundle.ddir,
+            cache_dir=shared_cache,
+            smear="alternate",
+            cadence_match="cadenceno",
+            missing_cadence="error",
+            offline=True,
+        )
+
+    cal_pos_after = recalibrate_tpf(
+        bundle.tpf_path,
+        ddir=bundle.ddir,
+        cache_dir=shared_cache,
+        smear="alternate",
+        cadence_match="positional",
+        missing_cadence="nan",
+        offline=True,
+    )
+    assert cal_pos_after.hdu[0].header["CADMATCH"] == "positional"
+    assert cal_pos_after.hdu[0].header["CADMISS"] == 0
+    assert np.all(np.isfinite(cal_pos_after.flux.value))
+
+    # 3. Unmasked -> SOURCE_MASK on shared cache must not reuse unmasked SRCMASK='NONE' cache
+    bundle_sm = tpf_builder(
+        tmp_path / "srcmask_prov",
+        col0_1based=210,
+        row0_1based=1993,
+        nx=10,
+        ny=56,
+        n_cadences=6,
+        bleed_in_smrow=True,
+        include_bleed=True,
+        flag_bad_cadence=False,
+        noise_sigma=0.0,
+        sky_dark_level=120.0,
+        seed=2015,
+    )
+    sm_cache = tmp_path / "srcmask_cache"
+    recalibrate_tpf(
+        bundle_sm.tpf_path,
+        ddir=bundle_sm.ddir,
+        cache_dir=sm_cache,
+        smear="alternate",
+        offline=True,
+    )
+    alt_blf = next((sm_cache / "s0020").glob("*-alt-s_col-blf.fits"))
+    with fits.open(alt_blf) as ah:
+        assert ah[1].header["CADMATCH"] == "cadenceno"
+        assert ah[1].header["SRCMASK"] == "NONE"
+
+    tpf_masked = lk.read(bundle_sm.tpf_path)
+    pq_in = np.zeros((56, 10), dtype=np.uint16)
+    pq_in[:53, :] = np.uint16(PixelQuality.SOURCE_MASK)
+    write_pixel_quality(tpf_masked, pq_in)
+    expected_digest = _source_mask_digest(pq_in != 0)
+    assert len(expected_digest) == 16 and expected_digest != "NONE"
+
+    cal_masked_warm = recalibrate_tpf(
+        tpf_masked,
+        ddir=bundle_sm.ddir,
+        cache_dir=sm_cache,
+        smear="alternate",
+        offline=True,
+    )
+    cal_masked_fresh = recalibrate_tpf(
+        tpf_masked,
+        ddir=bundle_sm.ddir,
+        cache_dir=tmp_path / "srcmask_fresh",
+        smear="alternate",
+        offline=True,
+    )
+    np.testing.assert_array_equal(
+        read_pixel_quality(cal_masked_warm),
+        read_pixel_quality(cal_masked_fresh),
+    )
+    np.testing.assert_allclose(
+        cal_masked_warm.flux.value,
+        cal_masked_fresh.flux.value,
+        rtol=1e-5,
+        atol=1e-4,
+    )
+    with fits.open(alt_blf) as ah:
+        assert ah[1].header["SRCMASK"] == expected_digest
+
+
+def test_desmear_positive_sky_all_bloom_and_nan_flux_bkg_mund_v201_04(
+    tpf_builder,
+    tmp_path: Path,
+) -> None:
+    """[MUND-04] desmear_calibrated_cutout catches sky>|bloom|, all-bloom, & NaN FLUX_BKG."""
+    rng = np.random.default_rng(42)
+    n_t, ny, nx = 24, 25, 11
+    sky = 300.0
+    sigma = 2.0
+    flux_clean = sky + rng.normal(0.0, sigma, size=(n_t, ny, nx))
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    psf = 8000.0 * np.exp(-((yy - 12.0) ** 2 + (xx - 5.0) ** 2) / (2.0 * 1.3**2))
+    flux_clean += psf[None, :, :]
+    flux_bloomed = flux_clean.copy()
+    flux_bloomed[:, :, 8] -= 250.0  # remains +50 > 0 on sky=300!
+
+    def _build_cutout_hdu(
+        flux_arr: np.ndarray,
+        bkg_arr: np.ndarray,
+        *,
+        backapp: bool,
+    ) -> lk.TessTargetPixelFile:
+        h0 = fits.PrimaryHDU()
+        h0.header["TELESCOP"] = "TESS"
+        h0.header["INSTRUME"] = "TESS Photometer"
+        cols = [
+            fits.Column(name="TIME", format="D", array=np.arange(n_t, dtype=np.float64)),
+            fits.Column(name="CADENCENO", format="J", array=np.arange(1, n_t + 1, dtype=np.int32)),
+            fits.Column(
+                name="FLUX",
+                format=f"{ny * nx}E",
+                dim=f"({nx},{ny})",
+                unit="e-/s",
+                array=flux_arr.astype(np.float32),
+            ),
+            fits.Column(
+                name="FLUX_ERR",
+                format=f"{ny * nx}E",
+                dim=f"({nx},{ny})",
+                unit="e-/s",
+                array=np.full((n_t, ny, nx), sigma, dtype=np.float32),
+            ),
+            fits.Column(
+                name="FLUX_BKG",
+                format=f"{ny * nx}E",
+                dim=f"({nx},{ny})",
+                unit="e-/s",
+                array=bkg_arr.astype(np.float32),
+            ),
+            fits.Column(
+                name="FLUX_BKG_ERR",
+                format=f"{ny * nx}E",
+                dim=f"({nx},{ny})",
+                unit="e-/s",
+                array=np.zeros((n_t, ny, nx), dtype=np.float32),
+            ),
+            fits.Column(name="QUALITY", format="J", array=np.zeros(n_t, dtype=np.int32)),
+        ]
+        h1 = fits.BinTableHDU.from_columns(cols, name="PIXELS")
+        h1.header["INT_TIME"] = 1.98
+        h1.header["READTIME"] = 0.02
+        h1.header["NUM_FRM"] = 60
+        h1.header["CRMITEN"] = True
+        h1.header["DEADC"] = 0.792
+        h1.header["BACKAPP"] = backapp
+        h1.header["1CRV5P"] = 600
+        h1.header["2CRV5P"] = 500
+        h2 = fits.ImageHDU(data=np.ones((ny, nx), dtype=np.int32), name="APERTURE")
+        h2.header["CRVAL1P"] = 600
+        h2.header["CRVAL2P"] = 500
+        return lk.TessTargetPixelFile(fits.HDUList([h0, h1, h2]))
+
+    # 1. Unsubtracted FFI (BACKAPP=False, sky=300, bloom=-250 on col 8)
+    desm_unsub = desmear_calibrated_cutout(
+        _build_cutout_hdu(flux_bloomed, np.zeros_like(flux_bloomed), backapp=False)
+    )
+    assert abs(float(np.mean(desm_unsub.hdu[1].data["FLUX"][:, 0, 8])) - 300.0) < 5.0
+    assert abs(float(np.mean(desm_unsub.hdu[1].data["FLUX"][:, 0, 7])) - 300.0) < 3.0
+
+    # 2. Background-subtracted FFI (BACKAPP=True, FLUX_BKG=300, flux_in=-250 on col 8)
+    desm_sub = desmear_calibrated_cutout(
+        _build_cutout_hdu(
+            flux_bloomed - sky,
+            np.full_like(flux_bloomed, sky),
+            backapp=True,
+        )
+    )
+    assert desm_sub.hdu[1].header["BACKAPP"] is False
+    assert desm_sub.meta["BKGSUB"] is False
+    assert abs(float(np.mean(desm_sub.hdu[1].data["FLUX"][:, 0, 8])) - 300.0) < 5.0
+
+    # 3. Clean curved (quadratic) scattered-light sky across N_t=250 cadences -> zero false alarms
+    n_t_curve = 250
+    xi = np.linspace(-1.0, 1.0, nx)[None, :]
+    eta = np.linspace(-1.0, 1.0, ny)[:, None]
+    curved_sky = 600.0 * (1.0 + 0.10 * xi - 0.08 * eta + 0.015 * xi * xi - 0.01 * eta * eta)
+    curved_flux = (
+        curved_sky[None, :, :]
+        + psf[None, :, :]
+        + rng.normal(0.0, sigma, size=(n_t_curve, ny, nx))
+    )
+    h0_c = fits.PrimaryHDU()
+    h0_c.header["TELESCOP"] = "TESS"
+    cols_c = [
+        fits.Column(name="TIME", format="D", array=np.arange(n_t_curve, dtype=np.float64)),
+        fits.Column(
+            name="CADENCENO",
+            format="J",
+            array=np.arange(1, n_t_curve + 1, dtype=np.int32),
+        ),
+        fits.Column(
+            name="FLUX",
+            format=f"{ny * nx}E",
+            dim=f"({nx},{ny})",
+            array=curved_flux.astype(np.float32),
+        ),
+        fits.Column(
+            name="FLUX_ERR",
+            format=f"{ny * nx}E",
+            dim=f"({nx},{ny})",
+            array=np.full((n_t_curve, ny, nx), sigma, dtype=np.float32),
+        ),
+        fits.Column(name="QUALITY", format="J", array=np.zeros(n_t_curve, dtype=np.int32)),
+    ]
+    h1_c = fits.BinTableHDU.from_columns(cols_c, name="PIXELS")
+    h1_c.header["BACKAPP"] = False
+    h1_c.header["1CRV5P"] = 600
+    h1_c.header["2CRV5P"] = 500
+    h2_c = fits.ImageHDU(data=np.ones((ny, nx), dtype=np.int32), name="APERTURE")
+    desm_clean = desmear_calibrated_cutout(
+        lk.TessTargetPixelFile(fits.HDUList([h0_c, h1_c, h2_c]))
+    )
+    np.testing.assert_allclose(desm_clean.hdu[1].data["FLUX"], curved_flux.astype(np.float32))
+
+    # 3b. Multi-column (> 50%) positive-sky bloom trenches must be caught and repaired!
+    # Case (i): 6 cols negative (-1200) + 1 col at +50 (-250 bloom) + 4 clean cols at +300
+    flux_mix = flux_clean.copy()
+    flux_mix[:, :, 2:8] -= 1500.0
+    flux_mix[:, :, 8] -= 250.0
+    desm_mix = desmear_calibrated_cutout(
+        _build_cutout_hdu(flux_mix, np.zeros_like(flux_mix), backapp=False)
+    )
+    assert abs(float(np.mean(desm_mix.hdu[1].data["FLUX"][:, 0, 8])) - 300.0) < 8.0
+
+    # Case (ii): 6 of 11 cols in a +50 positive-sky bloom trench (-250 on +300 sky), 5 clean cols
+    flux_maj = flux_clean.copy()
+    flux_maj[:, :, 2:8] -= 250.0
+    desm_maj = desmear_calibrated_cutout(
+        _build_cutout_hdu(flux_maj, np.zeros_like(flux_maj), backapp=False)
+    )
+    assert abs(float(np.mean(desm_maj.hdu[1].data["FLUX"][:, 0, 5])) - 300.0) < 8.0
+
+    # 3c. All-bloomed cutout with finite FLUX_BKG=300 e-/s (both moderate -250 and deep -500)
+    for bloom_amp in (250.0, 500.0):
+        flux_all_b = (flux_clean - sky) - bloom_amp
+        desm_all_b = desmear_calibrated_cutout(
+            _build_cutout_hdu(
+                flux_all_b,
+                np.full_like(flux_all_b, sky),
+                backapp=True,
+            )
+        )
+        assert desm_all_b.hdu[1].header["BACKAPP"] is False
+        assert desm_all_b.meta["BKGSUB"] is False
+        # True +300 e-/s sky must be recovered in both moderate and deep all-bloom regimes!
+        assert abs(float(np.mean(desm_all_b.hdu[1].data["FLUX"][:, 0, 0])) - 300.0) < 6.0
+        assert float(np.median(read_smear_err_column(desm_all_b)[:, 0])) >= 1.5
+
+    # 3d. Background-subtracted cutout omitting FLUX_BKG column preserves BACKAPP=True & BKGSUB=True
+    h1_nobkg = h1_c.copy()
+    h1_nobkg.header["BACKAPP"] = True
+    desm_nobkg = desmear_calibrated_cutout(
+        lk.TessTargetPixelFile(fits.HDUList([h0_c.copy(), h1_nobkg, h2_c.copy()]))
+    )
+    assert desm_nobkg.hdu[1].header["BACKAPP"] is True
+    assert desm_nobkg.meta["BKGSUB"] is True
+
+    # 4. All-bloomed cutout (Sirius S06 SPOC TPF with BACKAPP=True and all-NaN FLUX_BKG)
+    sirius_tpf = (
+        Path(__file__).resolve().parent.parent
+        / "notebooks"
+        / "tess2018349182459-s0006-0000000322899250-0126-s_tp.fits"
+    )
+    desm_sirius = desmear_calibrated_cutout(sirius_tpf)
+    pq_sir = read_pixel_quality(desm_sirius)
+    unres_frac = float(np.mean((pq_sir & int(PixelQuality.SMEAR_UNRESOLVED)) != 0))
+    assert unres_frac < 0.25
+    # Negative bloom on col 0 and central col 5 is lifted from < -1,500 e-/s to near >= 0
+    f_sir = np.asarray(desm_sirius.hdu[1].data["FLUX"], dtype=np.float64)
+    assert float(np.nanmedian(f_sir[:, 0, 0])) > -50.0
+    assert float(np.nanmedian(f_sir[:, 0, 5])) > -200.0
+    # Original BACKAPP=True is preserved when FLUX_BKG is all-NaN
+    assert desm_sirius.hdu[1].header["BACKAPP"] is True
+    assert desm_sirius.meta["BKGSUB"] is True
+
+
+def test_lightkurve_cutout_1crv5p_2crv5p_origin_mund_v201_05(
+    tpf_builder,
+    tmp_path: Path,
+) -> None:
+    """[MUND-05] recalibrate_tpf & desmear_calibrated_cutout must prefer HDU[1] 1CRV5P/2CRV5P."""
+    # Direct helper checks
+    h1_only = fits.Header({"1CRV5P": 676, "2CRV5P": 1052})
+    h2_stale = fits.Header({"CRVAL1P": 675, "CRVAL2P": 762})
+    assert _stamp_ccd_origin_1based(h1_only, h2_stale) == (676, 1052)
+    assert _stamp_ccd_origin_1based(fits.Header(), h2_stale) == (675, 762)
+
+    # 1. Lightkurve.cutout() on a 2-output synthetic TPF shifts into Output B while HDU[2] is stale
+    bundle = tpf_builder(
+        tmp_path / "cutout_2out",
+        col0_1based=545,  # cols 545..564 straddling Output A (<=556) and Output B (>=557)
+        row0_1based=1400,
+        nx=20,
+        ny=20,
+        n_cadences=6,
+        include_bleed=False,
+        flag_bad_cadence=False,
+        noise_sigma=0.0,
+        sky_dark_level=300.0,
+        seed=2016,
+    )
+    tpf_parent = lk.read(bundle.tpf_path)
+    sky_b = tpf_parent.wcs.pixel_to_world(15, 12)
+    tpf_cut = tpf_parent.cutout(center=sky_b, size=(6, 6))
+    assert tpf_cut.column >= 557  # Output B in HDU[1] 1CRV5P
+    assert int(tpf_cut.hdu[2].header["CRVAL1P"]) == 545  # stale Output A in HDU[2]!
+
+    cal_cut = recalibrate_tpf(
+        tpf_cut,
+        ddir=bundle.ddir,
+        cache_dir=tmp_path / "cut_cache",
+        smear="standard",
+        offline=True,
+    )
+    # Output HDU[1] 1CRV*P/2CRV*P and HDU[2] CRVAL1P/CRVAL2P are all synchronized
+    assert int(cal_cut.hdu[2].header["CRVAL1P"]) == tpf_cut.column
+    assert int(cal_cut.hdu[2].header["CRVAL2P"]) == tpf_cut.row
+    assert int(cal_cut.hdu[1].header["1CRV4P"]) == tpf_cut.column
+    assert int(cal_cut.hdu[1].header["2CRV4P"]) == tpf_cut.row
+
+    c0_rel = tpf_cut.column - 545
+    r0_rel = tpf_cut.row - 1400
+    truth_cut = (bundle.true_star_cube + bundle.true_sky_cube)[
+        :, r0_rel : r0_rel + 6, c0_rel : c0_rel + 6
+    ]
+    non_cr = bundle.cr_cube[:, r0_rel : r0_rel + 6, c0_rel : c0_rel + 6] == 0.0
+    np.testing.assert_allclose(cal_cut.flux.value[non_cr], truth_cut[non_cr], rtol=5e-4, atol=0.1)
+
+    # 2. desmear_calibrated_cutout with HDU[1] 1CRV5P=123 (straddling RAWX strap cols 125..130)
+    h0 = fits.PrimaryHDU()
+    ny_d, nx_d = 12, 8
+    cols = [
+        fits.Column(name="TIME", format="D", array=np.arange(4, dtype=np.float64)),
+        fits.Column(name="CADENCENO", format="J", array=np.arange(1, 5, dtype=np.int32)),
+        fits.Column(
+            name="FLUX",
+            format=f"{ny_d * nx_d}E",
+            dim=f"({nx_d},{ny_d})",
+            array=np.full((4, ny_d, nx_d), 100.0, dtype=np.float32),
+        ),
+        fits.Column(name="QUALITY", format="J", array=np.zeros(4, dtype=np.int32)),
+    ]
+    h1 = fits.BinTableHDU.from_columns(cols, name="PIXELS")
+    h1.header["1CRV5P"] = 123
+    h1.header["2CRV5P"] = 100
+    h2 = fits.ImageHDU(data=np.ones((ny_d, nx_d), dtype=np.int32), name="APERTURE")
+    desm_strap = desmear_calibrated_cutout(lk.TessTargetPixelFile(fits.HDUList([h0, h1, h2])))
+    pq_strap = read_pixel_quality(desm_strap)
+    assert np.any((pq_strap & int(PixelQuality.STRAP_COL)) != 0)
+
+
+def test_flux_err_ge_smear_err_invariant_with_varying_flat_and_sirius_s06(
+    tpf_builder,
+    tmp_path: Path,
+) -> None:
+    """HALOCVER=1 invariant: FLUX_ERR^2 >= SMEAR_ERR^2 on every row across varying flat fields."""
+    eps_f32 = float(np.finfo(np.float32).eps)
+
+    # 1. Synthetic cutout with a steep ±15% vertical flat-field gradient
+    bundle = tpf_builder(
+        tmp_path / "flat_grad",
+        col0_1based=210,
+        row0_1based=1993,
+        nx=10,
+        ny=56,
+        n_cadences=6,
+        bleed_in_smrow=True,
+        include_bleed=True,
+        flag_bad_cadence=False,
+        noise_sigma=0.0,
+        sky_dark_level=120.0,
+        seed=2017,
+    )
+    flat_path = next(bundle.ddir.glob("*-flat.fits"))
+    with fits.open(flat_path, mode="update", memmap=False) as fh:
+        grad = np.linspace(0.85, 1.15, 2048, dtype=np.float32)[:, None]
+        fh[1].data[:] = np.broadcast_to(grad, fh[1].data.shape).copy()
+        fh.flush()
+
+    cal_grad = recalibrate_tpf(
+        bundle.tpf_path,
+        ddir=bundle.ddir,
+        cache_dir=tmp_path / "flat_grad_cache",
+        smear="automatic",
+        offline=True,
+    )
+    fe_grad = np.asarray(cal_grad.hdu[1].data["FLUX_ERR"], dtype=np.float64)
+    se_grad = np.broadcast_to(
+        np.asarray(read_smear_err_column(cal_grad, quality_masked=False), dtype=np.float64)[
+            :, None, :
+        ],
+        fe_grad.shape,
+    )
+    fin_grad = np.isfinite(fe_grad) & np.isfinite(se_grad)
+    assert np.any(fin_grad)
+    assert np.all(
+        (fe_grad**2)[fin_grad] >= (se_grad**2)[fin_grad] * (1.0 - 2.0 * eps_f32)
+    )
+
+    # 2. Bundled Sirius Sector 6 SPOC TPF (real TESS flat field)
+    nb_dir = Path(__file__).resolve().parent.parent / "notebooks"
+    sirius_tpf = nb_dir / "tess2018349182459-s0006-0000000322899250-0126-s_tp.fits"
+    with pytest.warns(UserWarning, match="8 / 100"):
+        cal_sir = recalibrate_tpf(
+            sirius_tpf,
+            ddir=nb_dir,
+            cache_dir=tmp_path / "sirius_fe_se",
+            smear="automatic",
+            offline=True,
+        )
+    fe_sir = np.asarray(cal_sir.hdu[1].data["FLUX_ERR"], dtype=np.float64)
+    se_sir = np.broadcast_to(
+        np.asarray(read_smear_err_column(cal_sir, quality_masked=False), dtype=np.float64)[
+            :, None, :
+        ],
+        fe_sir.shape,
+    )
+    fin_sir = np.isfinite(fe_sir) & np.isfinite(se_sir)
+    assert np.any(fin_sir)
+    assert np.all(
+        (fe_sir**2)[fin_sir] >= (se_sir**2)[fin_sir] * (1.0 - 2.0 * eps_f32)
+    )

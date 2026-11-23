@@ -520,6 +520,7 @@ def build_synthetic_tess_tpf(
     hdr1["FRAMETIM"] = 2.0
     hdr1["NUM_FRM"] = num_frm
     hdr1["TIMEDEL"] = dt_days
+    hdr1["DEADC"] = 0.792 if crmiten else 0.99
     hdr1["BACKAPP"] = True
     hdr1["NREADOUT"] = int(n_eff)
     hdr1["FXDOFF"] = fxdoff
@@ -528,6 +529,20 @@ def build_synthetic_tess_tpf(
         hdr1[f"READNOI{out}"] = 8.5
         hdr1[f"MEANBLC{out}"] = meanblc[out]
     for col_idx in (4, 5, 6, 7, 8):
+        hdr1[f"1CTYP{col_idx}"] = "RA---TAN"
+        hdr1[f"2CTYP{col_idx}"] = "DEC--TAN"
+        hdr1[f"1CRPX{col_idx}"] = nx / 2.0
+        hdr1[f"2CRPX{col_idx}"] = ny / 2.0
+        hdr1[f"1CRVL{col_idx}"] = 101.287
+        hdr1[f"2CRVL{col_idx}"] = -16.716
+        hdr1[f"1CUNI{col_idx}"] = "deg"
+        hdr1[f"2CUNI{col_idx}"] = "deg"
+        hdr1[f"1CDLT{col_idx}"] = -0.0057
+        hdr1[f"2CDLT{col_idx}"] = 0.0057
+        hdr1[f"11PC{col_idx}"] = 1.0
+        hdr1[f"12PC{col_idx}"] = 0.0
+        hdr1[f"21PC{col_idx}"] = 0.0
+        hdr1[f"22PC{col_idx}"] = 1.0
         hdr1[f"WCSN{col_idx}P"] = "PHYSICAL"
         hdr1[f"WCAX{col_idx}P"] = 2
         hdr1[f"1CTY{col_idx}P"] = "RAWX"
